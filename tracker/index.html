@@ -1,0 +1,88 @@
+<h2>VAE Experiment Tracker</h2>
+
+<div>Loss</div>
+<canvas id="plot1" width="800" height="260"></canvas>
+
+<div>Effective KL (red) + Recon (green)</div>
+<canvas id="plot2" width="800" height="260"></canvas>
+
+<script>
+const c1 = document.getElementById("plot1");
+const c2 = document.getElementById("plot2");
+const ctx1 = c1.getContext("2d");
+const ctx2 = c2.getContext("2d");
+
+const data = [];
+
+function minMax(arr) {
+  let mn = Infinity, mx = -Infinity;
+  for (const v of arr) { if (v < mn) mn = v; if (v > mx) mx = v; }
+  if (mn === mx) { mn -= 1; mx += 1; } // avoid divide-by-zero if flat
+  return [mn, mx];
+}
+
+function makeX(steps, w) {
+  const [xmin, xmax] = minMax(steps);
+  return (s) => 50 + (s - xmin) / (xmax - xmin) * (w - 80);
+}
+
+function plotLine(ctx, xs, ys, xMap, yMap, color) {
+  ctx.beginPath();
+  ctx.strokeStyle = color;
+  for (let i = 0; i < ys.length; i++) {
+    const px = xMap(xs[i]);
+    const py = yMap(ys[i]);
+    if (i === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
+  }
+  ctx.stroke();
+}
+
+function draw() {
+  if (data.length < 2) return;
+
+  const steps = data.map(d => d.step);
+
+  // ---- Top plot: Total Loss only
+  ctx1.clearRect(0, 0, c1.width, c1.height);
+  const loss = data.map(d => d.loss);
+
+  const x1 = makeX(steps, c1.width);
+  const [lmin, lmax] = minMax(loss);
+  const y1 = (v) => (c1.height - 30) - (v - lmin) / (lmax - lmin) * (c1.height - 50);
+
+  plotLine(ctx1, steps, loss, x1, y1, "blue");
+  ctx1.fillStyle = "black";
+  ctx1.fillText("Total Loss", 60, 15);
+
+  // ---- Bottom plot: Recon (RL) + Effective KL (KL * KLw), both linear
+  ctx2.clearRect(0, 0, c2.width, c2.height);
+
+  const eps = 1e-12;
+
+  // raw signals
+  const rlRaw = data.map(d => d.rl);
+  const klEffRaw = data.map(d => d.kl * d.klw);
+
+  // log-scaled signals
+  const rlLog = rlRaw.map(v => Math.log10(Math.max(v, 0) + eps));
+  const klEffLog = klEffRaw.map(v => Math.log10(Math.max(v, 0) + eps));
+
+  const x2 = makeX(steps, c2.width);
+  const [ymin, ymax] = minMax(rlLog.concat(klEffLog));
+  const y2 = (v) => (c2.height - 30) - (v - ymin) / (ymax - ymin) * (c2.height - 50);
+
+  plotLine(ctx2, steps, rlLog,     x2, y2, "green");
+  plotLine(ctx2, steps, klEffLog,  x2, y2, "red");
+
+  ctx2.fillStyle = "black";
+  ctx2.fillText("log10(Recon)", 60, 15);
+  ctx2.fillText("log10(Effective KL)", 150, 15);
+}
+
+const evt = new EventSource("/stream");
+evt.onmessage = (e) => {
+  data.push(JSON.parse(e.data));
+  draw();
+};
+</script>
