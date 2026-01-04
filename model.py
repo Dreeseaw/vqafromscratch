@@ -109,9 +109,6 @@ class VariationalAutoEncoder(nn.Module):
         self._mu = nn.Linear(encoder_output_channels, self._config.latent_dim)
         self._logvar = nn.Linear(encoder_output_channels, self._config.latent_dim)
 
-        # Learned remapping of latent -> deterministic feature map
-        self._remap = nn.Linear(self._config.latent_dim, self._flat_feature_dim)
-
         # [B,D] -> [B,W,H,3]
         self._decoder = Decoder(config)
 
