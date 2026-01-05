@@ -12,6 +12,9 @@
 <div>Weighted KL = KL × KLw</div>
 <canvas id="plot_wkl" width="800" height="200"></canvas>
 
+<h3>Reconstructions</h3>
+<div id="images"></div>
+
 <script>
 const cL = document.getElementById("plot_l");
 const cRL  = document.getElementById("plot_rl");
@@ -142,4 +145,33 @@ evt.onmessage = (e) => {
   data.push(JSON.parse(e.data));
   draw();
 };
+
+const imgDiv = document.getElementById("images");
+const seen = new Set();
+
+async function pollImages() {
+  const res = await fetch("/images");
+  const files = await res.json();
+
+  for (const f of files) {
+    if (seen.has(f)) continue;
+    seen.add(f);
+
+    const img = document.createElement("img");
+    img.src = "/img/" + f;
+    img.style.maxWidth = "800px";
+    img.style.display = "block";
+    img.style.marginBottom = "10px";
+
+    const label = document.createElement("div");
+    label.textContent = f;
+    label.style.fontFamily = "monospace";
+    label.style.marginBottom = "4px";
+
+    imgDiv.appendChild(label);
+    imgDiv.appendChild(img);
+  }
+}
+
+setInterval(pollImages, 2000);
 </script>

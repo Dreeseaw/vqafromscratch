@@ -1,17 +1,22 @@
 """
 training code
 
-ResNet paper section 3.4 (Implementation) hyperparams
+- ResNet paper section 3.4 (Implementation) hyperparams
+
+results saved in 
+- /logs/<run_id>/logfile.txt
+- /logs/<run_id>/step_N.jpg
 
 todo
-- saving results
 - saving weights
 """
 import os
+import sys
 from collections import defaultdict
 from time import perf_counter
 
 from PIL import Image
+import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
@@ -26,10 +31,12 @@ DATA_DIR = "/Users/williamdreese/percy/vqa/VQA/Images/mscoco/"
 
 
 class CocoImageDataset(Dataset):
-    def __init__(self, image_dir):
+    def __init__(self, image_dir, count=None):
         self.image_dir = image_dir
         self.sizes = list()
         self.image_files = sorted(os.listdir(image_dir))
+        if count:
+            self.image_files = self.image_files[:count]
 
         self.transform = transforms.Compose([
             transforms.Resize(256),  # standard resize
@@ -76,6 +83,46 @@ def weight_nan_check(model):
             return True
     return False
 
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD  = (0.229, 0.224, 0.225)
+
+@torch.no_grad()
+def save_x_and_recon(x, x_hat, idx=0, filename=None,
+                     mean=IMAGENET_MEAN, std=IMAGENET_STD):
+    """
+    x, x_hat: [B,3,H,W] tensors in normalized space (e.g., ImageNet Normalize).
+    idx: which element in the batch to show
+    """
+    assert x.dim() == 4 and x.shape[1] == 3
+    assert x_hat.shape == x.shape
+    assert 0 <= idx < x.shape[0]
+
+    # pick one example
+    x0 = x[idx].detach().cpu().float()
+    xh0 = x_hat[idx].detach().cpu().float()
+
+    # CHW -> HWC
+    x0  = x0.permute(1, 2, 0)
+    xh0 = xh0.permute(1, 2, 0)
+
+    fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+    if filename:
+        fig.suptitle(filename, fontsize=14)
+
+    axes[0].imshow(x0)
+    axes[0].set_title("input")
+    axes[0].axis("off")
+
+    axes[1].imshow(xh0)
+    axes[1].set_title("recon")
+    axes[1].axis("off")
+
+    plt.tight_layout()
+    # plt.show()
+    plt.savefig(filename)
+
+
 def check_explosive_gradients(model):
     for name, param in model.named_parameters():
         if param.requires_grad and param.grad is not None:
@@ -83,10 +130,18 @@ def check_explosive_gradients(model):
             if max_grad >= 1e4:
                 print(f"Layer: {name} | Max Gradient: {max_grad.item():.4e} <--- Potential Explosion")
 
+def image_stats(name, t):
+    t = t.detach()
+    print(
+        f"{name}: shape={tuple(t.shape)} dtype={t.dtype} "
+        f"min={t.min().item():.4f} max={t.max().item():.4f} mean={t.mean().item():.4f}"
+    )
 
 if __name__=="__main__":
+    run_id = sys.argv[1] if len(sys.argv) > 1 else "default"
+
     # hyperparams
-    epochs = 200  # by the time my kids have kids
+    epochs = 20_000  # by the time my kids have kids
     global_step = 0
     kl_warmup_steps = 5000
     freeze_step = 4
@@ -96,7 +151,7 @@ if __name__=="__main__":
 
     # get some images from the train set
     dset = "train2014"
-    dataset = CocoImageDataset(DATA_DIR + f"{dset}/{dset}/")
+    dataset = CocoImageDataset(DATA_DIR + f"{dset}/{dset}/", count=None)
     loader = DataLoader(dataset, batch_size=128, shuffle=True)
 
     config = VAEConfig() 
@@ -171,12 +226,39 @@ if __name__=="__main__":
             opt.step()
 
             global_step += 1
-            print(f"Step: {global_step}, Loss: {loss} (RL: {recon_loss.mean()}, KL: {kl_loss.mean()}, KLw: {kl_weight})")
+            print(f"\nStep: {global_step}, Loss: {loss} (RL: {recon_loss.mean()}, KL: {kl_loss.mean()}, KLw: {kl_weight})")
             print(f"perf: {perf_counter()-step_start}")
             print(f"mu.mean: {mu.abs().mean().item()}, lv.mean: {lv.mean().item()}")
+            print(f"mu.pdist: {torch.pdist(mu).mean().item()}")
 
+            # is my latent space even being used
+            '''
+            with torch.no_grad():
+                z_prior = torch.randn_like(mu)
+                x_prior = vae._decoder(z_prior)
+                prior_recon_loss = F.mse_loss(x_prior, images, reduction="mean")
+                print(f"prior MSE: {prior_recon_loss}")
+            '''
+
+            # visualize
+            if global_step % 50 == 1:
+                #image_stats("x", images)
+                #image_stats("x_hat", recon)
+                @torch.no_grad()
+                def denorm_imagenet(t):
+                    mean = torch.tensor(IMAGENET_MEAN, device=t.device).view(1,3,1,1)
+                    std  = torch.tensor(IMAGENET_STD,  device=t.device).view(1,3,1,1)
+                    return (t * std + mean)
+                image_display = denorm_imagenet(images).clamp(0, 1)
+                recon_display = denorm_imagenet(recon).clamp(0, 1)
+                #image_stats("x_norm", image_display)
+                #image_stats("x_hat_norm", recon_display)
+                save_x_and_recon(image_display, recon_display, filename=run_id+f"/step_{global_step}.png")
+
+        '''
         print(f"\nEpoch {epoch:03d} | ")
         print(f"Most recent recon: {recon_loss.mean():.1f} | ")
         print(f"KL: {kl_loss.mean():.1f} | ")
         print(f"KL_w: {kl_weight:.3f}\n")
         print(f"Perf: {perf_counter()-epoch_start}")
+        '''

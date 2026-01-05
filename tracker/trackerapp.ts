@@ -1,17 +1,34 @@
 // trackerapp.ts
 import { serve } from "bun";
 import fs from "fs";
+import path from "path";
 
+// -------------------------
+// CLI ARG PARSING
+// -------------------------
 const args = process.argv;
-const fileIndex = args.indexOf("-f");
-if (fileIndex === -1) {
-  console.error("Usage: bun run trackerapp.ts -f logfile.txt");
+const dirIndex = args.indexOf("-f");
+if (dirIndex === -1) {
+  console.error("Usage: bun run trackerapp.ts -f <run_dir>");
   process.exit(1);
 }
-const logfile = args[fileIndex + 1];
 
+const runDir = path.resolve(args[dirIndex + 1]);
+const logfile = path.join(runDir, "logfile.txt");
+
+if (!fs.existsSync(runDir)) {
+  console.error(`Run directory does not exist: ${runDir}`);
+  process.exit(1);
+}
+if (!fs.existsSync(logfile)) {
+  console.error(`Missing logfile.txt in ${runDir}`);
+  process.exit(1);
+}
+
+// -------------------------
+// LOG PARSER
+// -------------------------
 function parseLine(line: string) {
-  // Example:
   // Step: 1, Loss: 3.31 (RL: 1.72, KL: 39.80, KLw: 0.04)
   const m = line.match(
     /Step:\s*(\d+),\s*Loss:\s*([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?).*?\(.*?RL:\s*([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?),\s*KL:\s*([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?),\s*KLw:\s*([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s*\)/
@@ -27,23 +44,31 @@ function parseLine(line: string) {
   };
 }
 
+// -------------------------
+// SERVER
+// -------------------------
 serve({
   port: 3000,
 
   async fetch(req) {
     const url = new URL(req.url);
 
+    // -------------------------
+    // MAIN PAGE
+    // -------------------------
     if (url.pathname === "/") {
       return new Response(await Bun.file("index.html").text(), {
         headers: { "Content-Type": "text/html" },
       });
     }
 
-    // SSE endpoint
+    // -------------------------
+    // SSE STREAM (LOG METRICS)
+    // -------------------------
     if (url.pathname === "/stream") {
       let closed = false;
       let watcher: fs.FSWatcher | null = null;
-    
+
       const stream = new ReadableStream<string>({
         start(controller) {
           const safeEnqueue = (obj: any) => {
@@ -51,34 +76,33 @@ serve({
             try {
               controller.enqueue(`data: ${JSON.stringify(obj)}\n\n`);
             } catch {
-              // client disconnected / stream closed mid-enqueue
               closed = true;
               try { watcher?.close(); } catch {}
             }
           };
-    
-          // 1) send existing data
+
+          // 1) send existing logfile contents
           const lines = fs.readFileSync(logfile, "utf-8").split("\n");
           for (const line of lines) {
             const parsed = parseLine(line);
             if (parsed) safeEnqueue(parsed);
           }
-    
-          // 2) tail file
+
+          // 2) tail logfile
           let size = fs.statSync(logfile).size;
-    
-          watcher = fs.watch(logfile, { persistent: true }, () => {
+
+          watcher = fs.watch(logfile, () => {
             if (closed) return;
-    
+
             const stats = fs.statSync(logfile);
             if (stats.size <= size) return;
-    
+
             const fd = fs.openSync(logfile, "r");
             const buffer = Buffer.alloc(stats.size - size);
             fs.readSync(fd, buffer, 0, buffer.length, size);
             fs.closeSync(fd);
             size = stats.size;
-    
+
             buffer
               .toString()
               .split("\n")
@@ -88,15 +112,14 @@ serve({
               });
           });
         },
-    
+
         cancel() {
-          // called when browser disconnects / refreshes
           closed = true;
           try { watcher?.close(); } catch {}
           watcher = null;
         },
       });
-    
+
       return new Response(stream, {
         headers: {
           "Content-Type": "text/event-stream",
@@ -105,6 +128,38 @@ serve({
         },
       });
     }
+
+    // -------------------------
+    // LIST RECON IMAGES
+    // -------------------------
+    if (url.pathname === "/images") {
+      const files = fs.readdirSync(runDir)
+        .filter(f => f.endsWith(".png"))
+        .sort((a, b) => {
+          const na = parseInt(a.match(/\d+/)?.[0] ?? "0");
+          const nb = parseInt(b.match(/\d+/)?.[0] ?? "0");
+          return na - nb;
+        });
+
+      return new Response(JSON.stringify(files), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // -------------------------
+    // SERVE IMAGE FILES
+    // -------------------------
+    if (url.pathname.startsWith("/img/")) {
+      const fname = url.pathname.replace("/img/", "");
+      const fpath = path.join(runDir, fname);
+
+      if (!fpath.startsWith(runDir) || !fs.existsSync(fpath)) {
+        return new Response("Not found", { status: 404 });
+      }
+
+      return new Response(Bun.file(fpath));
+    }
+
     return new Response("Not found", { status: 404 });
   },
 });
