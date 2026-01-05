@@ -1,16 +1,26 @@
 <h2>VAE Experiment Tracker</h2>
 
 <div>Loss</div>
-<canvas id="plot1" width="800" height="260"></canvas>
+<canvas id="plot_l" width="800" height="260"></canvas>
 
-<div>Effective KL (red) + Recon (green)</div>
-<canvas id="plot2" width="800" height="260"></canvas>
+<div>Recon / RL</div>
+<canvas id="plot_rl" width="800" height="200"></canvas>
+
+<div>KL</div>
+<canvas id="plot_kl" width="800" height="200"></canvas>
+
+<div>Weighted KL = KL × KLw</div>
+<canvas id="plot_wkl" width="800" height="200"></canvas>
 
 <script>
-const c1 = document.getElementById("plot1");
-const c2 = document.getElementById("plot2");
-const ctx1 = c1.getContext("2d");
-const ctx2 = c2.getContext("2d");
+const cL = document.getElementById("plot_l");
+const cRL  = document.getElementById("plot_rl");
+const cKL  = document.getElementById("plot_kl");
+const cWKL = document.getElementById("plot_wkl");
+const ctxL = cL.getContext("2d");
+const ctxRL  = cRL.getContext("2d");
+const ctxKL  = cKL.getContext("2d");
+const ctxWKL = cWKL.getContext("2d");
 
 const data = [];
 
@@ -19,6 +29,79 @@ function minMax(arr) {
   for (const v of arr) { if (v < mn) mn = v; if (v > mx) mx = v; }
   if (mn === mx) { mn -= 1; mx += 1; } // avoid divide-by-zero if flat
   return [mn, mx];
+}
+
+function drawAxes(ctx, canvas, xMin, xMax, yMin, yMax, xTicks = 5, yTicks = 5) {
+  ctx.strokeStyle = "#888";
+  ctx.fillStyle = "#555";
+  ctx.lineWidth = 1;
+  ctx.font = "10px sans-serif";
+
+  const left = 50;
+  const right = canvas.width - 20;
+  const top = 20;
+  const bottom = canvas.height - 30;
+
+  // axes lines
+  ctx.beginPath();
+  ctx.moveTo(left, top);
+  ctx.lineTo(left, bottom);
+  ctx.lineTo(right, bottom);
+  ctx.stroke();
+
+  // y ticks
+  for (let i = 0; i <= yTicks; i++) {
+    const t = i / yTicks;
+    const y = bottom - t * (bottom - top);
+    const v = yMin + t * (yMax - yMin);
+
+    ctx.beginPath();
+    ctx.moveTo(left - 5, y);
+    ctx.lineTo(left, y);
+    ctx.stroke();
+
+    ctx.fillText(v.toFixed(2), 5, y + 3);
+  }
+
+  // x ticks
+  for (let i = 0; i <= xTicks; i++) {
+    const t = i / xTicks;
+    const x = left + t * (right - left);
+    const v = xMin + t * (xMax - xMin);
+
+    ctx.beginPath();
+    ctx.moveTo(x, bottom);
+    ctx.lineTo(x, bottom + 5);
+    ctx.stroke();
+
+    ctx.fillText(Math.round(v), x - 6, bottom + 15);
+  }
+}
+
+function drawSingleSeries(ctx, canvas, steps, series, label, color) {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (series.length < 2) return;
+
+  const left = 50;
+  const right = canvas.width - 20;
+  const top = 20;
+  const bottom = canvas.height - 30;
+
+  const [xMin, xMax] = minMax(steps);
+  const [yMin, yMax] = minMax(series);
+
+  const xMap = (s) => left + (s - xMin) / (xMax - xMin) * (right - left);
+  const yMap = (v) => bottom - (v - yMin) / (yMax - yMin) * (bottom - top);
+
+  // axes
+  drawAxes(ctx, canvas, xMin, xMax, yMin, yMax);
+
+  // line
+  plotLine(ctx, steps, series, xMap, yMap, color);
+
+  // label
+  ctx.fillStyle = "black";
+  ctx.fillText(label, left + 5, 12);
 }
 
 function makeX(steps, w) {
@@ -43,41 +126,15 @@ function draw() {
 
   const steps = data.map(d => d.step);
 
-  // ---- Top plot: Total Loss only
-  ctx1.clearRect(0, 0, c1.width, c1.height);
   const loss = data.map(d => d.loss);
+  const rl = data.map(d => d.rl);
+  const kl = data.map(d => d.kl);
+  const wkl = data.map(d => d.kl * d.klw);
 
-  const x1 = makeX(steps, c1.width);
-  const [lmin, lmax] = minMax(loss);
-  const y1 = (v) => (c1.height - 30) - (v - lmin) / (lmax - lmin) * (c1.height - 50);
-
-  plotLine(ctx1, steps, loss, x1, y1, "blue");
-  ctx1.fillStyle = "black";
-  ctx1.fillText("Total Loss", 60, 15);
-
-  // ---- Bottom plot: Recon (RL) + Effective KL (KL * KLw), both linear
-  ctx2.clearRect(0, 0, c2.width, c2.height);
-
-  const eps = 1e-12;
-
-  // raw signals
-  const rlRaw = data.map(d => d.rl);
-  const klEffRaw = data.map(d => d.kl * d.klw);
-
-  // log-scaled signals
-  const rlLog = rlRaw.map(v => Math.log10(Math.max(v, 0) + eps));
-  const klEffLog = klEffRaw.map(v => Math.log10(Math.max(v, 0) + eps));
-
-  const x2 = makeX(steps, c2.width);
-  const [ymin, ymax] = minMax(rlLog.concat(klEffLog));
-  const y2 = (v) => (c2.height - 30) - (v - ymin) / (ymax - ymin) * (c2.height - 50);
-
-  plotLine(ctx2, steps, rlLog,     x2, y2, "green");
-  plotLine(ctx2, steps, klEffLog,  x2, y2, "red");
-
-  ctx2.fillStyle = "black";
-  ctx2.fillText("log10(Recon)", 60, 15);
-  ctx2.fillText("log10(Effective KL)", 150, 15);
+  drawSingleSeries(ctxL, cL, steps, loss, "Loss", "green");
+  drawSingleSeries(ctxRL, cRL, steps, rl, "Recon", "blue");
+  drawSingleSeries(ctxKL, cKL, steps, kl, "KL", "red");
+  drawSingleSeries(ctxWKL, cWKL, steps, wkl, "Weighted KL = KL × KLw", "purple");
 }
 
 const evt = new EventSource("/stream");
