@@ -25,12 +25,12 @@ Training
 (each working session)
 > pyenv activate vqa
 
-> python3 train.py | tee logs/logfile.txt
+> mkdir -pv logs/<run_id> && python3 -u train.py <run_id> | tee logs/<run_id>
 ```
 
 Running loss logging web app
 ----------------------------
 ```bash
-> cd tracker/ && bun run trackerapp.ts -f ../logs/logfile.txt
+> cd tracker/ && bun run trackerapp.ts -f ../logs/<run_id>
 ```
 and navigate to `localhost:3000` in your browser.
