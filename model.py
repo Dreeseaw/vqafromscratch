@@ -81,7 +81,7 @@ class Decoder(nn.Module):
             ConvUpBlock(128, 64),   # 28x28
             ConvUpBlock(64, 32),    # 56x56
             ConvUpBlock(32, 16),    # 112x112
-            ConvUpBlock(16, 3, act=nn.Tanh()),  # 224x224
+            ConvUpBlock(16, 3, act=nn.Identity()),  # 224x224
         )
 
     def forward(self, z):

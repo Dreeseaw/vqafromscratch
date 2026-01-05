@@ -88,8 +88,11 @@ if __name__=="__main__":
     # hyperparams
     epochs = 200  # by the time my kids have kids
     global_step = 0
-    kl_warmup_steps = 100
-    freeze_step = 40
+    kl_warmup_steps = 5000
+    freeze_step = 4
+    unfreeze_step = 40
+    beta_step = 400
+    frozen = False
 
     # get some images from the train set
     dset = "train2014"
@@ -103,50 +106,75 @@ if __name__=="__main__":
 
     log_params(vae)
 
+    def kl_weighting_base(step, warmup_steps):
+        kl_weight = min(0.009, (step-400) / warmup_steps)
+        return max(0.003, kl_weight)
+    kl_weighting = kl_weighting_base
+
     for epoch in range(epochs):
-        vae.train()  # training mode. keep in epoch loop in case I add eval
+        # train mode wrt freezing
+        vae.train()  
+        if frozen:
+            vae._decoder.eval()
         epoch_start = perf_counter()
         for images in loader:
-            if global_step == freeze_step:
+            # apply any phase switches
+            if global_step == 0:
+                # startup phase - train with a little KL 
+                def kl_w1(step, warmup_steps):
+                    return 0.01
+                kl_weighting = kl_w1
+            elif global_step == freeze_step:
+                # freeze phase - train encoder only, no KL
+                frozen = True
                 vae._decoder.requires_grad_(False)
-                vae._decoder.eval()  # decoder eval mode
+                vae._decoder.eval()  # freeze decoder batchnorms
                 opt = torch.optim.Adam(
                     filter(lambda p: p.requires_grad, vae.parameters()),
                     lr=0.001, 
                     weight_decay=0.0001,
                 )
+                # alter weighting scheme
+                def kl_w2(step, warmup_steps):
+                    return 0.0
+                kl_weighting = kl_w2
+            elif global_step == unfreeze_step:
+                # unfreeze phase - unfreeze decoder BUT leave beta = 0
+                frozen = False
+                vae._decoder.requires_grad_(True)
+                vae._decoder.train()
+                opt = torch.optim.Adam(
+                    vae.parameters(),
+                    lr=0.001, 
+                    weight_decay=0.0001,
+                )
+                def kl_w3(step, warmup_steps):
+                    return 0.003
+                kl_weighting = kl_w3
+            elif global_step == beta_step:
+                # begin re-introducing real beta
+                kl_weighting = kl_weighting_base
 
             step_start = perf_counter()
             images = images.to(device)
-
             recon, mu, lv = vae(images)
             
-            # simple loss for now - add KL after a few steps
-            # recon_loss = F.mse_loss(recon, images, reduction="none")
-            # recon_loss = recon_loss.view(images.size(0), -1).sum(dim=1)
-            
-            # simple normalized loss
+            # simple normalized losses
             recon_loss = F.mse_loss(recon, images, reduction="mean")  # avg losses
-            
             kl_loss = kl_divergence(mu, lv)
-
-            # clamp weight [0.05, 1.0]
-            # 1.0 is default
-            # 0.05 is because normal step 0 recon loss = 2, step 0 KL loss = 40
-            # and i wanna have them be equal off the bat for no dominance
-            kl_weight = min(1.0, global_step / kl_warmup_steps)
-            kl_weight = max(0.05, kl_weight)
-
+            kl_weight = kl_weighting(global_step, kl_warmup_steps)
             loss = (recon_loss + kl_weight * kl_loss).mean()
 
             opt.zero_grad()
             loss.backward()
-            check_explosive_gradients(vae)
+            # check_explosive_gradients(vae)
             opt.step()
 
             global_step += 1
             print(f"Step: {global_step}, Loss: {loss} (RL: {recon_loss.mean()}, KL: {kl_loss.mean()}, KLw: {kl_weight})")
             print(f"perf: {perf_counter()-step_start}")
+            print(f"mu.mean: {mu.abs().mean().item()}, lv.mean: {lv.mean().item()}")
+
         print(f"\nEpoch {epoch:03d} | ")
         print(f"Most recent recon: {recon_loss.mean():.1f} | ")
         print(f"KL: {kl_loss.mean():.1f} | ")

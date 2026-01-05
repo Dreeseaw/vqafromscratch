@@ -3,3 +3,4 @@
 *.DS_Store
 Images/*
 logs/*
+__pycache__/*
