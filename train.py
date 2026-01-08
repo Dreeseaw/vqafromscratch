@@ -30,24 +30,38 @@ DATA_DIR = "/Users/williamdreese/percy/vqa/VQA/Images/mscoco/"
 # torch.autograd.set_detect_anomaly(True) # use for NaN hunting
 
 
+### Training, eval, & test loading
+
 class CocoImageDataset(Dataset):
-    def __init__(self, image_dir, count=None):
+    def __init__(self, image_dir, count=None, rrc=True):
         self.image_dir = image_dir
         self.sizes = list()
         self.image_files = sorted(os.listdir(image_dir))
         if count:
             self.image_files = self.image_files[:count]
 
-        self.transform = transforms.Compose([
-            transforms.Resize(256),  # standard resize
-            transforms.RandomResizedCrop(224),  # simple augmentations
+        # training vs validation/test
+        if rrc:
+            trans = [
+                transforms.Resize(256), # standard resize
+                transforms.RandomResizedCrop(
+                    224, 
+                    scale=(0.75, 1.0), 
+                    ratio=(3/4, 4/3),
+                ),  # simple augmentations
+            ]
+        else:
+            trans = [transforms.Resize((224,224))]
+
+        trans.extend([
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ToTensor(),  # norm
+            transforms.ToTensor(),
             transforms.Normalize(
                 mean=[0.485, 0.456, 0.406],
                 std=[0.229, 0.224, 0.225],
             ),
         ])
+        self.transform = transforms.Compose(trans)
 
     def __len__(self):
         return len(self.image_files)
@@ -59,6 +73,7 @@ class CocoImageDataset(Dataset):
         image = self.transform(image)
         return image
 
+### Logging & visualization
 
 def log_params(model):
     total_params, total_bytes = 0, 0
@@ -68,11 +83,7 @@ def log_params(model):
     param_size_mb = total_bytes / (1024**2)
     print(f"Count: {total_params:,}")
     print(f"Size (Bytes): {total_bytes}")
-    print(f"Size (MB): {param_size_mb:.4f}\n")
-
-
-def kl_divergence(mu, lv):
-    return -0.5 * torch.sum(1 + lv - mu.pow(2) - lv.exp(), dim=1)
+    print(f"Size (MB): {param_size_mb:.4f}")
 
 def nan_check(tensor):
     return torch.isnan(tensor).any().item()
@@ -88,25 +99,37 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
 
 @torch.no_grad()
-def save_x_and_recon(x, x_hat, idx=0, filename=None,
-                     mean=IMAGENET_MEAN, std=IMAGENET_STD):
+def save_x_and_recon(
+    x, 
+    x_hat, 
+    x_hat_mu, 
+    idx=9, 
+    filename=None,
+    mean=IMAGENET_MEAN, 
+    std=IMAGENET_STD,
+):
     """
-    x, x_hat: [B,3,H,W] tensors in normalized space (e.g., ImageNet Normalize).
+    x, x_hat, x_hat_mu: [B,3,H,W] tensors in normalized space
     idx: which element in the batch to show
+    filename: what to name the saveed file for later viewing
+    mean, std: input transformation values
     """
     assert x.dim() == 4 and x.shape[1] == 3
-    assert x_hat.shape == x.shape
+    assert x_hat.shape == x.shape 
+    assert x.shape == x_hat_mu.shape
     assert 0 <= idx < x.shape[0]
 
     # pick one example
     x0 = x[idx].detach().cpu().float()
     xh0 = x_hat[idx].detach().cpu().float()
+    xhu0 = x_hat_mu[idx].detach().cpu().float()
 
     # CHW -> HWC
     x0  = x0.permute(1, 2, 0)
     xh0 = xh0.permute(1, 2, 0)
+    xhu0 = xhu0.permute(1, 2, 0)
 
-    fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
     if filename:
         fig.suptitle(filename, fontsize=14)
 
@@ -118,10 +141,13 @@ def save_x_and_recon(x, x_hat, idx=0, filename=None,
     axes[1].set_title("recon")
     axes[1].axis("off")
 
-    plt.tight_layout()
-    # plt.show()
-    plt.savefig(filename)
+    axes[2].imshow(xhu0)
+    axes[2].set_title("recon_u")
+    axes[2].axis("off")
 
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close(fig)  # free up pic memory
 
 def check_explosive_gradients(model):
     for name, param in model.named_parameters():
@@ -137,6 +163,44 @@ def image_stats(name, t):
         f"min={t.min().item():.4f} max={t.max().item():.4f} mean={t.mean().item():.4f}"
     )
 
+# save here for when I need to verify latent is being used
+def test_mu(mu, vae, images, recon):
+    # is my latent space even being used
+    with torch.no_grad():
+        z_prior = torch.randn_like(mu)
+        x_prior = vae._decoder(z_prior)
+        prior_recon_loss = F.mse_loss(x_prior, images, reduction="mean")
+        print(f"prior MSE: {prior_recon_loss}")
+
+    @torch.no_grad()
+    def mse_with_optimal_scale(x, x_hat):
+        a = (x * x_hat).mean() / (x_hat * x_hat).mean().clamp(min=1e-8)
+        return ((x - a * x_hat) ** 2).mean().item(), a.item()
+    print(f"mse_scaled: {mse_with_optimal_scale(images, recon)}")
+
+
+### Training schedule helper(s)
+
+def set_decoder_trainable(vae, step) -> float:
+    if step < 4:
+        vae._decoder.train()
+        vae._decoder.requires_grad_(True)
+        return 0.01
+    elif step < 40:
+        # Force encoder to minimize loss with a dumb decoder
+        # vae._decoder.eval()
+        # vae._decoder.requires_grad_(False)
+        return 0.001
+    else:
+        vae._decoder.train()
+        vae._decoder.requires_grad_(True)
+        return 0.003
+
+### Training loop
+
+def kl_divergence(mu, lv):
+    return -0.5 * torch.sum(1 + lv - mu.pow(2) - lv.exp(), dim=1)
+
 if __name__=="__main__":
     run_id = sys.argv[1] if len(sys.argv) > 1 else "default"
 
@@ -147,118 +211,87 @@ if __name__=="__main__":
     freeze_step = 4
     unfreeze_step = 40
     beta_step = 400
-    frozen = False
+    batch_size = 128
 
-    # get some images from the train set
+    # load dynamic training set
     dset = "train2014"
     dataset = CocoImageDataset(DATA_DIR + f"{dset}/{dset}/", count=None)
-    loader = DataLoader(dataset, batch_size=128, shuffle=True)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
+    # load static validation set
+    v_dset = "val2014"
+    v_dataset = CocoImageDataset(DATA_DIR + f"{v_dset}/{v_dset}/", count=32, rrc=False)
+    v_loader = DataLoader(v_dataset, batch_size=32, shuffle=False)
+
+    # torch object creation
     config = VAEConfig() 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     vae = VAE(config).to(device)
     opt = torch.optim.Adam(vae.parameters(), lr=0.001, weight_decay=0.0001)
 
     log_params(vae)
-
-    def kl_weighting_base(step, warmup_steps):
-        kl_weight = min(0.009, (step-400) / warmup_steps)
-        return max(0.003, kl_weight)
-    kl_weighting = kl_weighting_base
+    print(f"batch size: {batch_size}\n")
 
     for epoch in range(epochs):
-        # train mode wrt freezing
-        vae.train()  
-        if frozen:
-            vae._decoder.eval()
-        epoch_start = perf_counter()
         for images in loader:
-            # apply any phase switches
-            if global_step == 0:
-                # startup phase - train with a little KL 
-                def kl_w1(step, warmup_steps):
-                    return 0.01
-                kl_weighting = kl_w1
-            elif global_step == freeze_step:
-                # freeze phase - train encoder only, no KL
-                frozen = True
-                vae._decoder.requires_grad_(False)
-                vae._decoder.eval()  # freeze decoder batchnorms
-                opt = torch.optim.Adam(
-                    filter(lambda p: p.requires_grad, vae.parameters()),
-                    lr=0.001, 
-                    weight_decay=0.0001,
-                )
-                # alter weighting scheme
-                def kl_w2(step, warmup_steps):
-                    return 0.0
-                kl_weighting = kl_w2
-            elif global_step == unfreeze_step:
-                # unfreeze phase - unfreeze decoder BUT leave beta = 0
-                frozen = False
-                vae._decoder.requires_grad_(True)
-                vae._decoder.train()
-                opt = torch.optim.Adam(
-                    vae.parameters(),
-                    lr=0.001, 
-                    weight_decay=0.0001,
-                )
-                def kl_w3(step, warmup_steps):
-                    return 0.003
-                kl_weighting = kl_w3
-            elif global_step == beta_step:
-                # begin re-introducing real beta
-                kl_weighting = kl_weighting_base
+            # prepare for step
+            vae.train()  
+            kl_weight = set_decoder_trainable(vae, global_step)
 
+            # forward
             step_start = perf_counter()
             images = images.to(device)
             recon, mu, lv = vae(images)
             
-            # simple normalized losses
+            # simple normalized recon + weighted KL
             recon_loss = F.mse_loss(recon, images, reduction="mean")  # avg losses
             kl_loss = kl_divergence(mu, lv)
-            kl_weight = kl_weighting(global_step, kl_warmup_steps)
             loss = (recon_loss + kl_weight * kl_loss).mean()
 
+            # backward
             opt.zero_grad()
             loss.backward()
-            # check_explosive_gradients(vae)
+            torch.nn.utils.clip_grad_norm_(
+                filter(lambda p: p.requires_grad, vae.parameters()),
+                1.0,
+            )
             opt.step()
 
             global_step += 1
-            print(f"\nStep: {global_step}, Loss: {loss} (RL: {recon_loss.mean()}, KL: {kl_loss.mean()}, KLw: {kl_weight})")
-            print(f"perf: {perf_counter()-step_start}")
-            print(f"mu.mean: {mu.abs().mean().item()}, lv.mean: {lv.mean().item()}")
-            print(f"mu.pdist: {torch.pdist(mu).mean().item()}")
 
-            # is my latent space even being used
-            '''
-            with torch.no_grad():
-                z_prior = torch.randn_like(mu)
-                x_prior = vae._decoder(z_prior)
-                prior_recon_loss = F.mse_loss(x_prior, images, reduction="mean")
-                print(f"prior MSE: {prior_recon_loss}")
-            '''
+            # logging every 10
+            if global_step % 10 == 1:
+                print(f"\nStep: {global_step}, Loss: {loss} (RL: {recon_loss.mean()}, KL: {kl_loss.mean()}, KLw: {kl_weight})")
+                print(f"perf: {perf_counter()-step_start}")
+                print(f"mu.mean: {mu.abs().mean().item()}, lv.mean: {lv.mean().item()}")
+                print(f"mu.pdist: {torch.pdist(mu).mean().item()}")
+                image_stats("x", images)
+                image_stats("x_hat", recon)
 
-            # visualize
+            # validation set + visualization
             if global_step % 50 == 1:
-                #image_stats("x", images)
-                #image_stats("x_hat", recon)
-                @torch.no_grad()
-                def denorm_imagenet(t):
-                    mean = torch.tensor(IMAGENET_MEAN, device=t.device).view(1,3,1,1)
-                    std  = torch.tensor(IMAGENET_STD,  device=t.device).view(1,3,1,1)
-                    return (t * std + mean)
-                image_display = denorm_imagenet(images).clamp(0, 1)
-                recon_display = denorm_imagenet(recon).clamp(0, 1)
-                #image_stats("x_norm", image_display)
-                #image_stats("x_hat_norm", recon_display)
-                save_x_and_recon(image_display, recon_display, filename=run_id+f"/step_{global_step}.png")
+                vae.eval()
+                with torch.no_grad():
+                    for v_images in v_loader:
+                        v_images = v_images.to(device)
+                        v_recon, v_mu, v_lv = vae(v_images)
+                        v_recon_loss = F.mse_loss(v_recon, v_images, reduction="mean")
+                        v_kl_loss = kl_divergence(v_mu, v_lv)
+                        v_recon_mu = vae._decoder(v_mu)
+                        print(f"\nValidation: {global_step}, RL: {v_recon_loss.mean()}, KL: {v_kl_loss.mean()})")
+                        print(f"mu.mean: {v_mu.abs().mean().item()}, lv.mean: {v_lv.mean().item()}")
+                        print(f"mu.pdist: {torch.pdist(v_mu).mean().item()}")
 
-        '''
-        print(f"\nEpoch {epoch:03d} | ")
-        print(f"Most recent recon: {recon_loss.mean():.1f} | ")
-        print(f"KL: {kl_loss.mean():.1f} | ")
-        print(f"KL_w: {kl_weight:.3f}\n")
-        print(f"Perf: {perf_counter()-epoch_start}")
-        '''
+                    def denorm_imagenet(t):
+                        mean = torch.tensor(IMAGENET_MEAN, device=t.device).view(1,3,1,1)
+                        std  = torch.tensor(IMAGENET_STD,  device=t.device).view(1,3,1,1)
+                        return (t * std + mean)
+                    image_display = denorm_imagenet(v_images).clamp(0, 1)
+                    recon_display = denorm_imagenet(v_recon).clamp(0, 1)
+                    recon_mu_display = denorm_imagenet(v_recon_mu).clamp(0, 1)
+                    save_x_and_recon(
+                        image_display, 
+                        recon_display, 
+                        recon_mu_display, 
+                        filename=run_id+f"/step_{global_step}.png",
+                    )

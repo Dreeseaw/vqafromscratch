@@ -37,8 +37,23 @@ class ConvUpBlock(nn.Module):
     def __init__(self, ic, oc, kernel_size=4, stride=2, padding=1, act=nn.ReLU(inplace=True)):
         super().__init__()
         self._block = nn.Sequential(
-            nn.ConvTranspose2d(ic, oc, kernel_size, stride, padding),
+            # try mode="bilinear" as well some time
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(ic, oc, kernel_size=3, padding=1),
             nn.BatchNorm2d(oc),
+            act,
+        )
+
+    def forward(self, x):
+        return self._block(x)
+
+class ConvUpBlock_NoBN(nn.Module):
+    def __init__(self, ic, oc, kernel_size=4, stride=2, padding=1, act=nn.ReLU(inplace=True)):
+        super().__init__()
+        self._block = nn.Sequential(
+            # try mode="bilinear" as well some time
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(ic, oc, kernel_size=3, padding=1),
             act,
         )
 
@@ -75,20 +90,38 @@ class Decoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self._config = config
-        self._precoder = nn.Conv2d(config.latent_dim, 256, kernel_size=3, padding=1)
+
+        # get spatial info back
+        
+        # focused on extracting spatial info
+        self._spatialer = nn.Linear(config.latent_dim, 64 * 14 * 14)
+        # tensor gets shape-change in between layers 
+        self._precoder = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            # nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            # nn.ReLU(inplace=True),
+        )
+        
+        # focused on upsampling into a real RGB image
         self._decoder = nn.Sequential(
-            ConvUpBlock(256, 128),  # 14x14
-            ConvUpBlock(128, 64),   # 28x28
-            ConvUpBlock(64, 32),    # 56x56
-            ConvUpBlock(32, 16),    # 112x112
-            ConvUpBlock(16, 3, act=nn.Identity()),  # 224x224
+            ConvUpBlock_NoBN(128, 96),  # 14x14 (x2)
+            ConvUpBlock_NoBN(96, 64),   # 28x28 (x2)
+            ConvUpBlock_NoBN(64, 32),    # 56x56 (x2)
+            ConvUpBlock_NoBN(32, 16),    # 112x112 (x2)
+            nn.Conv2d(16, 3, kernel_size=3, padding=1), # still 224x224
         )
 
     def forward(self, z):
-        z = z[:, :, None, None]
-        z = z.expand(-1, -1, 7, 7)
-        z = self._precoder(z) 
-        return self._decoder(z)
+        h = self._spatialer(z)
+        h = h.view(
+            z.size(0), 
+            self._config.latent_dim // 4, 
+            self._config.feature_w * 2,
+            self._config.feature_h * 2,
+        )
+        h = self._precoder(h) 
+        return self._decoder(h)
 
 
 """
@@ -103,11 +136,11 @@ class VariationalAutoEncoder(nn.Module):
         # [B,W,H,3] -> [B,D]
         self._encoder = Encoder(config)
         encoder_output_channels = 256  # keep here in case it changes a lot
-        self._gap = nn.AdaptiveAvgPool2d(output_size=(1, 1))
+        # self._gap = nn.AdaptiveAvgPool2d(output_size=(1, 1))
 
         # Learned posterior weights
-        self._mu = nn.Linear(encoder_output_channels, self._config.latent_dim)
-        self._logvar = nn.Linear(encoder_output_channels, self._config.latent_dim)
+        self._mu = nn.Linear(encoder_output_channels * 7 * 7, self._config.latent_dim)
+        self._logvar = nn.Linear(encoder_output_channels * 7 * 7, self._config.latent_dim)
 
         # [B,D] -> [B,W,H,3]
         self._decoder = Decoder(config)
@@ -122,11 +155,14 @@ class VariationalAutoEncoder(nn.Module):
         # features = torch.flatten(features, start_dim=1)
 
         # good approach
-        features = self._gap(features).flatten(1)
+        # features = self._gap(features).flatten(1)
+        
+        # overfit test approach
+        features = features.flatten(1)
 
         mu = self._mu(features)  # position in latent space
         lv = self._logvar(features)  # confidence of position in latent space
-        clipped_lv = torch.clamp(lv, min=-10.0, max=0.0)  # help combat exploding gradients
+        clipped_lv = torch.clamp(lv, min=-10.0, max=-2.0)  # help combat exploding gradients
         std = torch.exp(clipped_lv / 2.0)
         sample = mu  + (torch.randn_like(std) * std)  # vary it for automatic encoding
         if nan_check(sample): print("samples have nan")

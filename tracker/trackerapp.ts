@@ -9,7 +9,7 @@ import path from "path";
 const args = process.argv;
 const dirIndex = args.indexOf("-f");
 if (dirIndex === -1) {
-  console.error("Usage: bun run trackerapp.ts -f <run_dir>");
+  console.error("Usage: bun run trackerapp.ts -f <run_dir> [-p <port>]");
   process.exit(1);
 }
 
@@ -22,6 +22,17 @@ if (!fs.existsSync(runDir)) {
 }
 if (!fs.existsSync(logfile)) {
   console.error(`Missing logfile.txt in ${runDir}`);
+  process.exit(1);
+}
+
+const portIndex = args.indexOf("-p");
+const port =
+  portIndex !== -1
+    ? Number(args[portIndex + 1])
+    : 3000;
+
+if (!Number.isInteger(port) || port <= 0) {
+  console.error(`Invalid port: ${args[portIndex + 1]}`);
   process.exit(1);
 }
 
@@ -48,7 +59,7 @@ function parseLine(line: string) {
 // SERVER
 // -------------------------
 serve({
-  port: 3000,
+  port: port,
 
   async fetch(req) {
     const url = new URL(req.url);

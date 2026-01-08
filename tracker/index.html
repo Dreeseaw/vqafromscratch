@@ -6,10 +6,10 @@
 <div>Recon / RL</div>
 <canvas id="plot_rl" width="800" height="200"></canvas>
 
-<div>KL</div>
+<div>KL (log-scale)</div>
 <canvas id="plot_kl" width="800" height="200"></canvas>
 
-<div>Weighted KL = KL × KLw</div>
+<div>Weighted KL = KL x KLw (log-scale)</div>
 <canvas id="plot_wkl" width="800" height="200"></canvas>
 
 <h3>Reconstructions</h3>
@@ -129,15 +129,18 @@ function draw() {
 
   const steps = data.map(d => d.step);
 
+  const eps = 1e-12;
   const loss = data.map(d => d.loss);
   const rl = data.map(d => d.rl);
-  const kl = data.map(d => d.kl);
-  const wkl = data.map(d => d.kl * d.klw);
+  let kl = data.map(d => d.kl);
+  kl = kl.map(v => Math.log10(Math.max(v, 0) + eps));
+  let wkl = data.map(d => d.kl * d.klw);
+  wkl = wkl.map(v => Math.log10(Math.max(v, 0) + eps));
 
   drawSingleSeries(ctxL, cL, steps, loss, "Loss", "green");
   drawSingleSeries(ctxRL, cRL, steps, rl, "Recon", "blue");
   drawSingleSeries(ctxKL, cKL, steps, kl, "KL", "red");
-  drawSingleSeries(ctxWKL, cWKL, steps, wkl, "Weighted KL = KL × KLw", "purple");
+  drawSingleSeries(ctxWKL, cWKL, steps, wkl, "Weighted KL = KL x KLw", "purple");
 }
 
 const evt = new EventSource("/stream");
