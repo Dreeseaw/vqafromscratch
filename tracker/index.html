@@ -152,11 +152,44 @@ evt.onmessage = (e) => {
 const imgDiv = document.getElementById("images");
 const seen = new Set();
 
+function pruneReverseLog(files, limit) {
+  if (files.length <= limit) return files.slice();
+
+  const out = [];
+  const n = files.length;
+
+  // Always keep the first image
+  out.push(files[0]);
+
+  const remaining = limit - 1;
+  if (remaining <= 0) return out;
+
+  // Indices sampled logarithmically toward the end
+  const seen = new Set([0]);
+
+  for (let i = 0; i < remaining; i++) {
+    const t = i / (remaining - 1);          // [0, 1]
+    const logT = Math.log10(1 + 9 * t);      // bias toward 1
+    const idx = Math.floor(logT * (n - 1));
+
+    if (!seen.has(idx)) {
+      seen.add(idx);
+      out.push(files[idx]);
+    }
+  }
+
+  // Ensure most recent image is always included
+  if (!seen.has(n - 1)) out.push(files[n - 1]);
+
+  // Sort to preserve chronological order
+  return out.sort((a, b) => files.indexOf(a) - files.indexOf(b));
+}
+
 async function pollImages() {
   const res = await fetch("/images");
   const files = await res.json();
-
-  for (const f of files) {
+  const sparse_files = pruneReverseLog(files, 30);
+  for (const f of sparse_files) {
     if (seen.has(f)) continue;
     seen.add(f);
 
