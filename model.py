@@ -162,7 +162,7 @@ class VariationalAutoEncoder(nn.Module):
 
         mu = self._mu(features)  # position in latent space
         lv = self._logvar(features)  # confidence of position in latent space
-        clipped_lv = torch.clamp(lv, min=-10.0, max=-2.0)  # help combat exploding gradients
+        clipped_lv = torch.clamp(lv, min=-10.0, max=1.0)  # help combat exploding gradients
         std = torch.exp(clipped_lv / 2.0)
         sample = mu  + (torch.randn_like(std) * std)  # vary it for automatic encoding
         if nan_check(sample): print("samples have nan")

@@ -32,8 +32,11 @@ DATA_DIR = "/Users/williamdreese/percy/vqa/VQA/Images/mscoco/"
 
 ### Training, eval, & test loading
 
+COLOR_MEAN = (0.485, 0.456, 0.406)
+COLOR_STD  = (0.229, 0.224, 0.225)
+
 class CocoImageDataset(Dataset):
-    def __init__(self, image_dir, count=None, rrc=True):
+    def __init__(self, image_dir, count=None, rrc=True, flip=True):
         self.image_dir = image_dir
         self.sizes = list()
         self.image_files = sorted(os.listdir(image_dir))
@@ -53,12 +56,16 @@ class CocoImageDataset(Dataset):
         else:
             trans = [transforms.Resize((224,224))]
 
+        if flip:
+            trans.extend([
+                transforms.RandomHorizontalFlip(p=0.5),
+            ])
+
         trans.extend([
-            transforms.RandomHorizontalFlip(p=0.5),
             transforms.ToTensor(),
             transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
+                mean=list(COLOR_MEAN),
+                std=list(COLOR_STD),
             ),
         ])
         self.transform = transforms.Compose(trans)
@@ -95,18 +102,15 @@ def weight_nan_check(model):
     return False
 
 
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD  = (0.229, 0.224, 0.225)
-
 @torch.no_grad()
 def save_x_and_recon(
     x, 
     x_hat, 
     x_hat_mu, 
-    idx=9, 
+    idx=2, 
     filename=None,
-    mean=IMAGENET_MEAN, 
-    std=IMAGENET_STD,
+    mean=COLOR_MEAN, 
+    std=COLOR_STD,
 ):
     """
     x, x_hat, x_hat_mu: [B,3,H,W] tensors in normalized space
@@ -182,18 +186,29 @@ def test_mu(mu, vae, images, recon):
 ### Training schedule helper(s)
 
 def set_decoder_trainable(vae, step) -> float:
+
+    # linear klw growth
+    return min(max(step / 10_000, 0.001), 0.01)
+
+    # attempt multiple "linear bumps" that grow klw by 10x, 2x, 1.5x, 1.1x
+    # at arbitrary steps 
+    # warmup bump (10x) - steps 10->100: 0.001 -> 0.01
+    # latent bump (2x) - steps 500->1k: 0.01 -> 0.02 
+    # generalization bump (1.25x) - 2k->5k: 0.02 -> 0.025 
+    # final bump (1.1x) - 10k -> 20k: 0.0275
+
     if step < 4:
-        vae._decoder.train()
-        vae._decoder.requires_grad_(True)
-        return 0.01
+        # vae._decoder.train()
+        # vae._decoder.requires_grad_(True)
+        return 0.001
     elif step < 40:
         # Force encoder to minimize loss with a dumb decoder
         # vae._decoder.eval()
         # vae._decoder.requires_grad_(False)
         return 0.001
     else:
-        vae._decoder.train()
-        vae._decoder.requires_grad_(True)
+        # vae._decoder.train()
+        # vae._decoder.requires_grad_(True)
         return 0.003
 
 ### Training loop
@@ -215,8 +230,12 @@ if __name__=="__main__":
 
     # load dynamic training set
     dset = "train2014"
-    dataset = CocoImageDataset(DATA_DIR + f"{dset}/{dset}/", count=None)
+    dataset = CocoImageDataset(DATA_DIR + f"{dset}/{dset}/")
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    # uncomment (& comment out above) for overfit testing
+    # dataset = CocoImageDataset(DATA_DIR + f"{dset}/{dset}/", count=8, rrc=False, flip=False)
+    # loader = DataLoader(dataset, batch_size=8, shuffle=False)
 
     # load static validation set
     v_dset = "val2014"
@@ -283,8 +302,8 @@ if __name__=="__main__":
                         print(f"mu.pdist: {torch.pdist(v_mu).mean().item()}")
 
                     def denorm_imagenet(t):
-                        mean = torch.tensor(IMAGENET_MEAN, device=t.device).view(1,3,1,1)
-                        std  = torch.tensor(IMAGENET_STD,  device=t.device).view(1,3,1,1)
+                        mean = torch.tensor(COLOR_MEAN, device=t.device).view(1,3,1,1)
+                        std  = torch.tensor(COLOR_STD,  device=t.device).view(1,3,1,1)
                         return (t * std + mean)
                     image_display = denorm_imagenet(v_images).clamp(0, 1)
                     recon_display = denorm_imagenet(v_recon).clamp(0, 1)

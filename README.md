@@ -34,3 +34,12 @@ Running loss logging web app
 > cd tracker/ && bun run trackerapp.ts -f ../logs/<run_id>
 ```
 and navigate to `localhost:3000` in your browser.
+
+Create mp4 of step_nnn.png's 
+----------------------------
+```bash
+> cd logs/<run_id>/
+> ls step_*.png | sort -V | sed "s/^/file '/; s/$/'/" > frames.txt && \
+ffmpeg -y -r 30 -f concat -safe 0 -i frames.txt \
+  -c:v libx264 -pix_fmt yuv420p -crf 18 out.mp4
+```

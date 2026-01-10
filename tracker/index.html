@@ -135,7 +135,7 @@ function draw() {
   let kl = data.map(d => d.kl);
   kl = kl.map(v => Math.log10(Math.max(v, 0) + eps));
   let wkl = data.map(d => d.kl * d.klw);
-  wkl = wkl.map(v => Math.log10(Math.max(v, 0) + eps));
+  // wkl = wkl.map(v => Math.log10(Math.max(v, 0) + eps));
 
   drawSingleSeries(ctxL, cL, steps, loss, "Loss", "green");
   drawSingleSeries(ctxRL, cRL, steps, rl, "Recon", "blue");
