@@ -1,14 +1,16 @@
 """
-training code
+training code for vae
 
-- ResNet paper section 3.4 (Implementation) hyperparams
+new run
+> python3 train.py my_fun_run_id
+
+continue from weights (in this case, from step 4000)
+> python3 train.py my_fun_run_id 4000
 
 results saved in 
 - /logs/<run_id>/logfile.txt
 - /logs/<run_id>/step_N.jpg
-
-todo
-- saving weights
+- /logs/<run_id>/step_N.tar
 """
 import os
 import sys
@@ -22,6 +24,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 from torchvision import transforms
+from torchvision.utils import save_image
 
 from model import VariationalAutoEncoder as VAE, VAEConfig
 
@@ -38,7 +41,6 @@ COLOR_STD  = (0.229, 0.224, 0.225)
 class CocoImageDataset(Dataset):
     def __init__(self, image_dir, count=None, rrc=True, flip=True):
         self.image_dir = image_dir
-        self.sizes = list()
         self.image_files = sorted(os.listdir(image_dir))
         if count:
             self.image_files = self.image_files[:count]
@@ -76,21 +78,47 @@ class CocoImageDataset(Dataset):
     def __getitem__(self, idx):
         img_path = os.path.join(self.image_dir, self.image_files[idx])
         image = Image.open(img_path).convert("RGB")
-        self.sizes.append(image.size)
         image = self.transform(image)
         return image
 
+
 ### Logging & visualization
 
-def log_params(model):
+LOGDIR  = "logs/"
+LOGFILE = "logfile.txt"
+
+class Logger:
+    def __init__(self, run_id, checkpoint_id):
+        self._run_id = run_id
+        self._base   = LOGDIR+run_id+"/"
+        self._ckpt   = checkpoint_id
+
+        # fail on duplicate run_id for now (unless cont. training)
+        if os.path.isfile(self._base+LOGFILE) and not checkpoint_id:
+            print("this run_id already exists (np ckpt) - exitting")
+            sys.exit(1)
+
+    def log(self, txt):
+        print(txt)
+        fn = self._base+LOGFILE
+        if self._ckpt:
+            fn = self._base+f'logfile_from_{self._ckpt}.txt'
+        
+        # just create new file for logging if it's a continue training run,
+        # to avoid dual-writing the same step to a file
+        # (let web app read both and dedupe)
+        with open(fn, 'a') as f:
+            f.write(txt)
+
+def log_params(model, logger):
     total_params, total_bytes = 0, 0
     for name, param in model.named_parameters():
         total_params += param.numel()
         total_bytes += param.nelement() * param.element_size()
     param_size_mb = total_bytes / (1024**2)
-    print(f"Count: {total_params:,}")
-    print(f"Size (Bytes): {total_bytes}")
-    print(f"Size (MB): {param_size_mb:.4f}")
+    logger.log(f"Count: {total_params:,}")
+    logger.log(f"Size (Bytes): {total_bytes}")
+    logger.log(f"Size (MB): {param_size_mb:.4f}")
 
 def nan_check(tensor):
     return torch.isnan(tensor).any().item()
@@ -101,64 +129,17 @@ def weight_nan_check(model):
             return True
     return False
 
-
 @torch.no_grad()
-def save_x_and_recon(
-    x, 
-    x_hat, 
-    x_hat_mu, 
-    idx=2, 
-    filename=None,
-    mean=COLOR_MEAN, 
-    std=COLOR_STD,
-):
-    """
-    x, x_hat, x_hat_mu: [B,3,H,W] tensors in normalized space
-    idx: which element in the batch to show
-    filename: what to name the saveed file for later viewing
-    mean, std: input transformation values
-    """
-    assert x.dim() == 4 and x.shape[1] == 3
-    assert x_hat.shape == x.shape 
-    assert x.shape == x_hat_mu.shape
-    assert 0 <= idx < x.shape[0]
-
-    # pick one example
-    x0 = x[idx].detach().cpu().float()
-    xh0 = x_hat[idx].detach().cpu().float()
-    xhu0 = x_hat_mu[idx].detach().cpu().float()
-
-    # CHW -> HWC
-    x0  = x0.permute(1, 2, 0)
-    xh0 = xh0.permute(1, 2, 0)
-    xhu0 = xhu0.permute(1, 2, 0)
-
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-    if filename:
-        fig.suptitle(filename, fontsize=14)
-
-    axes[0].imshow(x0)
-    axes[0].set_title("input")
-    axes[0].axis("off")
-
-    axes[1].imshow(xh0)
-    axes[1].set_title("recon")
-    axes[1].axis("off")
-
-    axes[2].imshow(xhu0)
-    axes[2].set_title("recon_u")
-    axes[2].axis("off")
-
-    plt.tight_layout()
-    plt.savefig(filename)
-    plt.close(fig)  # free up pic memory
+def save_triplet(x, x_hat, x_hat_mu, filename, idx=3):
+    trip = torch.stack([x[idx], x_hat[idx], x_hat_mu[idx]], dim=0)
+    save_image(trip, filename, nrow=3)
 
 def check_explosive_gradients(model):
     for name, param in model.named_parameters():
         if param.requires_grad and param.grad is not None:
             max_grad = param.grad.detach().abs().max()
             if max_grad >= 1e4:
-                print(f"Layer: {name} | Max Gradient: {max_grad.item():.4e} <--- Potential Explosion")
+                print(f"Layer: {name} | Max Gradient: {max_grad.item():.4e} <=====")
 
 def image_stats(name, t):
     t = t.detach()
@@ -167,49 +148,13 @@ def image_stats(name, t):
         f"min={t.min().item():.4f} max={t.max().item():.4f} mean={t.mean().item():.4f}"
     )
 
-# save here for when I need to verify latent is being used
-def test_mu(mu, vae, images, recon):
-    # is my latent space even being used
-    with torch.no_grad():
-        z_prior = torch.randn_like(mu)
-        x_prior = vae._decoder(z_prior)
-        prior_recon_loss = F.mse_loss(x_prior, images, reduction="mean")
-        print(f"prior MSE: {prior_recon_loss}")
-
-    @torch.no_grad()
-    def mse_with_optimal_scale(x, x_hat):
-        a = (x * x_hat).mean() / (x_hat * x_hat).mean().clamp(min=1e-8)
-        return ((x - a * x_hat) ** 2).mean().item(), a.item()
-    print(f"mse_scaled: {mse_with_optimal_scale(images, recon)}")
-
 
 ### Training schedule helper(s)
 
 def set_decoder_trainable(vae, step) -> float:
-
-    # linear klw growth
-    return min(max(step / 10_000, 0.001), 0.01)
-
-    # attempt multiple "linear bumps" that grow klw by 10x, 2x, 1.5x, 1.1x
-    # at arbitrary steps 
-    # warmup bump (10x) - steps 10->100: 0.001 -> 0.01
-    # latent bump (2x) - steps 500->1k: 0.01 -> 0.02 
-    # generalization bump (1.25x) - 2k->5k: 0.02 -> 0.025 
-    # final bump (1.1x) - 10k -> 20k: 0.0275
-
-    if step < 4:
-        # vae._decoder.train()
-        # vae._decoder.requires_grad_(True)
-        return 0.001
-    elif step < 40:
-        # Force encoder to minimize loss with a dumb decoder
-        # vae._decoder.eval()
-        # vae._decoder.requires_grad_(False)
-        return 0.001
-    else:
-        # vae._decoder.train()
-        # vae._decoder.requires_grad_(True)
-        return 0.003
+    # linear, but need to get this schedule down
+    # or maybe account for R-D curve
+    return min(max(step / 100_000, 0.001), 0.02)
 
 ### Training loop
 
@@ -218,29 +163,43 @@ def kl_divergence(mu, lv):
 
 if __name__=="__main__":
     run_id = sys.argv[1] if len(sys.argv) > 1 else "default"
+    checkpoint_id = int(sys.argv[2]) if len(sys.argv) > 2 else None
 
     # hyperparams
     epochs = 20_000  # by the time my kids have kids
     global_step = 0
-    kl_warmup_steps = 5000
-    freeze_step = 4
-    unfreeze_step = 40
-    beta_step = 400
     batch_size = 128
 
     # load dynamic training set
     dset = "train2014"
     dataset = CocoImageDataset(DATA_DIR + f"{dset}/{dset}/")
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    loader = DataLoader(
+        dataset, 
+        batch_size=batch_size, 
+        shuffle=True,
+        num_workers=5,
+        persistent_workers=True,
+        prefetch_factor=4,
+    )
 
-    # uncomment (& comment out above) for overfit testing
+    # uncomment for overfit testing
     # dataset = CocoImageDataset(DATA_DIR + f"{dset}/{dset}/", count=8, rrc=False, flip=False)
     # loader = DataLoader(dataset, batch_size=8, shuffle=False)
 
     # load static validation set
     v_dset = "val2014"
     v_dataset = CocoImageDataset(DATA_DIR + f"{v_dset}/{v_dset}/", count=32, rrc=False)
-    v_loader = DataLoader(v_dataset, batch_size=32, shuffle=False)
+    v_loader = DataLoader(
+        v_dataset, 
+        batch_size=32, 
+        shuffle=False,
+        num_workers=1,
+        persistent_workers=True,
+    )
+
+    # cpu performance guidance
+    torch.set_num_threads(os.cpu_count()-6)
+    torch.set_num_interop_threads(1)
 
     # torch object creation
     config = VAEConfig() 
@@ -248,17 +207,25 @@ if __name__=="__main__":
     vae = VAE(config).to(device)
     opt = torch.optim.Adam(vae.parameters(), lr=0.001, weight_decay=0.0001)
 
-    log_params(vae)
-    print(f"batch size: {batch_size}\n")
+    if checkpoint_id:
+        ckpt_file = f'logs/{run_id}/step_{checkpoint_id}.tar'
+        checkpoint = torch.load(ckpt_file, weights_only=True)
+        vae.load_state_dict(checkpoint['model_state_dict'])
+        opt.load_state_dict(checkpoint['optimizer_state_dict'])
+        global_step = checkpoint['global_step']
+
+    logger = Logger(run_id, checkpoint_id)
+    log_params(vae, logger)
+    logger.log(f"batch size: {batch_size}\n")
+    step_start = perf_counter()
 
     for epoch in range(epochs):
+        vae.train()
         for images in loader:
             # prepare for step
-            vae.train()  
             kl_weight = set_decoder_trainable(vae, global_step)
 
             # forward
-            step_start = perf_counter()
             images = images.to(device)
             recon, mu, lv = vae(images)
             
@@ -280,12 +247,13 @@ if __name__=="__main__":
 
             # logging every 10
             if global_step % 10 == 1:
-                print(f"\nStep: {global_step}, Loss: {loss} (RL: {recon_loss.mean()}, KL: {kl_loss.mean()}, KLw: {kl_weight})")
-                print(f"perf: {perf_counter()-step_start}")
-                print(f"mu.mean: {mu.abs().mean().item()}, lv.mean: {lv.mean().item()}")
-                print(f"mu.pdist: {torch.pdist(mu).mean().item()}")
-                image_stats("x", images)
-                image_stats("x_hat", recon)
+                step_end = perf_counter()
+                logger.log(f"\nStep: {global_step}, Loss: {loss.detach()} (RL: {recon_loss.mean().detach()}, KL: {kl_loss.mean().detach()}, KLw: {kl_weight})")
+                logger.log(f"10-step perf: {step_end-step_start}")
+                logger.log(f"mu.mean: {mu.abs().mean().detach()}, lv.mean: {lv.mean().detach()}")
+                step_start = step_end  # reset loop timer (includes val & weight save)
+                # too expensive
+                # logger.log(f"mu.pdist: {torch.pdist(mu).mean().item()}")
 
             # validation set + visualization
             if global_step % 50 == 1:
@@ -297,9 +265,9 @@ if __name__=="__main__":
                         v_recon_loss = F.mse_loss(v_recon, v_images, reduction="mean")
                         v_kl_loss = kl_divergence(v_mu, v_lv)
                         v_recon_mu = vae._decoder(v_mu)
-                        print(f"\nValidation: {global_step}, RL: {v_recon_loss.mean()}, KL: {v_kl_loss.mean()})")
-                        print(f"mu.mean: {v_mu.abs().mean().item()}, lv.mean: {v_lv.mean().item()}")
-                        print(f"mu.pdist: {torch.pdist(v_mu).mean().item()}")
+                        logger.log(f"\nValidation: {global_step}, RL: {v_recon_loss.mean()}, KL: {v_kl_loss.mean()})")
+                        logger.log(f"mu.mean: {v_mu.abs().mean().item()}, lv.mean: {v_lv.mean().item()}")
+                        # logger.log(f"mu.pdist: {torch.pdist(v_mu).mean().item()}")
 
                     def denorm_imagenet(t):
                         mean = torch.tensor(COLOR_MEAN, device=t.device).view(1,3,1,1)
@@ -308,9 +276,19 @@ if __name__=="__main__":
                     image_display = denorm_imagenet(v_images).clamp(0, 1)
                     recon_display = denorm_imagenet(v_recon).clamp(0, 1)
                     recon_mu_display = denorm_imagenet(v_recon_mu).clamp(0, 1)
-                    save_x_and_recon(
+                    # save_x_and_recon(
+                    save_triplet(    
                         image_display, 
                         recon_display, 
                         recon_mu_display, 
-                        filename=run_id+f"/step_{global_step}.png",
+                        filename="logs/"+run_id+f"/step_{global_step}.png",
                     )
+                vae.train()
+            # save weights for future testing/ training/ probing
+            if global_step % 1000 == 1 and global_step != 1:
+                checkpoint_path = f'logs/{run_id}/step_{global_step}.tar'
+                torch.save({
+                    'global_step': global_step,
+                    'model_state_dict': vae.state_dict(),
+                    'optimizer_state_dict': opt.state_dict(),
+                }, checkpoint_path)

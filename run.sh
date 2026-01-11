@@ -1,5 +1,17 @@
 #!/bin/bash
+set -e
 
-RUN_ID=$1
+if [ $# -lt 1 ]; then
+  echo "Usage: $0 <run_id> [checkpoint_step]"
+  exit 1
+fi
 
-mkdir -pv "logs/$RUN_ID" && python3 -u train.py "logs/$RUN_ID" | tee "logs/$RUN_ID/logfile.txt"
+RUN_ID="$1"
+
+mkdir -pv "logs/$RUN_ID" 
+if [ $# -ge 2 ]; then
+  CKPT_STEP="$2"
+  python train.py "$RUN_ID" "$CKPT_STEP"
+else
+  python train.py "$RUN_ID"
+fi

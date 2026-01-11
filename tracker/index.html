@@ -12,7 +12,12 @@
 <div>Weighted KL = KL x KLw (log-scale)</div>
 <canvas id="plot_wkl" width="800" height="200"></canvas>
 
-<h3>Reconstructions</h3>
+<div>dD/dR slope (EMA-based)</div>
+<canvas id="plot_slope" width="800" height="200"></canvas>
+
+<h2>Reconstructions</h2>
+<h3>Original - X' - X(mu)'</h3>
+
 <div id="images"></div>
 
 <script>
@@ -20,12 +25,33 @@ const cL = document.getElementById("plot_l");
 const cRL  = document.getElementById("plot_rl");
 const cKL  = document.getElementById("plot_kl");
 const cWKL = document.getElementById("plot_wkl");
+const cS   = document.getElementById("plot_slope");
+
 const ctxL = cL.getContext("2d");
 const ctxRL  = cRL.getContext("2d");
 const ctxKL  = cKL.getContext("2d");
 const ctxWKL = cWKL.getContext("2d");
+const ctxS   = cS.getContext("2d");
 
 const data = [];
+
+/**
+ * EMA state for D (RL) and R (KL)
+ * We compute slope as ΔD_ema / ΔR_ema each point.
+ *
+ * Interpretation:
+ *   slope > 0  => D increasing while R decreasing (collapse direction)
+ *   slope < 0  => D decreasing while R increasing (learning / using rate)
+ *   |slope| big => very sensitive region (rate changes cost a lot)
+ */
+const slopeState = {
+  init: false,
+  alpha: 0.01,     // ~100-step timescale; tweak 0.005–0.02
+  D_ema: 0,
+  R_ema: 0,
+  D_prev: 0,
+  R_prev: 0
+};
 
 function minMax(arr) {
   let mn = Infinity, mx = -Infinity;
@@ -63,7 +89,7 @@ function drawAxes(ctx, canvas, xMin, xMax, yMin, yMax, xTicks = 5, yTicks = 5) {
     ctx.lineTo(left, y);
     ctx.stroke();
 
-    ctx.fillText(v.toFixed(2), 5, y + 3);
+    ctx.fillText(v.toFixed(3), 5, y + 3);
   }
 
   // x ticks
@@ -81,6 +107,18 @@ function drawAxes(ctx, canvas, xMin, xMax, yMin, yMax, xTicks = 5, yTicks = 5) {
   }
 }
 
+function plotLine(ctx, xs, ys, xMap, yMap, color) {
+  ctx.beginPath();
+  ctx.strokeStyle = color;
+  for (let i = 0; i < ys.length; i++) {
+    const px = xMap(xs[i]);
+    const py = yMap(ys[i]);
+    if (i === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
+  }
+  ctx.stroke();
+}
+
 function drawSingleSeries(ctx, canvas, steps, series, label, color) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   if (series.length < 2) return;
@@ -96,32 +134,42 @@ function drawSingleSeries(ctx, canvas, steps, series, label, color) {
   const xMap = (s) => left + (s - xMin) / (xMax - xMin) * (right - left);
   const yMap = (v) => bottom - (v - yMin) / (yMax - yMin) * (bottom - top);
 
-  // axes
   drawAxes(ctx, canvas, xMin, xMax, yMin, yMax);
-
-  // line
   plotLine(ctx, steps, series, xMap, yMap, color);
 
-  // label
   ctx.fillStyle = "black";
   ctx.fillText(label, left + 5, 12);
 }
 
-function makeX(steps, w) {
-  const [xmin, xmax] = minMax(steps);
-  return (s) => 50 + (s - xmin) / (xmax - xmin) * (w - 80);
-}
+// Compute EMA slope point for a new (D=RL, R=KL) observation
+function updateSlope(D, R) {
+  const eps = 1e-9;
 
-function plotLine(ctx, xs, ys, xMap, yMap, color) {
-  ctx.beginPath();
-  ctx.strokeStyle = color;
-  for (let i = 0; i < ys.length; i++) {
-    const px = xMap(xs[i]);
-    const py = yMap(ys[i]);
-    if (i === 0) ctx.moveTo(px, py);
-    else ctx.lineTo(px, py);
+  if (!Number.isFinite(D) || !Number.isFinite(R)) return null;
+
+  if (!slopeState.init) {
+    slopeState.init = true;
+    slopeState.D_ema = D;
+    slopeState.R_ema = R;
+    slopeState.D_prev = D;
+    slopeState.R_prev = R;
+    return 0; // slope undefined at first point; return 0 for plotting
   }
-  ctx.stroke();
+
+  const a = slopeState.alpha;
+  slopeState.D_ema = a * D + (1 - a) * slopeState.D_ema;
+  slopeState.R_ema = a * R + (1 - a) * slopeState.R_ema;
+
+  const dD = slopeState.D_ema - slopeState.D_prev;
+  const dR = slopeState.R_ema - slopeState.R_prev;
+
+  slopeState.D_prev = slopeState.D_ema;
+  slopeState.R_prev = slopeState.R_ema;
+
+  // If dR is ~0, slope is unreliable; return null to skip plotting this point
+  if (Math.abs(dR) < eps) return null;
+
+  return dD / dR;
 }
 
 function draw() {
@@ -132,15 +180,61 @@ function draw() {
   const eps = 1e-12;
   const loss = data.map(d => d.loss);
   const rl = data.map(d => d.rl);
+
+  // KL and WKL
   let kl = data.map(d => d.kl);
   kl = kl.map(v => Math.log10(Math.max(v, 0) + eps));
+
   let wkl = data.map(d => d.kl * d.klw);
-  // wkl = wkl.map(v => Math.log10(Math.max(v, 0) + eps));
+
+  // Slope series (dD/dR using *raw* D=rl and R=kl_raw (not log))
+  const slopeSteps = [];
+  const slopes = [];
+  // Rebuild EMA from scratch each draw so the line is consistent (simple + robust)
+  const tmpState = { init:false, alpha:slopeState.alpha, D_ema:0, R_ema:0, D_prev:0, R_prev:0 };
+  const updateTmpSlope = (D, R) => {
+    const eps2 = 1e-9;
+    if (!Number.isFinite(D) || !Number.isFinite(R)) return null;
+    if (!tmpState.init) {
+      tmpState.init = true;
+      tmpState.D_ema = D;
+      tmpState.R_ema = R;
+      tmpState.D_prev = D;
+      tmpState.R_prev = R;
+      return 0;
+    }
+    const a = tmpState.alpha;
+    tmpState.D_ema = a * D + (1 - a) * tmpState.D_ema;
+    tmpState.R_ema = a * R + (1 - a) * tmpState.R_ema;
+
+    const dD = tmpState.D_ema - tmpState.D_prev;
+    const dR = tmpState.R_ema - tmpState.R_prev;
+
+    tmpState.D_prev = tmpState.D_ema;
+    tmpState.R_prev = tmpState.R_ema;
+
+    if (Math.abs(dR) < eps2) return null;
+    return dD / dR;
+  };
+
+  for (let i = 0; i < data.length; i++) {
+    const s = data[i].step;
+    const D = data[i].rl;
+    const Rraw = data[i].kl; // IMPORTANT: rate in nats, not log-scaled
+    const slope = updateTmpSlope(D, Rraw);
+    if (slope === null) continue;
+    slopeSteps.push(s);
+    slopes.push(slope);
+  }
+
+  const SCLAMP = 2;
+  const slopesClamped = slopes.map(v => Math.max(-SCLAMP, Math.min(SCLAMP, v)));
 
   drawSingleSeries(ctxL, cL, steps, loss, "Loss", "green");
-  drawSingleSeries(ctxRL, cRL, steps, rl, "Recon", "blue");
-  drawSingleSeries(ctxKL, cKL, steps, kl, "KL", "red");
+  drawSingleSeries(ctxRL, cRL, steps, rl, "Recon (mean MSE)", "blue");
+  drawSingleSeries(ctxKL, cKL, steps, kl, "KL (log10)", "red");
   drawSingleSeries(ctxWKL, cWKL, steps, wkl, "Weighted KL = KL x KLw", "purple");
+  drawSingleSeries(ctxS, cS, slopeSteps, slopesClamped, "dD/dR (EMA, clamped)", "black");
 }
 
 const evt = new EventSource("/stream");
@@ -149,6 +243,9 @@ evt.onmessage = (e) => {
   draw();
 };
 
+// -------------------------
+// Images
+// -------------------------
 const imgDiv = document.getElementById("images");
 const seen = new Set();
 
@@ -158,18 +255,16 @@ function pruneReverseLog(files, limit) {
   const out = [];
   const n = files.length;
 
-  // Always keep the first image
   out.push(files[0]);
 
   const remaining = limit - 1;
   if (remaining <= 0) return out;
 
-  // Indices sampled logarithmically toward the end
   const seen = new Set([0]);
 
   for (let i = 0; i < remaining; i++) {
-    const t = i / (remaining - 1);          // [0, 1]
-    const logT = Math.log10(1 + 9 * t);      // bias toward 1
+    const t = i / (remaining - 1);
+    const logT = Math.log10(1 + 9 * t);
     const idx = Math.floor(logT * (n - 1));
 
     if (!seen.has(idx)) {
@@ -178,10 +273,8 @@ function pruneReverseLog(files, limit) {
     }
   }
 
-  // Ensure most recent image is always included
   if (!seen.has(n - 1)) out.push(files[n - 1]);
 
-  // Sort to preserve chronological order
   return out.sort((a, b) => files.indexOf(a) - files.indexOf(b));
 }
 
