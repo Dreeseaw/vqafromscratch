@@ -182,7 +182,7 @@ if __name__=="__main__":
     # hyperparams
     epochs = 20_000  # by the time my kids have kids
     global_step = 0
-    batch_size = 128
+    batch_size = 96
 
     # cpu performance guidance
     torch.set_num_threads(8)
