@@ -184,6 +184,10 @@ if __name__=="__main__":
     global_step = 0
     batch_size = 128
 
+    # cpu performance guidance
+    torch.set_num_threads(8)
+    torch.set_num_interop_threads(1)
+
     # load dynamic training set
     dset = "train2014"
     dataset = CocoImageDataset(DATA_DIR + f"{dset}/{dset}/")
@@ -191,9 +195,9 @@ if __name__=="__main__":
         dataset, 
         batch_size=batch_size, 
         shuffle=True,
-        num_workers=5,
+        num_workers=1,
         persistent_workers=True,
-        prefetch_factor=4,
+        prefetch_factor=1,
     )
 
     # uncomment for overfit testing
@@ -207,13 +211,7 @@ if __name__=="__main__":
         v_dataset, 
         batch_size=32, 
         shuffle=False,
-        num_workers=1,
-        persistent_workers=True,
     )
-
-    # cpu performance guidance
-    torch.set_num_threads(os.cpu_count()-6)
-    torch.set_num_interop_threads(1)
 
     # torch object creation
     config = VAEConfig() 
@@ -264,7 +262,7 @@ if __name__=="__main__":
             if global_step % 10 == 1:
                 step_end = perf_counter()
                 logger.log(f"\nStep: {global_step}, Loss: {loss.detach()} (RL: {recon_loss.mean().detach()}, KL: {kl_loss.mean().detach()}, KLw: {kl_weight})")
-                logger.log(f"10-step perf: {step_end-step_start}")
+                logger.log(f"10-step im/s: {(batch_size*10) / (step_end-step_start)}")
                 logger.log(f"mu.mean: {mu.abs().mean().detach()}, lv.mean: {lv.mean().detach()}")
                 step_start = step_end  # reset loop timer (includes val & weight save)
                 # too expensive
