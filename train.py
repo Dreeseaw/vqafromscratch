@@ -237,18 +237,16 @@ if __name__=="__main__":
         vae.train()
         for images in loader:
             # prepare for step
-            kl_weight = set_decoder_trainable(vae, global_step)
+            beta = set_decoder_trainable(vae, global_step)
 
             # forward
             images = images.to(device)
             recon, mu, lv = vae(images)
             
             # simple normalized recon + weighted KL
-            recon_loss = F.mse_loss(recon, images, reduction="none")  # losses
-            recon_loss = recon_loss.flatten(1).sum(dim=1).mean()
+            recon_loss = F.mse_loss(recon, images, reduction="mean")
             kl_loss = kl_divergence(mu, lv)
-            kl_loss = kl_loss.flatten(1).sum(dim=1).mean()
-            loss = recon_loss + (kl_weight * kl_loss)
+            loss = (recon_loss + beta * kl_loss).mean()
 
             # backward
             opt.zero_grad()
@@ -265,7 +263,7 @@ if __name__=="__main__":
             if global_step % 10 == 1:
                 step_end = perf_counter()
                 r_norm = 3*224*224
-                logger.log(f"\nStep: {global_step}, Loss: {loss.detach() / r_norm} (RL: {recon_loss.detach() / r_norm}, KL: {kl_loss.detach()}, KLw: {kl_weight})")
+                logger.log(f"\nStep: {global_step}, Loss: {loss.detach()} (RL: {recon_loss.mean().detach()}, KL: {kl_loss.mean().detach()}, KLw: {beta})")
                 logger.log(f"10-step im/s: {(batch_size*10) / (step_end-step_start)}")
                 logger.log(f"mu.mean: {mu.flatten(1).abs().mean().detach()}, lv.mean: {lv.flatten(1).mean().detach()}")
                 step_start = step_end  # reset loop timer (includes val & weight save)
