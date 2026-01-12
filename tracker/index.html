@@ -1,4 +1,4 @@
-<h2>VAE Experiment Tracker</h2>
+<h1>VAE Experiment Tracker</h1>
 
 <div>Loss</div>
 <canvas id="plot_l" width="800" height="220"></canvas>
@@ -9,7 +9,7 @@
 <div>KL (log-scale)</div>
 <canvas id="plot_kl" width="800" height="200"></canvas>
 
-<div>Weighted KL = KL x KLw (log-scale)</div>
+<div>Weighted KL = KL x KLw</div>
 <canvas id="plot_wkl" width="800" height="200"></canvas>
 
 <div>dD/dR slope (EMA-based)</div>
@@ -18,7 +18,8 @@
 <div>Rate-Distortion (R=KL, D=RL) scatter</div>
 <canvas id="plot_rd" width="800" height="320"></canvas>
 
-<h3>Reconstructions</h3>
+<h2>Reconstructions</h2>
+<h3>X, X', X'(mu)</h3>
 <div id="images"></div>
 
 <script>
@@ -281,10 +282,27 @@ function draw() {
   drawRDScatter(ctxRD, cRD, rdPoints);
 }
 
+let lastStep = -1;
+let drawQueued = false;
+
 const evt = new EventSource("/stream");
 evt.onmessage = (e) => {
-  data.push(JSON.parse(e.data));
-  draw();
+  const d = JSON.parse(e.data);
+
+  // Ignore replays / duplicates
+  if (d.step <= lastStep) return;
+  lastStep = d.step;
+
+  data.push(d);
+
+  // Coalesce bursts into one draw
+  if (!drawQueued) {
+    drawQueued = true;
+    requestAnimationFrame(() => {
+      drawQueued = false;
+      draw();
+    });
+  }
 };
 
 // -------------------------

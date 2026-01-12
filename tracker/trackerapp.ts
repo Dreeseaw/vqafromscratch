@@ -77,26 +77,35 @@ serve({
     // SSE STREAM (LOG METRICS)
     // -------------------------
     if (url.pathname === "/stream") {
+      const lastEventId = Number(req.headers.get("last-event-id") ?? "-1");
+      const lastStepSeen = Number.isFinite(lastEventId) ? lastEventId : -1;
       let closed = false;
       let watcher: fs.FSWatcher | null = null;
 
       const stream = new ReadableStream<string>({
         start(controller) {
-          const safeEnqueue = (obj: any) => {
+	  const safeEnqueue = (obj: any) => {
             if (closed) return;
-            try {
+  	    try {
+              // Make reconnects resumable
+    	      controller.enqueue(`id: ${obj.step}\n`);
               controller.enqueue(`data: ${JSON.stringify(obj)}\n\n`);
             } catch {
               closed = true;
+	      // ew
               try { watcher?.close(); } catch {}
             }
           };
 
           // 1) send existing logfile contents
+	  let maxStepSent = lastStepSeen;
           const lines = fs.readFileSync(logfile, "utf-8").split("\n");
           for (const line of lines) {
             const parsed = parseLine(line);
-            if (parsed) safeEnqueue(parsed);
+            if (parsed && parsed.step > maxStepSent) {
+	      maxStepSent = parsed.step;
+	      safeEnqueue(parsed);
+	    }
           }
 
           // 2) tail logfile
@@ -122,11 +131,16 @@ serve({
                 if (parsed) safeEnqueue(parsed);
               });
           });
+	  const ping = setInterval(() => {
+	    if (closed) return;
+            try { controller.enqueue(`: ping\n\n`); } catch {}
+          }, 15000);
         },
 
         cancel() {
           closed = true;
           try { watcher?.close(); } catch {}
+	  try { clearInterval(ping); } catch {}
           watcher = null;
         },
       });
