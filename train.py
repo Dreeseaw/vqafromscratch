@@ -14,6 +14,7 @@ results saved in
 """
 import os
 import sys
+import datetime
 from collections import defaultdict
 from time import perf_counter
 
@@ -115,10 +116,23 @@ def log_params(model, logger):
     for name, param in model.named_parameters():
         total_params += param.numel()
         total_bytes += param.nelement() * param.element_size()
+    enc_params, enc_bytes = 0, 0
+    for name, param in model._encoder.named_parameters():
+        enc_params += param.numel()
+        enc_bytes += param.nelement() * param.element_size()
+    dec_params, dec_bytes = 0, 0
+    for name, param in model._decoder.named_parameters():
+        dec_params += param.numel()
+        dec_bytes += param.nelement() * param.element_size()
     param_size_mb = total_bytes / (1024**2)
-    logger.log(f"Count: {total_params:,}")
-    logger.log(f"Size (Bytes): {total_bytes}")
-    logger.log(f"Size (MB): {param_size_mb:.4f}")
+    enc_param_size_mb = enc_bytes / (1024**2)
+    dec_param_size_mb = dec_bytes / (1024**2)
+    latent_param_size_mb = param_size_mb - (enc_param_size_mb + dec_param_size_mb)
+    logger.log(f"Total: {total_params:,}")
+    logger.log(f"Total size (MB): {param_size_mb:.4f}")
+    logger.log(f"Encoder size (MB): {enc_param_size_mb:.4f}")
+    logger.log(f"Decoder size (MB): {dec_param_size_mb:.4f}")
+    logger.log(f"Latent head size (MB): {latent_param_size_mb:.4f}")
 
 def nan_check(tensor):
     return torch.isnan(tensor).any().item()
@@ -154,7 +168,7 @@ def image_stats(name, t):
 def set_decoder_trainable(vae, step) -> float:
     # linear, but need to get this schedule down
     # or maybe account for R-D curve
-    return min(max(step / 100_000, 0.001), 0.02)
+    return min(max((float(step)-200.0 / 300000.0) + 0.001, 0.001), 0.003)
 
 ### Training loop
 
@@ -216,7 +230,8 @@ if __name__=="__main__":
 
     logger = Logger(run_id, checkpoint_id)
     log_params(vae, logger)
-    logger.log(f"batch size: {batch_size}\n")
+    logger.log(f"batch size: {batch_size}")
+    logger.log(f"Run start time: {str(datetime.datetime.now())}\n")
     step_start = perf_counter()
 
     for epoch in range(epochs):

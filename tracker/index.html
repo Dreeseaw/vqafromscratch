@@ -1,7 +1,7 @@
 <h2>VAE Experiment Tracker</h2>
 
 <div>Loss</div>
-<canvas id="plot_l" width="800" height="260"></canvas>
+<canvas id="plot_l" width="800" height="220"></canvas>
 
 <div>Recon / RL</div>
 <canvas id="plot_rl" width="800" height="200"></canvas>
@@ -15,9 +15,10 @@
 <div>dD/dR slope (EMA-based)</div>
 <canvas id="plot_slope" width="800" height="200"></canvas>
 
-<h2>Reconstructions</h2>
-<h3>Original - X' - X(mu)'</h3>
+<div>Rate-Distortion (R=KL, D=RL) scatter</div>
+<canvas id="plot_rd" width="800" height="320"></canvas>
 
+<h3>Reconstructions</h3>
 <div id="images"></div>
 
 <script>
@@ -26,52 +27,40 @@ const cRL  = document.getElementById("plot_rl");
 const cKL  = document.getElementById("plot_kl");
 const cWKL = document.getElementById("plot_wkl");
 const cS   = document.getElementById("plot_slope");
+const cRD  = document.getElementById("plot_rd");
 
 const ctxL = cL.getContext("2d");
 const ctxRL  = cRL.getContext("2d");
 const ctxKL  = cKL.getContext("2d");
 const ctxWKL = cWKL.getContext("2d");
 const ctxS   = cS.getContext("2d");
+const ctxRD  = cRD.getContext("2d");
 
 const data = [];
 
-/**
- * EMA state for D (RL) and R (KL)
- * We compute slope as ΔD_ema / ΔR_ema each point.
- *
- * Interpretation:
- *   slope > 0  => D increasing while R decreasing (collapse direction)
- *   slope < 0  => D decreasing while R increasing (learning / using rate)
- *   |slope| big => very sensitive region (rate changes cost a lot)
- */
-const slopeState = {
-  init: false,
-  alpha: 0.01,     // ~100-step timescale; tweak 0.005–0.02
-  D_ema: 0,
-  R_ema: 0,
-  D_prev: 0,
-  R_prev: 0
-};
-
+// -------------------------
+// Basic helpers
+// -------------------------
 function minMax(arr) {
   let mn = Infinity, mx = -Infinity;
   for (const v of arr) { if (v < mn) mn = v; if (v > mx) mx = v; }
-  if (mn === mx) { mn -= 1; mx += 1; } // avoid divide-by-zero if flat
+  if (!Number.isFinite(mn) || !Number.isFinite(mx)) return [0, 1];
+  if (mn === mx) { mn -= 1; mx += 1; }
   return [mn, mx];
 }
 
-function drawAxes(ctx, canvas, xMin, xMax, yMin, yMax, xTicks = 5, yTicks = 5) {
+function drawAxes(ctx, canvas, xMin, xMax, yMin, yMax, xTicks = 5, yTicks = 5, xLabel = "", yLabel = "") {
   ctx.strokeStyle = "#888";
   ctx.fillStyle = "#555";
   ctx.lineWidth = 1;
   ctx.font = "10px sans-serif";
 
-  const left = 50;
+  const left = 55;
   const right = canvas.width - 20;
   const top = 20;
-  const bottom = canvas.height - 30;
+  const bottom = canvas.height - 35;
 
-  // axes lines
+  // axes
   ctx.beginPath();
   ctx.moveTo(left, top);
   ctx.lineTo(left, bottom);
@@ -103,8 +92,20 @@ function drawAxes(ctx, canvas, xMin, xMax, yMin, yMax, xTicks = 5, yTicks = 5) {
     ctx.lineTo(x, bottom + 5);
     ctx.stroke();
 
-    ctx.fillText(Math.round(v), x - 6, bottom + 15);
+    ctx.fillText(v.toFixed(2), x - 10, bottom + 15);
   }
+
+  // labels
+  if (xLabel) ctx.fillText(xLabel, (left + right) / 2 - 30, canvas.height - 8);
+  if (yLabel) {
+    ctx.save();
+    ctx.translate(12, (top + bottom) / 2 + 30);
+    ctx.rotate(-Math.PI / 2);
+    ctx.fillText(yLabel, 0, 0);
+    ctx.restore();
+  }
+
+  return { left, right, top, bottom };
 }
 
 function plotLine(ctx, xs, ys, xMap, yMap, color) {
@@ -123,10 +124,10 @@ function drawSingleSeries(ctx, canvas, steps, series, label, color) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   if (series.length < 2) return;
 
-  const left = 50;
+  const left = 55;
   const right = canvas.width - 20;
   const top = 20;
-  const bottom = canvas.height - 30;
+  const bottom = canvas.height - 35;
 
   const [xMin, xMax] = minMax(steps);
   const [yMin, yMax] = minMax(series);
@@ -134,44 +135,119 @@ function drawSingleSeries(ctx, canvas, steps, series, label, color) {
   const xMap = (s) => left + (s - xMin) / (xMax - xMin) * (right - left);
   const yMap = (v) => bottom - (v - yMin) / (yMax - yMin) * (bottom - top);
 
-  drawAxes(ctx, canvas, xMin, xMax, yMin, yMax);
+  drawAxes(ctx, canvas, xMin, xMax, yMin, yMax, 5, 5);
   plotLine(ctx, steps, series, xMap, yMap, color);
 
   ctx.fillStyle = "black";
   ctx.fillText(label, left + 5, 12);
 }
 
-// Compute EMA slope point for a new (D=RL, R=KL) observation
-function updateSlope(D, R) {
+// -------------------------
+// EMA slope (dD/dR)
+// -------------------------
+function computeSlopeSeries(points, alpha = 0.01) {
+  // points: [{step, D, R}]
   const eps = 1e-9;
+  const outSteps = [];
+  const outSlope = [];
 
-  if (!Number.isFinite(D) || !Number.isFinite(R)) return null;
+  let init = false;
+  let D_ema = 0, R_ema = 0, D_prev = 0, R_prev = 0;
 
-  if (!slopeState.init) {
-    slopeState.init = true;
-    slopeState.D_ema = D;
-    slopeState.R_ema = R;
-    slopeState.D_prev = D;
-    slopeState.R_prev = R;
-    return 0; // slope undefined at first point; return 0 for plotting
+  for (const p of points) {
+    const { step, D, R } = p;
+    if (!Number.isFinite(D) || !Number.isFinite(R)) continue;
+
+    if (!init) {
+      init = true;
+      D_ema = D; R_ema = R;
+      D_prev = D; R_prev = R;
+      outSteps.push(step);
+      outSlope.push(0);
+      continue;
+    }
+
+    D_ema = alpha * D + (1 - alpha) * D_ema;
+    R_ema = alpha * R + (1 - alpha) * R_ema;
+
+    const dD = D_ema - D_prev;
+    const dR = R_ema - R_prev;
+
+    D_prev = D_ema;
+    R_prev = R_ema;
+
+    if (Math.abs(dR) < eps) continue;
+
+    outSteps.push(step);
+    outSlope.push(dD / dR);
   }
 
-  const a = slopeState.alpha;
-  slopeState.D_ema = a * D + (1 - a) * slopeState.D_ema;
-  slopeState.R_ema = a * R + (1 - a) * slopeState.R_ema;
-
-  const dD = slopeState.D_ema - slopeState.D_prev;
-  const dR = slopeState.R_ema - slopeState.R_prev;
-
-  slopeState.D_prev = slopeState.D_ema;
-  slopeState.R_prev = slopeState.R_ema;
-
-  // If dR is ~0, slope is unreliable; return null to skip plotting this point
-  if (Math.abs(dR) < eps) return null;
-
-  return dD / dR;
+  return { outSteps, outSlope };
 }
 
+// -------------------------
+// RD scatter plot
+// -------------------------
+function drawRDScatter(ctx, canvas, points) {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (points.length < 5) return;
+
+  // Use raw R=KL, D=RL
+  const R = points.map(p => p.R);
+  const D = points.map(p => p.D);
+
+  // Trim to finite only
+  const pts = points.filter(p => Number.isFinite(p.R) && Number.isFinite(p.D));
+  if (pts.length < 5) return;
+
+  const Rs = pts.map(p => p.R);
+  const Ds = pts.map(p => p.D);
+
+  // Robust bounds (avoid 1 insane point ruining view)
+  // We'll use simple percentile-like trimming by sorting.
+  const sortedR = Rs.slice().sort((a,b)=>a-b);
+  const sortedD = Ds.slice().sort((a,b)=>a-b);
+  const pLow = 0.02, pHigh = 0.98;
+  const rMin = sortedR[Math.floor(pLow * (sortedR.length - 1))];
+  const rMax = sortedR[Math.floor(pHigh * (sortedR.length - 1))];
+  const dMin = sortedD[Math.floor(pLow * (sortedD.length - 1))];
+  const dMax = sortedD[Math.floor(pHigh * (sortedD.length - 1))];
+
+  const { left, right, top, bottom } =
+    drawAxes(ctx, canvas, rMin, rMax, dMin, dMax, 6, 6, "Rate R = KL (nats, mean)", "Distortion D = RL (mean MSE)");
+
+  const xMap = (r) => left + (r - rMin) / (rMax - rMin) * (right - left);
+  const yMap = (d) => bottom - (d - dMin) / (dMax - dMin) * (bottom - top);
+
+  // Color by time (older = lighter, newer = darker)
+  // No fancy colormap: just grayscale alpha.
+  // Also sub-sample for performance if huge.
+  const N = pts.length;
+  const maxPts = 5000;
+  const stride = Math.max(1, Math.floor(N / maxPts));
+
+  for (let i = 0; i < N; i += stride) {
+    const p = pts[i];
+    if (p.R < rMin || p.R > rMax || p.D < dMin || p.D > dMax) continue;
+
+    const t = i / Math.max(1, N - 1); // 0..1
+    const alpha = 0.15 + 0.75 * t;    // newer darker
+    ctx.fillStyle = `rgba(0,0,0,${alpha.toFixed(3)})`;
+
+    const x = xMap(p.R);
+    const y = yMap(p.D);
+    ctx.fillRect(x, y, 2, 2);
+  }
+
+  // Add a tiny legend
+  ctx.fillStyle = "#000";
+  ctx.font = "10px sans-serif";
+  ctx.fillText("darker = later steps", left + 5, top + 10);
+}
+
+// -------------------------
+// Main draw
+// -------------------------
 function draw() {
   if (data.length < 2) return;
 
@@ -181,60 +257,28 @@ function draw() {
   const loss = data.map(d => d.loss);
   const rl = data.map(d => d.rl);
 
-  // KL and WKL
-  let kl = data.map(d => d.kl);
-  kl = kl.map(v => Math.log10(Math.max(v, 0) + eps));
+  // KL log view (for the KL plot only)
+  let klLog = data.map(d => Math.log10(Math.max(d.kl, 0) + eps));
 
+  // Weighted KL (raw)
   let wkl = data.map(d => d.kl * d.klw);
 
-  // Slope series (dD/dR using *raw* D=rl and R=kl_raw (not log))
-  const slopeSteps = [];
-  const slopes = [];
-  // Rebuild EMA from scratch each draw so the line is consistent (simple + robust)
-  const tmpState = { init:false, alpha:slopeState.alpha, D_ema:0, R_ema:0, D_prev:0, R_prev:0 };
-  const updateTmpSlope = (D, R) => {
-    const eps2 = 1e-9;
-    if (!Number.isFinite(D) || !Number.isFinite(R)) return null;
-    if (!tmpState.init) {
-      tmpState.init = true;
-      tmpState.D_ema = D;
-      tmpState.R_ema = R;
-      tmpState.D_prev = D;
-      tmpState.R_prev = R;
-      return 0;
-    }
-    const a = tmpState.alpha;
-    tmpState.D_ema = a * D + (1 - a) * tmpState.D_ema;
-    tmpState.R_ema = a * R + (1 - a) * tmpState.R_ema;
+  // Slope series needs raw D=rl and raw R=kl
+  const rdPoints = data.map(d => ({ step: d.step, D: d.rl, R: d.kl }));
+  const { outSteps: slopeSteps, outSlope: slopes } = computeSlopeSeries(rdPoints, 0.01);
 
-    const dD = tmpState.D_ema - tmpState.D_prev;
-    const dR = tmpState.R_ema - tmpState.R_prev;
-
-    tmpState.D_prev = tmpState.D_ema;
-    tmpState.R_prev = tmpState.R_ema;
-
-    if (Math.abs(dR) < eps2) return null;
-    return dD / dR;
-  };
-
-  for (let i = 0; i < data.length; i++) {
-    const s = data[i].step;
-    const D = data[i].rl;
-    const Rraw = data[i].kl; // IMPORTANT: rate in nats, not log-scaled
-    const slope = updateTmpSlope(D, Rraw);
-    if (slope === null) continue;
-    slopeSteps.push(s);
-    slopes.push(slope);
-  }
-
-  const SCLAMP = 2;
+  // Clamp slope for readability
+  const SCLAMP = 0.05;
   const slopesClamped = slopes.map(v => Math.max(-SCLAMP, Math.min(SCLAMP, v)));
 
   drawSingleSeries(ctxL, cL, steps, loss, "Loss", "green");
   drawSingleSeries(ctxRL, cRL, steps, rl, "Recon (mean MSE)", "blue");
-  drawSingleSeries(ctxKL, cKL, steps, kl, "KL (log10)", "red");
+  drawSingleSeries(ctxKL, cKL, steps, klLog, "KL (log10)", "red");
   drawSingleSeries(ctxWKL, cWKL, steps, wkl, "Weighted KL = KL x KLw", "purple");
   drawSingleSeries(ctxS, cS, slopeSteps, slopesClamped, "dD/dR (EMA, clamped)", "black");
+
+  // RD scatter
+  drawRDScatter(ctxRD, cRD, rdPoints);
 }
 
 const evt = new EventSource("/stream");
@@ -244,7 +288,7 @@ evt.onmessage = (e) => {
 };
 
 // -------------------------
-// Images
+// Images (unchanged)
 // -------------------------
 const imgDiv = document.getElementById("images");
 const seen = new Set();
@@ -255,16 +299,18 @@ function pruneReverseLog(files, limit) {
   const out = [];
   const n = files.length;
 
+  // Always keep the first image
   out.push(files[0]);
 
   const remaining = limit - 1;
   if (remaining <= 0) return out;
 
+  // Indices sampled logarithmically toward the end
   const seen = new Set([0]);
 
   for (let i = 0; i < remaining; i++) {
-    const t = i / (remaining - 1);
-    const logT = Math.log10(1 + 9 * t);
+    const t = i / (remaining - 1);          // [0, 1]
+    const logT = Math.log10(1 + 9 * t);     // bias toward 1
     const idx = Math.floor(logT * (n - 1));
 
     if (!seen.has(idx)) {
@@ -273,8 +319,10 @@ function pruneReverseLog(files, limit) {
     }
   }
 
+  // Ensure most recent image is always included
   if (!seen.has(n - 1)) out.push(files[n - 1]);
 
+  // Sort to preserve chronological order
   return out.sort((a, b) => files.indexOf(a) - files.indexOf(b));
 }
 
