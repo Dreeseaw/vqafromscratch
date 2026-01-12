@@ -168,7 +168,8 @@ def image_stats(name, t):
 def set_decoder_trainable(vae, step) -> float:
     # linear, but need to get this schedule down
     # or maybe account for R-D curve
-    return min(max((float(step)-200.0 / 300000.0) + 0.001, 0.001), 0.003)
+    return 0.001
+    # return min(max((float(step)-200.0 / 300000.0) + 0.001, 0.001), 0.003)
 
 ### Training loop
 
@@ -243,9 +244,11 @@ if __name__=="__main__":
             recon, mu, lv = vae(images)
             
             # simple normalized recon + weighted KL
-            recon_loss = F.mse_loss(recon, images, reduction="mean")  # avg losses
+            recon_loss = F.mse_loss(recon, images, reduction="none")  # losses
+            recon_loss = recon_loss.flatten(1).sum(dim=1).mean()
             kl_loss = kl_divergence(mu, lv)
-            loss = (recon_loss + kl_weight * kl_loss).mean()
+            kl_loss = kl_loss.flatten(1).sum(dim=1).mean()
+            loss = recon_loss + (kl_weight * kl_loss)
 
             # backward
             opt.zero_grad()
@@ -261,14 +264,15 @@ if __name__=="__main__":
             # logging every 10
             if global_step % 10 == 1:
                 step_end = perf_counter()
-                logger.log(f"\nStep: {global_step}, Loss: {loss.detach()} (RL: {recon_loss.mean().detach()}, KL: {kl_loss.mean().detach()}, KLw: {kl_weight})")
+                r_norm = 3*224*224
+                logger.log(f"\nStep: {global_step}, Loss: {loss.detach() / r_norm} (RL: {recon_loss.detach() / r_norm}, KL: {kl_loss.detach()}, KLw: {kl_weight})")
                 logger.log(f"10-step im/s: {(batch_size*10) / (step_end-step_start)}")
-                logger.log(f"mu.mean: {mu.abs().mean().detach()}, lv.mean: {lv.mean().detach()}")
+                logger.log(f"mu.mean: {mu.flatten(1).abs().mean().detach()}, lv.mean: {lv.flatten(1).mean().detach()}")
                 step_start = step_end  # reset loop timer (includes val & weight save)
                 # too expensive
                 # logger.log(f"mu.pdist: {torch.pdist(mu).mean().item()}")
 
-            # validation set + visualization
+            # validation set + visualization every 50
             if global_step % 50 == 1:
                 vae.eval()
                 with torch.no_grad():
@@ -276,10 +280,10 @@ if __name__=="__main__":
                         v_images = v_images.to(device)
                         v_recon, v_mu, v_lv = vae(v_images)
                         v_recon_loss = F.mse_loss(v_recon, v_images, reduction="mean")
-                        v_kl_loss = kl_divergence(v_mu, v_lv)
+                        v_kl_loss = kl_divergence(v_mu.flatten(1), v_lv.flatten(1))
                         v_recon_mu = vae._decoder(v_mu)
                         logger.log(f"\nValidation: {global_step}, RL: {v_recon_loss.mean()}, KL: {v_kl_loss.mean()})")
-                        logger.log(f"mu.mean: {v_mu.abs().mean().item()}, lv.mean: {v_lv.mean().item()}")
+                        logger.log(f"mu.mean: {v_mu.flatten(1).abs().mean().item()}, lv.mean: {v_lv.flatten(1).mean().item()}")
                         # logger.log(f"mu.pdist: {torch.pdist(v_mu).mean().item()}")
 
                     def denorm_imagenet(t):
@@ -297,7 +301,8 @@ if __name__=="__main__":
                         filename="logs/"+run_id+f"/step_{global_step}.png",
                     )
                 vae.train()
-            # save weights for future testing/ training/ probing
+
+            # save weights for future testing/ training/ probing every 1000
             if global_step % 1000 == 1 and global_step != 1:
                 checkpoint_path = f'logs/{run_id}/step_{global_step}.tar'
                 torch.save({

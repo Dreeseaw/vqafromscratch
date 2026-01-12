@@ -91,38 +91,40 @@ class Decoder(nn.Module):
         super().__init__()
         self._config = config
 
-        # get spatial info back
-        
-        # focused on extracting spatial info
-        self._spatialer = nn.Linear(config.latent_dim, 64 * 14 * 14)
-        # tensor gets shape-change in between layers 
-        self._precoder = nn.Sequential(
+        # latent comes with spatial structure - no need to recreate
+        # seed does not upsample, but gets massages latent
+        self._seed = nn.Sequential(
+            nn.Conv2d(16, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            # nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            # nn.ReLU(inplace=True),
         )
         
         # focused on upsampling into a real RGB image
         self._decoder = nn.Sequential(
-            ConvUpBlock_NoBN(128, 96),  # 14x14 (x2)
-            ConvUpBlock_NoBN(96, 64),   # 28x28 (x2)
-            ConvUpBlock_NoBN(64, 32),    # 56x56 (x2)
-            ConvUpBlock_NoBN(32, 16),    # 112x112 (x2)
-            nn.Conv2d(16, 3, kernel_size=3, padding=1), # still 224x224
+            ConvUpBlock_NoBN(128, 96),  # 7
+            ConvUpBlock_NoBN(96, 64),   # 14
+            ConvUpBlock_NoBN(64, 32),   # 28 
+            ConvUpBlock_NoBN(32, 16),   # 56
+            ConvUpBlock_NoBN(16, 3),    # 112
+            # nn.Conv2d(16, 3, kernel_size=3, padding=1), # still 224x224
         )
 
     def forward(self, z):
-        h = self._spatialer(z)
-        h = h.view(
-            z.size(0), 
-            self._config.latent_dim // 4, 
-            self._config.feature_w * 2,
-            self._config.feature_h * 2,
-        )
-        h = self._precoder(h) 
+        h = self._seed(z) 
         return self._decoder(h)
 
+
+class SpatialPosteriorHead(nn.Module):
+    def __init__(self, in_channels: int, latent_dim: int):
+        super().__init__()
+        self.mu_conv = nn.Conv2d(in_channels, latent_dim, kernel_size=1)
+        self.logvar_conv = nn.Conv2d(in_channels, latent_dim, kernel_size=1)
+
+    def forward(self, h):  # [B, C, H, W]
+        mu = self.mu_conv(h)         # [B, D, H, W]
+        logvar = self.logvar_conv(h) # [B, D, H, W]
+        return mu, logvar
 
 """
 Full x -> x' model 
@@ -131,41 +133,26 @@ class VariationalAutoEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self._config = config
-        self._flat_feature_dim = config.latent_dim * config.feature_w * config.feature_h
 
-        # [B,W,H,3] -> [B,D]
+        # [B,3,W,H] -> [B,C,7,7]
         self._encoder = Encoder(config)
-        encoder_output_channels = 256  # keep here in case it changes a lot
-        # self._gap = nn.AdaptiveAvgPool2d(output_size=(1, 1))
 
-        # Learned posterior weights
-        self._mu = nn.Linear(encoder_output_channels * 7 * 7, self._config.latent_dim)
-        self._logvar = nn.Linear(encoder_output_channels * 7 * 7, self._config.latent_dim)
+        # Learned (spatial) posterior weights
+        # [B,C,7,7] -> [B,D,7,7]
+        self._post_head = SpatialPosteriorHead(256, 16)
 
-        # [B,D] -> [B,W,H,3]
+        # [B,C,7,7] -> [B,3,W,H]
         self._decoder = Decoder(config)
 
     def forward(self, x):
         # grab some 2d features
         features = self._encoder(x)
-        if nan_check(features): print("features have nan")
-        
-        # loses structure and channels - do not do
-        # flatten 3d feature map into 1d per sample in batch
-        # features = torch.flatten(features, start_dim=1)
 
-        # good approach
-        # features = self._gap(features).flatten(1)
-        
-        # overfit test approach
-        features = features.flatten(1)
-
-        mu = self._mu(features)  # position in latent space
-        lv = self._logvar(features)  # confidence of position in latent space
+        # don't flatten - use spatial latent head
+        mu, lv = self._post_head(features)
         clipped_lv = torch.clamp(lv, min=-10.0, max=1.0)  # help combat exploding gradients
         std = torch.exp(clipped_lv / 2.0)
-        sample = mu  + (torch.randn_like(std) * std)  # vary it for automatic encoding
-        if nan_check(sample): print("samples have nan")
+        sample = mu  + (torch.randn_like(std) * std)  # reparam trick
 
         x_hat = self._decoder(sample)
         return x_hat, mu, clipped_lv
