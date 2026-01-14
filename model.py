@@ -92,9 +92,11 @@ class Decoder(nn.Module):
         self._config = config
 
         # latent comes with spatial structure - no need to recreate
-        # seed does not upsample, but gets massages latent
+        # seed does not upsample, but preps signal for upsampling
         self._seed = nn.Sequential(
-            nn.Conv2d(16, 64, kernel_size=3, padding=1),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
@@ -102,11 +104,15 @@ class Decoder(nn.Module):
         
         # focused on upsampling into a real RGB image
         self._decoder = nn.Sequential(
-            ConvUpBlock_NoBN(128, 96),  # 7
+            ConvUpBlock_NoBN(128, 96, act=nn.Identity()),  # 7
+            nn.Conv2d(96, 96, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
             ConvUpBlock_NoBN(96, 64),   # 14
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
             ConvUpBlock_NoBN(64, 32),   # 28 
             ConvUpBlock_NoBN(32, 16),   # 56
-            ConvUpBlock_NoBN(16, 3),    # 112
+            ConvUpBlock_NoBN(16, 3, act=nn.Identity()),    # 112
             # nn.Conv2d(16, 3, kernel_size=3, padding=1), # still 224x224
         )
 

@@ -168,7 +168,8 @@ def image_stats(name, t):
 def set_decoder_trainable(vae, step) -> float:
     # linear, but need to get this schedule down
     # or maybe account for R-D curve
-    return 0.001
+    # return 0.001
+    return 0.00521  # beta = 1 from original vae paper
     # return min(max((float(step)-200.0 / 300000.0) + 0.001, 0.001), 0.003)
 
 ### Training loop
@@ -263,9 +264,9 @@ if __name__=="__main__":
             if global_step % 10 == 1:
                 step_end = perf_counter()
                 r_norm = 3*224*224
-                logger.log(f"\nStep: {global_step}, Loss: {loss.detach()} (RL: {recon_loss.mean().detach()}, KL: {kl_loss.mean().detach()}, KLw: {beta})")
-                logger.log(f"10-step im/s: {(batch_size*10) / (step_end-step_start)}")
-                logger.log(f"mu.mean: {mu.flatten(1).abs().mean().detach()}, lv.mean: {lv.flatten(1).mean().detach()}")
+                logger.log(f"\nStep: {global_step}, Loss: {loss.detach():.4f} (RL: {recon_loss.mean().detach():.4f}, KL: {kl_loss.mean().detach():.4f}, KLw: {beta})")
+                logger.log(f"10-step im/s: {((batch_size*10) / (step_end-step_start)):.4f}")
+                logger.log(f"mu.mean: {mu.flatten(1).abs().mean().detach():.4f}, lv.mean: {lv.flatten(1).mean().detach():.4f}")
                 step_start = step_end  # reset loop timer (includes val & weight save)
                 # too expensive
                 # logger.log(f"mu.pdist: {torch.pdist(mu).mean().item()}")
@@ -278,10 +279,10 @@ if __name__=="__main__":
                         v_images = v_images.to(device)
                         v_recon, v_mu, v_lv = vae(v_images)
                         v_recon_loss = F.mse_loss(v_recon, v_images, reduction="mean")
-                        v_kl_loss = kl_divergence(v_mu.flatten(1), v_lv.flatten(1))
+                        v_kl_loss = kl_divergence(v_mu, v_lv)
                         v_recon_mu = vae._decoder(v_mu)
-                        logger.log(f"\nValidation: {global_step}, RL: {v_recon_loss.mean()}, KL: {v_kl_loss.mean()})")
-                        logger.log(f"mu.mean: {v_mu.flatten(1).abs().mean().item()}, lv.mean: {v_lv.flatten(1).mean().item()}")
+                        logger.log(f"\nValidation: {global_step}, RL: {v_recon_loss.mean().detach():.4f}, KL: {v_kl_loss.mean().detach():.4f})")
+                        logger.log(f"mu.mean: {v_mu.flatten(1).abs().mean().detach():.4f}, lv.mean: {v_lv.flatten(1).mean().detach():.4f}")
                         # logger.log(f"mu.pdist: {torch.pdist(v_mu).mean().item()}")
 
                     def denorm_imagenet(t):

@@ -6,7 +6,7 @@
 <div>Recon / RL</div>
 <canvas id="plot_rl" width="800" height="200"></canvas>
 
-<div>KL (log-scale)</div>
+<div>KL</div>
 <canvas id="plot_kl" width="800" height="200"></canvas>
 
 <div>Weighted KL = KL x KLw</div>
@@ -15,7 +15,7 @@
 <div>dD/dR slope (EMA-based)</div>
 <canvas id="plot_slope" width="800" height="200"></canvas>
 
-<div>Rate-Distortion (R=KL, D=RL) scatter</div>
+<div>Rate-Distortion scatter (both min/maxes dropped)</div>
 <canvas id="plot_rd" width="800" height="320"></canvas>
 
 <h2>Reconstructions</h2>
@@ -256,10 +256,11 @@ function draw() {
 
   const eps = 1e-12;
   const loss = data.map(d => d.loss);
-  const rl = data.map(d => d.rl);
+  const rl = data.map(d => Math.min(d.rl, 3.0));
 
   // KL log view (for the KL plot only)
-  let klLog = data.map(d => Math.log10(Math.max(d.kl, 0) + eps));
+  let klLog = data.map(d => Math.max(d.kl, 0.0));
+  // let klLog = data.map(d => Math.log10(Math.max(d.kl, 0) + eps));
 
   // Weighted KL (raw)
   let wkl = data.map(d => d.kl * d.klw);
@@ -269,7 +270,7 @@ function draw() {
   const { outSteps: slopeSteps, outSlope: slopes } = computeSlopeSeries(rdPoints, 0.01);
 
   // Clamp slope for readability
-  const SCLAMP = 0.05;
+  const SCLAMP = 0.5;
   const slopesClamped = slopes.map(v => Math.max(-SCLAMP, Math.min(SCLAMP, v)));
 
   drawSingleSeries(ctxL, cL, steps, loss, "Loss", "green");
