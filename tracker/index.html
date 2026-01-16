@@ -123,6 +123,7 @@ function plotLine(ctx, xs, ys, xMap, yMap, color) {
 
 function drawSingleSeries(ctx, canvas, steps, series, label, color) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
+
   if (series.length < 2) return;
 
   const left = 55;
@@ -190,6 +191,7 @@ function computeSlopeSeries(points, alpha = 0.01) {
 // RD scatter plot
 // -------------------------
 function drawRDScatter(ctx, canvas, points) {
+  const maxPoints = 20002;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   if (points.length < 5) return;
 
@@ -198,7 +200,9 @@ function drawRDScatter(ctx, canvas, points) {
   const D = points.map(p => p.D);
 
   // Trim to finite only
-  const pts = points.filter(p => Number.isFinite(p.R) && Number.isFinite(p.D));
+  const pts = points.filter(
+    p => Number.isFinite(p.R) && Number.isFinite(p.D) && p.step < maxPoints
+  );
   if (pts.length < 5) return;
 
   const Rs = pts.map(p => p.R);
@@ -224,21 +228,63 @@ function drawRDScatter(ctx, canvas, points) {
   // No fancy colormap: just grayscale alpha.
   // Also sub-sample for performance if huge.
   const N = pts.length;
-  const maxPts = 5000;
+  const maxPts = 1000;
   const stride = Math.max(1, Math.floor(N / maxPts));
 
-  for (let i = 0; i < N; i += stride) {
+  for (let i = 0; i < maxPts; i += 1) {
     const p = pts[i];
     if (p.R < rMin || p.R > rMax || p.D < dMin || p.D > dMax) continue;
 
-    const t = i / Math.max(1, N - 1); // 0..1
-    const alpha = 0.15 + 0.75 * t;    // newer darker
+    const t = i / Math.max(1, N - 1);    // 0..1
+    const alpha = 0.35 + 0.60 * t;       // old points are visible
+    const size  = 1 + Math.floor(2 * t); // newer points bigger (1..3)
     ctx.fillStyle = `rgba(0,0,0,${alpha.toFixed(3)})`;
 
     const x = xMap(p.R);
     const y = yMap(p.D);
-    ctx.fillRect(x, y, 2, 2);
+    ctx.fillRect(x, y, size, size);
   }
+  
+  function drawCentroidTrail() {
+    const K = 20; // number of segments across time
+    const N = pts.length;
+    if (N < 50) return;
+
+    ctx.strokeStyle = "rgba(0,0,0,0.85)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+
+    for (let k = 0; k < K; k++) {
+      const a = Math.floor((k / K) * N);
+      const b = Math.floor(((k + 1) / K) * N);
+
+      let sr = 0, sd = 0, c = 0;
+      for (let i = a; i < b; i++) {
+        const p = pts[i];
+        // keep within bounds
+        if (p.R < rMin || p.R > rMax || p.D < dMin || p.D > dMax) continue;
+        sr += p.R; sd += p.D; c++;
+      }
+      if (c === 0) continue;
+
+      const r = sr / c;
+      const d = sd / c;
+      const x = xMap(r);
+      const y = yMap(d);
+
+      if (k === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Mark latest centroid
+    ctx.fillStyle = "rgba(0,0,0,1)";
+    ctx.beginPath();
+    ctx.arc(xMap(pts[N-1].R), yMap(pts[N-1].D), 4, 0, 2*Math.PI);
+    ctx.fill();
+  }
+
+  drawCentroidTrail();
 
   // Add a tiny legend
   ctx.fillStyle = "#000";

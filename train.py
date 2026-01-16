@@ -89,20 +89,23 @@ LOGDIR  = "logs/"
 LOGFILE = "logfile.txt"
 
 class Logger:
-    def __init__(self, run_id, checkpoint_id):
+    def __init__(self, run_id, checkpoint_id, probe=False):
         self._run_id = run_id
         self._base   = LOGDIR+run_id+"/"
         self._ckpt   = checkpoint_id
+        self._probe  = probe
 
         # fail on duplicate run_id for now (unless cont. training)
-        if os.path.isfile(self._base+LOGFILE) and not checkpoint_id:
+        if os.path.isfile(self._base+LOGFILE) and not checkpoint_id and not probe:
             print("this run_id already exists (np ckpt) - exitting")
             sys.exit(1)
 
     def log(self, txt):
         print(txt)
         fn = self._base+LOGFILE
-        if self._ckpt:
+        if self._probe:
+            fn = self._base+f'logfile_probe.txt'
+        elif self._ckpt:
             fn = self._base+f'logfile_from_{self._ckpt}.txt'
         
         # just create new file for logging if it's a continue training run,
@@ -169,8 +172,8 @@ def set_decoder_trainable(vae, step) -> float:
     # linear, but need to get this schedule down
     # or maybe account for R-D curve
     # return 0.001
-    return 0.00521  # beta = 1 from original vae paper
-    # return min(max((float(step)-200.0 / 300000.0) + 0.001, 0.001), 0.003)
+    # return 0.00521  # beta = 1 from original vae paper
+    return 0.01042    # beta = 2
 
 ### Training loop
 
@@ -263,7 +266,6 @@ if __name__=="__main__":
             # logging every 10
             if global_step % 10 == 1:
                 step_end = perf_counter()
-                r_norm = 3*224*224
                 logger.log(f"\nStep: {global_step}, Loss: {loss.detach():.4f} (RL: {recon_loss.mean().detach():.4f}, KL: {kl_loss.mean().detach():.4f}, KLw: {beta})")
                 logger.log(f"10-step im/s: {((batch_size*10) / (step_end-step_start)):.4f}")
                 logger.log(f"mu.mean: {mu.flatten(1).abs().mean().detach():.4f}, lv.mean: {lv.flatten(1).mean().detach():.4f}")
