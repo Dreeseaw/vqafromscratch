@@ -161,7 +161,7 @@ class VariationalAutoEncoder(nn.Module):
         sample = mu  + (torch.randn_like(std) * std)  # reparam trick
 
         x_hat = self._decoder(sample)
-        return x_hat, mu, clipped_lv
+        return x_hat, sample, mu, clipped_lv
 
 
 if __name__=="__main__":

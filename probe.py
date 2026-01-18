@@ -244,7 +244,7 @@ def main():
                     help="multilabel => BCE + micro-F1, singlelabel => CE + top1 acc")
 
     ap.add_argument("--batch_size", type=int, default=128)
-    ap.add_argument("--epochs", type=int, default=10)
+    ap.add_argument("--epochs", type=int, default=7)
     ap.add_argument("--lr", type=float, default=1e-2)
     ap.add_argument("--weight_decay", type=float, default=0.0)
     ap.add_argument("--num_workers", type=int, default=1)
