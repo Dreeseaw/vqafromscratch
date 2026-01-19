@@ -15,7 +15,7 @@
 <div>dD/dR slope (EMA-based)</div>
 <canvas id="plot_slope" width="800" height="200"></canvas>
 
-<div>Rate-Distortion scatter (both min/maxes dropped)</div>
+<div>Rate-Distortion scatter (outliers removed)</div>
 <canvas id="plot_rd" width="800" height="320"></canvas>
 
 <h2>Reconstructions</h2>
@@ -309,7 +309,7 @@ function draw() {
   // let klLog = data.map(d => Math.log10(Math.max(d.kl, 0) + eps));
 
   // Weighted KL (raw)
-  let wkl = data.map(d => d.kl * d.klw);
+  let wkl = data.map(d => d.mmd);
 
   // Slope series needs raw D=rl and raw R=kl
   const rdPoints = data.map(d => ({ step: d.step, D: d.rl, R: d.kl }));

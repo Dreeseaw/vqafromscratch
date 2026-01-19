@@ -12,6 +12,8 @@ Key changes vs prior version:
 Example:
 python3 probe.py --ckpt logs/my_run/step_4000.tar --label_mode multilabel
 python3 probe.py --ckpt logs/my_run/step_4000.tar --label_mode singlelabel
+python3 probe.py --ckpts logs/run1/step_2000.tar logs/run2/step_4000.tar --max_parallel 2
+python3 probe.py --ckpts logs/run1/step_2000.tar logs/run2/step_4000.tar --multi_mode lockstep
 """
 
 import os
@@ -19,6 +21,7 @@ import re
 import json
 import time
 import argparse
+import multiprocessing as mp
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
@@ -232,35 +235,11 @@ def top1_acc(logits: torch.Tensor, y: torch.Tensor) -> float:
 # -------------------------
 # Main
 # -------------------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", type=str, required=True, help="logs/<run_id>/step_<N>.tar")
-    ap.add_argument("--train_image_dir", type=str, default=os.path.join(DATA_DIR_DEFAULT, "train2014/train2014/"))
-    ap.add_argument("--val_image_dir", type=str, default=os.path.join(DATA_DIR_DEFAULT, "val2014/val2014/"))
-    ap.add_argument("--train_ann_json", type=str, default=os.path.join(ANNO_DIR_DEFAULT, "annotations/instances_train2014.json"))
-    ap.add_argument("--val_ann_json", type=str, default=os.path.join(ANNO_DIR_DEFAULT, "annotations/instances_val2014.json"))
-
-    ap.add_argument("--label_mode", type=str, choices=["multilabel", "singlelabel"], default="multilabel",
-                    help="multilabel => BCE + micro-F1, singlelabel => CE + top1 acc")
-
-    ap.add_argument("--batch_size", type=int, default=128)
-    ap.add_argument("--epochs", type=int, default=7)
-    ap.add_argument("--lr", type=float, default=1e-2)
-    ap.add_argument("--weight_decay", type=float, default=0.0)
-    ap.add_argument("--num_workers", type=int, default=1)
-    ap.add_argument("--limit_train", type=int, default=0)
-    ap.add_argument("--limit_val", type=int, default=0)
-
-    ap.add_argument("--use_mu", action="store_true", help="Probe on mu instead of sampled z.")
-    ap.add_argument("--no_aug", action="store_true", help="Disable train-time RRC/flip.")
-    ap.add_argument("--threads", type=int, default=8)
-    ap.add_argument("--interop_threads", type=int, default=1)
-    args = ap.parse_args()
-
+def run_probe(ckpt_path: str, args: argparse.Namespace) -> None:
     torch.set_num_threads(args.threads)
     torch.set_num_interop_threads(args.interop_threads)
 
-    ckpt_path = os.path.expanduser(args.ckpt)
+    ckpt_path = os.path.expanduser(ckpt_path)
     run_id, ckpt_step = infer_run_and_step_from_ckpt(ckpt_path)
     checkpoint_id_for_logger = ckpt_step if ckpt_step >= 0 else 0
 
@@ -431,6 +410,279 @@ def main():
 
     logger.log("[probe] done\n")
 
+
+def run_probes_lockstep(ckpt_paths: list[str], args: argparse.Namespace) -> None:
+    torch.set_num_threads(args.threads)
+    torch.set_num_interop_threads(args.interop_threads)
+
+    train_ann = load_json(args.train_ann_json)
+    val_ann = load_json(args.val_ann_json)
+    train_targets = build_coco_object_targets(train_ann)
+    val_targets = build_coco_object_targets(val_ann)
+
+    C = train_targets.num_classes
+
+    use_aug = not args.no_aug
+    train_ds = CocoProbeDataset(
+        image_dir=args.train_image_dir,
+        targets=train_targets,
+        label_mode=args.label_mode,
+        rrc=use_aug,
+        flip=use_aug,
+        limit=(args.limit_train if args.limit_train > 0 else None),
+    )
+    val_ds = CocoProbeDataset(
+        image_dir=args.val_image_dir,
+        targets=val_targets,
+        label_mode=args.label_mode,
+        rrc=False,
+        flip=False,
+        limit=(args.limit_val if args.limit_val > 0 else None),
+    )
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        persistent_workers=(args.num_workers > 0),
+        prefetch_factor=1 if args.num_workers > 0 else None,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=(args.num_workers > 0),
+        prefetch_factor=1 if args.num_workers > 0 else None,
+        drop_last=False,
+    )
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if args.label_mode == "multilabel":
+        loss_fn = nn.BCEWithLogitsLoss()
+        metric_name = "microF1"
+    else:
+        loss_fn = nn.CrossEntropyLoss()
+        metric_name = "top1"
+
+    bundle = []
+    for ckpt_path in ckpt_paths:
+        ckpt_path = os.path.expanduser(ckpt_path)
+        run_id, ckpt_step = infer_run_and_step_from_ckpt(ckpt_path)
+        checkpoint_id_for_logger = ckpt_step if ckpt_step >= 0 else 0
+
+        logger = Logger(run_id, checkpoint_id_for_logger, probe=True)
+        logger.log(f"\n[probe] ckpt: {ckpt_path}\n")
+        logger.log(f"[probe] label_mode: {args.label_mode} | use_mu: {args.use_mu}\n")
+        logger.log(f"[probe] device: {device}\n")
+        logger.log(f"[probe] num_classes: {C}\n")
+        logger.log(f"[probe] train samples: {len(train_ds)} | val samples: {len(val_ds)}\n")
+
+        vae = VAE(VAEConfig()).to(device)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+        vae.load_state_dict(ckpt["model_state_dict"])
+        vae.eval()
+        for p in vae.parameters():
+            p.requires_grad_(False)
+
+        x0, _ = next(iter(train_loader))
+        x0 = x0.to(device)
+        with torch.no_grad():
+            z0 = vae_encode_z(vae, x0, use_mu=args.use_mu).flatten(1)
+        z_dim = int(z0.shape[1])
+        logger.log(f"[probe] z_dim(flat): {z_dim}\n")
+
+        probe = LinearProbe(z_dim, C).to(device)
+        opt = torch.optim.AdamW(probe.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+        bundle.append({
+            "ckpt_path": ckpt_path,
+            "ckpt_step": ckpt_step,
+            "run_id": run_id,
+            "logger": logger,
+            "vae": vae,
+            "probe": probe,
+            "opt": opt,
+            "best_val": -1.0,
+        })
+
+    @torch.no_grad()
+    def eval_epoch(entry: dict) -> Tuple[float, float]:
+        probe = entry["probe"]
+        vae = entry["vae"]
+        probe.eval()
+        total_loss, total_metric, n = 0.0, 0.0, 0
+        for x, y in val_loader:
+            x = x.to(device)
+            y = y.to(device)
+
+            z = vae_encode_z(vae, x, use_mu=args.use_mu).flatten(1)
+            logits = probe(z)
+
+            loss = loss_fn(logits, y) if args.label_mode == "multilabel" else loss_fn(logits, y)
+            metric = multilabel_micro_f1(logits, y) if args.label_mode == "multilabel" else top1_acc(logits, y)
+
+            bs = x.shape[0]
+            total_loss += loss.item() * bs
+            total_metric += metric * bs
+            n += bs
+        return total_loss / max(1, n), total_metric / max(1, n)
+
+    start = time.time()
+    global_step = 0
+
+    for epoch in range(1, args.epochs + 1):
+        for entry in bundle:
+            entry["probe"].train()
+            entry["total_loss"] = 0.0
+            entry["total_metric"] = 0.0
+            entry["n"] = 0
+
+        for x, y in train_loader:
+            x = x.to(device)
+            y = y.to(device)
+
+            for entry in bundle:
+                vae = entry["vae"]
+                probe = entry["probe"]
+                opt = entry["opt"]
+
+                with torch.no_grad():
+                    z = vae_encode_z(vae, x, use_mu=args.use_mu).flatten(1)
+
+                logits = probe(z)
+                loss = loss_fn(logits, y)
+
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+
+                metric = multilabel_micro_f1(logits.detach(), y) if args.label_mode == "multilabel" else top1_acc(logits.detach(), y)
+
+                bs = x.shape[0]
+                entry["total_loss"] += loss.item() * bs
+                entry["total_metric"] += metric * bs
+                entry["n"] += bs
+                entry["last_loss"] = loss.detach()
+
+            global_step += 1
+            if global_step % 50 == 1:
+                for entry in bundle:
+                    entry["logger"].log(f"Step: {global_step}, Loss: {entry['last_loss']:.4f}")
+
+        elapsed = time.time() - start
+
+        for entry in bundle:
+            tr_loss = entry["total_loss"] / max(1, entry["n"])
+            tr_metric = entry["total_metric"] / max(1, entry["n"])
+            va_loss, va_metric = eval_epoch(entry)
+            entry["logger"].log(
+                f"[probe] epoch {epoch:03d} | "
+                f"train loss {tr_loss:.4f} {metric_name} {tr_metric:.4f} | "
+                f"val loss {va_loss:.4f} {metric_name} {va_metric:.4f} | "
+                f"elapsed {elapsed:.1f}s\n"
+            )
+
+            if va_metric > entry["best_val"]:
+                entry["best_val"] = va_metric
+                out_path = f"logs/{entry['run_id']}/probe_step_{entry['ckpt_step'] if entry['ckpt_step']>=0 else 'unknown'}.tar"
+                torch.save(
+                    {
+                        "label_mode": args.label_mode,
+                        "metric": metric_name,
+                        "z_dim": entry["probe"].fc.in_features,
+                        "num_classes": C,
+                        "use_mu": args.use_mu,
+                        "probe_state_dict": entry["probe"].state_dict(),
+                        "probe_opt_state_dict": entry["opt"].state_dict(),
+                        "best_val_metric": entry["best_val"],
+                        "vae_ckpt_path": entry["ckpt_path"],
+                    },
+                    out_path,
+                )
+                entry["logger"].log(
+                    f"[probe] saved best probe -> {out_path} (best val {metric_name}={entry['best_val']:.4f})\n"
+                )
+
+    for entry in bundle:
+        entry["logger"].log("[probe] done\n")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ckpt", type=str, help="logs/<run_id>/step_<N>.tar")
+    ap.add_argument("--ckpts", type=str, nargs="+", help="One or more ckpts to probe in parallel.")
+    ap.add_argument("--train_image_dir", type=str, default=os.path.join(DATA_DIR_DEFAULT, "train2014/train2014/"))
+    ap.add_argument("--val_image_dir", type=str, default=os.path.join(DATA_DIR_DEFAULT, "val2014/val2014/"))
+    ap.add_argument("--train_ann_json", type=str, default=os.path.join(ANNO_DIR_DEFAULT, "annotations/instances_train2014.json"))
+    ap.add_argument("--val_ann_json", type=str, default=os.path.join(ANNO_DIR_DEFAULT, "annotations/instances_val2014.json"))
+
+    ap.add_argument("--label_mode", type=str, choices=["multilabel", "singlelabel"], default="multilabel",
+                    help="multilabel => BCE + micro-F1, singlelabel => CE + top1 acc")
+
+    ap.add_argument("--batch_size", type=int, default=128)
+    ap.add_argument("--epochs", type=int, default=7)
+    ap.add_argument("--lr", type=float, default=1e-2)
+    ap.add_argument("--weight_decay", type=float, default=0.0)
+    ap.add_argument("--num_workers", type=int, default=1)
+    ap.add_argument("--limit_train", type=int, default=0)
+    ap.add_argument("--limit_val", type=int, default=0)
+
+    ap.add_argument("--use_mu", action="store_true", help="Probe on mu instead of sampled z.")
+    ap.add_argument("--no_aug", action="store_true", help="Disable train-time RRC/flip.")
+    ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument("--interop_threads", type=int, default=1)
+    ap.add_argument("--max_parallel", type=int, default=1, help="Max concurrent probes when using --ckpts.")
+    ap.add_argument(
+        "--multi_mode",
+        type=str,
+        choices=["process", "lockstep"],
+        default="lockstep",
+        help="process => separate processes per ckpt, lockstep => share a single dataloader in one process",
+    )
+    args = ap.parse_args()
+
+    if not args.ckpt and not args.ckpts:
+        ap.error("Specify --ckpt for a single probe or --ckpts for parallel probing.")
+
+    ckpt_list = []
+    if args.ckpt:
+        ckpt_list.append(args.ckpt)
+    if args.ckpts:
+        ckpt_list.extend(args.ckpts)
+
+    if len(ckpt_list) == 1:
+        run_probe(ckpt_list[0], args)
+        return
+
+    if args.multi_mode == "lockstep":
+        run_probes_lockstep(ckpt_list, args)
+        return
+
+    max_parallel = max(1, int(args.max_parallel))
+    ctx = mp.get_context("spawn")
+    running: list[mp.Process] = []
+    idx = 0
+
+    while idx < len(ckpt_list) or running:
+        while idx < len(ckpt_list) and len(running) < max_parallel:
+            ckpt_path = ckpt_list[idx]
+            proc = ctx.Process(target=run_probe, args=(ckpt_path, args))
+            proc.start()
+            running.append(proc)
+            idx += 1
+
+        for proc in running[:]:
+            proc.join(timeout=0)
+            if not proc.is_alive():
+                if proc.exitcode != 0:
+                    raise RuntimeError(f"Probe process failed with exit code {proc.exitcode}.")
+                running.remove(proc)
+        if running:
+            time.sleep(0.1)
 
 if __name__ == "__main__":
     main()
