@@ -314,14 +314,25 @@ def orthogonal_reg(mu: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return loss
 
 
-def orthogonal_reg_spatial(mu: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+def orthogonal_reg_spatial(mu: torch.Tensor, corr: bool = True, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Computes channel covariance (or corr) over all batch+spatial samples (N = B*H*W),
+    then penalizes off-diagonal entries.
+
+    mu: [B,C,H,W] tensor
+    corr: if true, variance is normalized (helps with lv collapse)
+
+    returns: scalar decorrelation loss
+    """
+
     B, C, H, W = mu.shape
     x = mu.permute(0, 2, 3, 1).reshape(-1, C)
     x = x - x.mean(dim=0, keepdim=True)
 
-    # normalize per channel
-    std = x.std(dim=0, keepdim=True).clamp_min(eps)
-    x = x / std
+    # normalize per channel for correlation
+    if corr:
+        std = x.std(dim=0, keepdim=True).clamp_min(eps)
+        x = x / std
 
     N = x.shape[0]
     corr = (x.T @ x) / (N + eps)
@@ -345,7 +356,7 @@ def set_decoder_trainable(vae, step) -> (float, float, float):
     # return 0.00521  # beta = 1 from original vae paper
     #if step < 10_001:
     #    return (200.0, 0.0005, 0.0)
-    return (200.0, 0.0005, 0.001)  # let the model have a lil kl
+    return (0.0, 0.0005, 0.001)  # let the model have a lil kl
     # return (100.0, 0.0)    # start playing with alpha > 0, beta = 0
 
 
@@ -422,7 +433,7 @@ if __name__=="__main__":
             recon_loss = F.mse_loss(recon, images, reduction="mean")
             kl_loss = kl_divergence(mu, lv)
             mmd = mmd_imq(z.flatten(1), torch.randn_like(z).flatten(1))
-            ortho = orthogonal_reg_spatial(mu)
+            ortho = orthogonal_reg_spatial(mu, corr=True)
             loss = (recon_loss + beta * kl_loss).mean() + (alpha * mmd) + (gamma * ortho)
 
             # backward
