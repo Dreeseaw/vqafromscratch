@@ -356,7 +356,7 @@ def set_decoder_trainable(vae, step) -> (float, float, float):
     # return 0.00521  # beta = 1 from original vae paper
     #if step < 10_001:
     #    return (200.0, 0.0005, 0.0)
-    return (0.0, 0.0005, 0.001)  # let the model have a lil kl
+    return (0.0, 0.0005, 0.0)  # let the model have a lil kl
     # return (100.0, 0.0)    # start playing with alpha > 0, beta = 0
 
 
@@ -372,8 +372,15 @@ if __name__=="__main__":
     batch_size = 96
 
     # cpu performance guidance
-    torch.set_num_threads(8)
-    torch.set_num_interop_threads(1)
+    device = "cpu" 
+    if torch.cuda.is_available(): 
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+
+    if device == "cpu":
+        torch.set_num_threads(8)
+        torch.set_num_interop_threads(1)
 
     # load dynamic training set
     dset = "train2014"
@@ -402,7 +409,6 @@ if __name__=="__main__":
 
     # torch object creation
     config = VAEConfig() 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     vae = VAE(config).to(device)
     opt = torch.optim.Adam(vae.parameters(), lr=0.001, weight_decay=0.0001)
 
@@ -416,7 +422,8 @@ if __name__=="__main__":
     logger = Logger(run_id, checkpoint_id)
     log_params(vae, logger)
     logger.log(f"batch size: {batch_size}")
-    logger.log(f"Run start time: {str(datetime.datetime.now())}\n")
+    logger.log(f"Run start time: {str(datetime.datetime.now())}")
+    logger.log(f"Running on {device}\n")
     step_start = perf_counter()
 
     for epoch in range(epochs):
