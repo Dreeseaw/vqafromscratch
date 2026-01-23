@@ -42,7 +42,7 @@ if (!Number.isInteger(port) || port <= 0) {
 function parseLine(line: string) {
   // Step: 1, Loss: 3.31 (RL: 1.72, KL: 39.80, KLw: 0.04)
   const m = line.match(
-    /Step:\s*(\d+),\s*Loss:\s*([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?).*?\(.*?RL:\s*([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?),\s*KL:\s*([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?),\s*KLw:\s*([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s*\)/
+    /Step:\s*(\d+),\s*Loss:\s*([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?).*?\(\s*RL:\s*([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?),\s*KL:\s*([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?),\s*KLw:\s*([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?),\s*MMD:\s*([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s*MMDw:\s*([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s*\)/
   );
   if (!m) return null;
 
@@ -52,6 +52,8 @@ function parseLine(line: string) {
     rl: Number(m[3]),
     kl: Number(m[4]),
     klw: Number(m[5]),
+    mmd: Number(m[6]),
+    mmdw: Number(m[7]),
   };
 }
 

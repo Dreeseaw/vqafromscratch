@@ -9,13 +9,13 @@
 <div>KL</div>
 <canvas id="plot_kl" width="800" height="200"></canvas>
 
-<div>Weighted KL = KL x KLw</div>
-<canvas id="plot_wkl" width="800" height="200"></canvas>
+<div>MMD</div>
+<canvas id="plot_mmd" width="800" height="200"></canvas>
 
 <div>dD/dR slope (EMA-based)</div>
 <canvas id="plot_slope" width="800" height="200"></canvas>
 
-<div>Rate-Distortion scatter (both min/maxes dropped)</div>
+<div>Rate-Distortion scatter (outliers removed)</div>
 <canvas id="plot_rd" width="800" height="320"></canvas>
 
 <h2>Reconstructions</h2>
@@ -26,14 +26,14 @@
 const cL = document.getElementById("plot_l");
 const cRL  = document.getElementById("plot_rl");
 const cKL  = document.getElementById("plot_kl");
-const cWKL = document.getElementById("plot_wkl");
+const cMMD = document.getElementById("plot_mmd");
 const cS   = document.getElementById("plot_slope");
 const cRD  = document.getElementById("plot_rd");
 
 const ctxL = cL.getContext("2d");
 const ctxRL  = cRL.getContext("2d");
 const ctxKL  = cKL.getContext("2d");
-const ctxWKL = cWKL.getContext("2d");
+const ctxMMD = cMMD.getContext("2d");
 const ctxS   = cS.getContext("2d");
 const ctxRD  = cRD.getContext("2d");
 
@@ -191,7 +191,7 @@ function computeSlopeSeries(points, alpha = 0.01) {
 // RD scatter plot
 // -------------------------
 function drawRDScatter(ctx, canvas, points) {
-  const maxPoints = 20002;
+  const maxPoints = 70002;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   if (points.length < 5) return;
 
@@ -212,7 +212,7 @@ function drawRDScatter(ctx, canvas, points) {
   // We'll use simple percentile-like trimming by sorting.
   const sortedR = Rs.slice().sort((a,b)=>a-b);
   const sortedD = Ds.slice().sort((a,b)=>a-b);
-  const pLow = 0.02, pHigh = 0.98;
+  const pLow = 0.01, pHigh = 0.99;
   const rMin = sortedR[Math.floor(pLow * (sortedR.length - 1))];
   const rMax = sortedR[Math.floor(pHigh * (sortedR.length - 1))];
   const dMin = sortedD[Math.floor(pLow * (sortedD.length - 1))];
@@ -228,7 +228,7 @@ function drawRDScatter(ctx, canvas, points) {
   // No fancy colormap: just grayscale alpha.
   // Also sub-sample for performance if huge.
   const N = pts.length;
-  const maxPts = 1000;
+  const maxPts = 10000;
   const stride = Math.max(1, Math.floor(N / maxPts));
 
   for (let i = 0; i < maxPts; i += 1) {
@@ -246,7 +246,7 @@ function drawRDScatter(ctx, canvas, points) {
   }
   
   function drawCentroidTrail() {
-    const K = 20; // number of segments across time
+    const K = 40; // number of segments across time
     const N = pts.length;
     if (N < 50) return;
 
@@ -302,14 +302,17 @@ function draw() {
 
   const eps = 1e-12;
   const loss = data.map(d => d.loss);
-  const rl = data.map(d => Math.min(d.rl, 3.0));
+  const rl = data.map(d => Math.min(d.rl, 0.6));
 
   // KL log view (for the KL plot only)
-  let klLog = data.map(d => Math.max(d.kl, 0.0));
+  const klClamp = 10.0;
+  let klLog = data.map(d => Math.max(d.kl, klClamp));
   // let klLog = data.map(d => Math.log10(Math.max(d.kl, 0) + eps));
 
   // Weighted KL (raw)
-  let wkl = data.map(d => d.kl * d.klw);
+  const mmdMulti = 10000.0;
+  const mmdClamp = 1.0;
+  let mmd = data.map(d => Math.min(d.mmd*mmdMulti, mmdClamp));
 
   // Slope series needs raw D=rl and raw R=kl
   const rdPoints = data.map(d => ({ step: d.step, D: d.rl, R: d.kl }));
@@ -321,8 +324,8 @@ function draw() {
 
   drawSingleSeries(ctxL, cL, steps, loss, "Loss", "green");
   drawSingleSeries(ctxRL, cRL, steps, rl, "Recon (mean MSE)", "blue");
-  drawSingleSeries(ctxKL, cKL, steps, klLog, "KL (log10)", "red");
-  drawSingleSeries(ctxWKL, cWKL, steps, wkl, "Weighted KL = KL x KLw", "purple");
+  drawSingleSeries(ctxKL, cKL, steps, klLog, "KL (Clamp: "+klClamp+")", "red");
+  drawSingleSeries(ctxMMD, cMMD, steps, mmd, "MMD scaled", "purple");
   drawSingleSeries(ctxS, cS, slopeSteps, slopesClamped, "dD/dR (EMA, clamped)", "black");
 
   // RD scatter

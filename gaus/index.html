@@ -1,0 +1,1399 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>2D Gaussian Latent Geometry Visualizer</title>
+  <style>
+    :root {
+      --bg: #0b0e14;
+      --panel: #111625;
+      --panel2: #0f1320;
+      --text: #e7eaf0;
+      --muted: #a8b0c2;
+      --grid: rgba(255,255,255,0.08);
+      --axis: rgba(255,255,255,0.25);
+      --accent: #7aa2f7;
+      --danger: #f7768e;
+      --ok: #9ece6a;
+      --shadow: rgba(0,0,0,0.4);
+    }
+    html, body { height: 100%; background: var(--bg); color: var(--text); margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
+    .wrap { display: grid; grid-template-columns: 420px 1fr; gap: 14px; height: 100%; padding: 14px; box-sizing: border-box; }
+    .panel { background: linear-gradient(180deg, var(--panel), var(--panel2)); border: 1px solid rgba(255,255,255,0.08); border-radius: 14px; box-shadow: 0 10px 30px var(--shadow); overflow: hidden; display: flex; flex-direction: column; }
+    .panel header { padding: 14px 14px 10px; border-bottom: 1px solid rgba(255,255,255,0.08); }
+    .panel header h1 { margin: 0; font-size: 16px; letter-spacing: 0.2px; }
+    .panel header .sub { margin-top: 6px; color: var(--muted); font-size: 12px; line-height: 1.35; }
+    .panel .content { padding: 14px; flex: 1; overflow: auto; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+    label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+    input[type="number"], input[type="text"], select {
+      width: 100%; box-sizing: border-box;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.10);
+      color: var(--text);
+      border-radius: 10px;
+      padding: 10px 10px;
+      outline: none;
+    }
+    input[type="number"]:focus, input[type="text"]:focus, select:focus {
+      border-color: rgba(122,162,247,0.6);
+      box-shadow: 0 0 0 3px rgba(122,162,247,0.15);
+    }
+    .btnbar { display: flex; gap: 10px; flex-wrap: wrap; }
+    button {
+      background: rgba(122,162,247,0.16);
+      border: 1px solid rgba(122,162,247,0.35);
+      color: var(--text);
+      border-radius: 12px;
+      padding: 10px 12px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button:hover { background: rgba(122,162,247,0.22); }
+    button.secondary {
+      background: rgba(255,255,255,0.06);
+      border-color: rgba(255,255,255,0.12);
+      font-weight: 600;
+    }
+    button.danger {
+      background: rgba(247,118,142,0.16);
+      border-color: rgba(247,118,142,0.35);
+    }
+    .tiny { font-size: 12px; color: var(--muted); }
+    .divider { height: 1px; background: rgba(255,255,255,0.10); margin: 12px 0; }
+    .gauss-list { display: grid; gap: 10px; }
+    .gauss-card {
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 12px;
+      padding: 10px;
+    }
+    .gauss-card .top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    .pill {
+      font-size: 11px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.12);
+      background: rgba(255,255,255,0.06);
+      color: var(--muted);
+    }
+    .gauss-card .grid { margin-top: 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .gauss-card .grid3 { margin-top: 8px; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+    .gauss-card input { padding: 9px 9px; border-radius: 10px; }
+    .gauss-card .actions { margin-top: 10px; display: flex; gap: 8px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .stats { white-space: pre; font-size: 12px; color: var(--muted); background: rgba(0,0,0,0.22); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 10px; line-height: 1.35; overflow: auto; max-height: 220px;}
+    .right { display: grid; grid-template-rows: auto 1fr; gap: 14px; }
+    .canvas-wrap { padding: 14px; }
+    canvas { width: 100%; height: calc(100vh - 160px); border-radius: 14px; background: rgba(0,0,0,0.18); border: 1px solid rgba(255,255,255,0.08); }
+    canvas { cursor: grab; }
+    canvas:active { cursor: grabbing; }
+    .topbar { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .chk { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .chk input { transform: scale(1.1); }
+    .hint { color: var(--muted); font-size: 12px; line-height: 1.35; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <!-- LEFT: controls -->
+    <div class="panel">
+      <header>
+        <h1>2D Gaussian Latent Geometry</h1>
+        <div class="sub">
+          Define one or more 2D Gaussians (mean + std + correlation). Visualize samples + covariance ellipses.
+          Prints KL(q‖N(0,I)) and optional pairwise KL. Everything in this one HTML file.
+        </div>
+      </header>
+
+      <div class="content">
+        <div class="topbar">
+          <div>
+            <label>Samples / Gaussian</label>
+            <input id="samples" type="number" min="0" step="100" value="2000" />
+            <div class="tiny">Set to 0 to disable sampling.</div>
+          </div>
+          <div>
+            <label>Random Seed</label>
+            <input id="seed" type="number" step="1" value="0" />
+            <div class="tiny">Affects sampling only.</div>
+          </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="row">
+          <div>
+            <label>Ellipses (Mahalanobis radii)</label>
+            <input id="ellipses" type="text" value="1,2" />
+            <div class="tiny">Comma list, e.g. <span class="mono">1,2,3</span></div>
+          </div>
+          <div>
+            <label>View Range (±)</label>
+            <input id="range" type="number" min="0.5" step="0.5" value="4" />
+            <div class="tiny">Plot window is [-R, R] for both axes.</div>
+          </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="chk">
+          <label style="margin:0">Options</label>
+          <label class="chk"><input id="showScatter" type="checkbox" checked /> show samples</label>
+          <label class="chk"><input id="showGrid" type="checkbox" checked /> grid</label>
+          <label class="chk"><input id="equalAspect" type="checkbox" checked /> equal aspect</label>
+          <label class="chk"><input id="showPriorCircle" type="checkbox" checked /> show N(0,I) circle</label>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="btnbar">
+          <button id="add">+ Add Gaussian</button>
+          <button id="reset" class="secondary">Reset defaults</button>
+          <button id="redraw" class="secondary">Redraw</button>
+          <button id="export" class="secondary">Export JSON</button>
+          <button id="import" class="secondary">Import JSON</button>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="row">
+          <div>
+            <label>Pairwise KL (optional)</label>
+            <input id="pairKL" type="text" placeholder="e.g. 0,1" />
+            <div class="tiny">Computes KL(q_i‖q_j) and KL(q_j‖q_i).</div>
+          </div>
+          <div>
+            <label>Aggregate KL mode</label>
+            <select id="aggMode">
+              <option value="mean">Mean over Gaussians</option>
+              <option value="max">Max over Gaussians</option>
+              <option value="sum">Sum over Gaussians</option>
+            </select>
+            <div class="tiny">Simple aggregation over the list.</div>
+          </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="gauss-list" id="gaussList"></div>
+
+        <div class="divider"></div>
+
+        <div>
+          <label style="font-weight:600; letter-spacing:0.2px;">Simulation</label>
+          <div class="tiny">Target distribution is the average of the listed Gaussians.</div>
+        </div>
+
+        <div class="row">
+          <div>
+            <label>Dataset size</label>
+            <input id="simSize" type="number" min="20" step="20" value="240" />
+          </div>
+          <div>
+            <label>Init spread (σ)</label>
+            <input id="simInitStd" type="number" min="0.2" step="0.2" value="3" />
+          </div>
+        </div>
+
+        <div class="row3">
+          <div class="gauss-card" style="padding:10px;">
+            <label class="chk" style="margin:0 0 8px;"><input id="simLossKl" type="checkbox" checked /> KL to target Gaussian</label>
+            <label>Weight</label>
+            <input id="simWeightKl" type="number" min="0" step="0.1" value="1" />
+          </div>
+          <div class="gauss-card" style="padding:10px;">
+            <label class="chk" style="margin:0 0 8px;"><input id="simLossMmd" type="checkbox" /> MMD (RBF) to target samples</label>
+            <label>Weight</label>
+            <input id="simWeightMmd" type="number" min="0" step="0.1" value="0.6" />
+          </div>
+          <div class="gauss-card" style="padding:10px;">
+            <label class="chk" style="margin:0 0 8px;"><input id="simLossOrtho" type="checkbox" /> Orthogonal regularizer (decorrelate)</label>
+            <label>Weight</label>
+            <input id="simWeightOrtho" type="number" min="0" step="0.1" value="0.4" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div>
+            <label>Learning rate</label>
+            <input id="simLr" type="number" min="0.001" step="0.01" value="0.08" />
+          </div>
+          <div>
+            <label>Steps / frame</label>
+            <input id="simSteps" type="number" min="1" step="1" value="4" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div>
+            <label>RBF bandwidth (MMD)</label>
+            <input id="simBandwidth" type="number" min="0.1" step="0.1" value="1.2" />
+          </div>
+          <div>
+            <label>Target</label>
+            <div class="pill mono">avg of Gaussians</div>
+          </div>
+        </div>
+
+        <div class="btnbar">
+          <button id="simInit">Initialize dataset</button>
+          <button id="simStep" class="secondary">Step</button>
+          <button id="simRun" class="secondary">Run</button>
+          <button id="simClear" class="danger">Clear</button>
+        </div>
+
+        <div class="divider"></div>
+
+        <label>Stats</label>
+        <div class="stats mono" id="stats"></div>
+
+        <div class="divider"></div>
+
+        <div class="hint">
+          Notes: ellipse radii are Mahalanobis distances <span class="mono">(x-μ)ᵀΣ⁻¹(x-μ)=k²</span>.
+          In 2D, k=1 encloses ~39% probability mass; k=2 encloses ~86%.
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT: plot -->
+    <div class="right">
+      <div class="panel">
+        <header>
+          <h1>Plot</h1>
+          <div class="sub">
+            Axis units are latent coordinates (z1, z2). Prior N(0,I) is the unit circle.
+            Ellipses are exact; samples are optional.
+          </div>
+        </header>
+        <div class="canvas-wrap">
+          <canvas id="cv" width="1200" height="900"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+/* ===========================
+   Minimal seeded RNG (LCG)
+   =========================== */
+function makeRNG(seed) {
+  let s = (seed >>> 0);
+  return function() {
+    // Numerical Recipes LCG
+    s = (1664525 * s + 1013904223) >>> 0;
+    return (s / 4294967296);
+  };
+}
+
+/* ===========================
+   Gaussian math (2D)
+   =========================== */
+
+// Covariance from sx, sy, rho
+function covFrom(sx, sy, rho) {
+  const a = sx * sx;
+  const d = sy * sy;
+  const b = rho * sx * sy;
+  return [[a, b], [b, d]];
+}
+
+// det of 2x2
+function det2(M) {
+  return M[0][0] * M[1][1] - M[0][1] * M[1][0];
+}
+
+// inv of 2x2
+function inv2(M) {
+  const det = det2(M);
+  if (!(det > 0)) return null;
+  const invDet = 1 / det;
+  return [
+    [ M[1][1] * invDet, -M[0][1] * invDet ],
+    [ -M[1][0] * invDet, M[0][0] * invDet ]
+  ];
+}
+
+// trace of 2x2
+function trace2(M) {
+  return M[0][0] + M[1][1];
+}
+
+// matmul 2x2 * 2x2
+function mm2(A, B) {
+  return [
+    [
+      A[0][0]*B[0][0] + A[0][1]*B[1][0],
+      A[0][0]*B[0][1] + A[0][1]*B[1][1]
+    ],
+    [
+      A[1][0]*B[0][0] + A[1][1]*B[1][0],
+      A[1][0]*B[0][1] + A[1][1]*B[1][1]
+    ]
+  ];
+}
+
+// v^T * M * v, v is 2-vector
+function quad2(v, M) {
+  const x = v[0], y = v[1];
+  return x*(M[0][0]*x + M[0][1]*y) + y*(M[1][0]*x + M[1][1]*y);
+}
+
+// Eigen decomposition for symmetric 2x2
+// Returns {l1,l2, v1:[x,y], v2:[x,y]} with l1>=l2
+function eigSym2(M) {
+  const a = M[0][0], b = M[0][1], d = M[1][1];
+  const tr = a + d;
+  const disc = Math.sqrt((a - d)*(a - d) + 4*b*b);
+  const l1 = 0.5*(tr + disc);
+  const l2 = 0.5*(tr - disc);
+
+  function norm(v) {
+    const n = Math.hypot(v[0], v[1]);
+    return n > 0 ? [v[0]/n, v[1]/n] : [1, 0];
+  }
+
+  // For eigenvector, solve (A - λI)v=0
+  let v1;
+  if (Math.abs(b) > 1e-12) v1 = norm([l1 - d, b]);
+  else v1 = (a >= d) ? [1, 0] : [0, 1];
+
+  // orthogonal for symmetric 2D
+  const v2 = [-v1[1], v1[0]];
+  return { l1, l2, v1, v2 };
+}
+
+// KL(N0 || N1) for 2D Gaussians
+function klGaussian(mu0, cov0, mu1, cov1) {
+  const inv1 = inv2(cov1);
+  if (!inv1) return NaN;
+  const diff = [mu1[0] - mu0[0], mu1[1] - mu0[1]];
+  const termTrace = trace2(mm2(inv1, cov0));
+  const termQuad  = quad2(diff, inv1);
+  const det0 = det2(cov0);
+  const det1 = det2(cov1);
+  if (!(det0 > 0 && det1 > 0)) return NaN;
+  const termLogDet = Math.log(det1 / det0);
+  const k = 2;
+  return 0.5 * (termTrace + termQuad - k + termLogDet);
+}
+
+// Sample from N(mu, cov) using eigen basis: cov = V diag(l) V^T
+function sampleGaussian2(rng, mu, cov) {
+  // Box-Muller for N(0,1)
+  const u1 = Math.max(rng(), 1e-12);
+  const u2 = rng();
+  const r = Math.sqrt(-2 * Math.log(u1));
+  const th = 2 * Math.PI * u2;
+  const z0 = r * Math.cos(th);
+  const z1 = r * Math.sin(th);
+
+  const E = eigSym2(cov);
+  const s0 = Math.sqrt(Math.max(E.l1, 0));
+  const s1 = Math.sqrt(Math.max(E.l2, 0));
+
+  // x = mu + v1*(s0*z0) + v2*(s1*z1)
+  const x = mu[0] + E.v1[0]*(s0*z0) + E.v2[0]*(s1*z1);
+  const y = mu[1] + E.v1[1]*(s0*z0) + E.v2[1]*(s1*z1);
+  return [x, y];
+}
+
+// Ellipse points for Mahalanobis radius k
+function ellipsePoints(mu, cov, k, n=240) {
+  const E = eigSym2(cov);
+  const a = k * Math.sqrt(Math.max(E.l1, 0));
+  const b = k * Math.sqrt(Math.max(E.l2, 0));
+
+  const pts = [];
+  for (let i = 0; i < n; i++) {
+    const t = (i / n) * 2 * Math.PI;
+    const cx = a * Math.cos(t);
+    const cy = b * Math.sin(t);
+    // rotate: V*[cx, cy]
+    const x = mu[0] + E.v1[0]*cx + E.v2[0]*cy;
+    const y = mu[1] + E.v1[1]*cx + E.v2[1]*cy;
+    pts.push([x, y]);
+  }
+  return pts;
+}
+
+function add2(a, b) {
+  return [[a[0][0] + b[0][0], a[0][1] + b[0][1]], [a[1][0] + b[1][0], a[1][1] + b[1][1]]];
+}
+
+function scale2(M, s) {
+  return [[M[0][0] * s, M[0][1] * s], [M[1][0] * s, M[1][1] * s]];
+}
+
+function outer2(v, w) {
+  return [[v[0] * w[0], v[0] * w[1]], [v[1] * w[0], v[1] * w[1]]];
+}
+
+function targetGaussianFromList(list) {
+  if (!list || list.length === 0) {
+    return { mu: [0, 0], cov: [[1, 0], [0, 1]] };
+  }
+  const n = list.length;
+  let mx = 0, my = 0;
+  for (const g of list) { mx += g.mx; my += g.my; }
+  mx /= n; my /= n;
+  let cov = [[0, 0], [0, 0]];
+  for (const g of list) {
+    const mu = [g.mx, g.my];
+    const covG = covFrom(g.sx, g.sy, g.rho);
+    const diff = [mu[0] - mx, mu[1] - my];
+    cov = add2(cov, add2(covG, outer2(diff, diff)));
+  }
+  cov = scale2(cov, 1 / n);
+  return { mu: [mx, my], cov };
+}
+
+function datasetStats(points) {
+  const n = points.length;
+  if (!n) return { mu: [0, 0], cov: [[1, 0], [0, 1]] };
+  let mx = 0, my = 0;
+  for (const p of points) { mx += p[0]; my += p[1]; }
+  mx /= n; my /= n;
+  let c00 = 0, c01 = 0, c11 = 0;
+  for (const p of points) {
+    const dx = p[0] - mx;
+    const dy = p[1] - my;
+    c00 += dx * dx;
+    c01 += dx * dy;
+    c11 += dy * dy;
+  }
+  c00 /= n; c01 /= n; c11 /= n;
+  return { mu: [mx, my], cov: [[c00, c01], [c01, c11]] };
+}
+
+/* ===========================
+   Canvas plotting helpers
+   =========================== */
+function createPalette(i) {
+  // deterministic “distinct-ish” HSL without hardcoding specific colors
+  const hue = (i * 137.508) % 360; // golden angle
+  return `hsla(${hue}, 85%, 65%, 0.95)`;
+}
+
+function draw(ctx, state) {
+  const cv = ctx.canvas;
+  const W = cv.width, H = cv.height;
+
+  ctx.clearRect(0, 0, W, H);
+
+  const R = Math.max(0.5, +state.range || 4);
+  const pad = 40;
+  const innerW = W - 2*pad;
+  const innerH = H - 2*pad;
+
+  function worldToScreen(p) {
+    const x = p[0] - (state.panX || 0), y = p[1] - (state.panY || 0);
+    const sx = pad + ( (x + R) / (2*R) ) * innerW;
+    const sy = pad + ( (R - y) / (2*R) ) * innerH; // invert y
+    return [sx, sy];
+  }
+
+  // Grid
+  if (state.showGrid) {
+    ctx.strokeStyle = "rgba(255,255,255,0.08)";
+    ctx.lineWidth = 1;
+    const step = niceGridStep(R);
+    for (let x = -R; x <= R + 1e-9; x += step) {
+      const p1 = worldToScreen([x, -R]);
+      const p2 = worldToScreen([x,  R]);
+      ctx.beginPath(); ctx.moveTo(p1[0], p1[1]); ctx.lineTo(p2[0], p2[1]); ctx.stroke();
+    }
+    for (let y = -R; y <= R + 1e-9; y += step) {
+      const p1 = worldToScreen([-R, y]);
+      const p2 = worldToScreen([ R, y]);
+      ctx.beginPath(); ctx.moveTo(p1[0], p1[1]); ctx.lineTo(p2[0], p2[1]); ctx.stroke();
+    }
+  }
+
+  // Axes
+  ctx.strokeStyle = "rgba(255,255,255,0.25)";
+  ctx.lineWidth = 1.5;
+  {
+    const p1 = worldToScreen([-R, 0]);
+    const p2 = worldToScreen([ R, 0]);
+    ctx.beginPath(); ctx.moveTo(p1[0], p1[1]); ctx.lineTo(p2[0], p2[1]); ctx.stroke();
+  }
+  {
+    const p1 = worldToScreen([0, -R]);
+    const p2 = worldToScreen([0,  R]);
+    ctx.beginPath(); ctx.moveTo(p1[0], p1[1]); ctx.lineTo(p2[0], p2[1]); ctx.stroke();
+  }
+
+  // Prior circle (N(0,I)) i.e. ellipse k=1 for I
+  if (state.showPriorCircle) {
+    ctx.strokeStyle = "rgba(122,162,247,0.65)";
+    ctx.lineWidth = 2;
+    const pts = ellipsePoints([0,0], [[1,0],[0,1]], 1, 240);
+    strokePath(ctx, pts.map(worldToScreen));
+    // label
+    ctx.fillStyle = "rgba(122,162,247,0.9)";
+    ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace";
+    const lab = worldToScreen([1, 0]);
+    ctx.fillText("prior 1σ", lab[0] + 6, lab[1] - 6);
+  }
+
+  // Draw each Gaussian
+  const ellipses = parseEllipses(state.ellipsesText);
+
+  state.gaussians.forEach((g, i) => {
+    const color = createPalette(i);
+
+    const mu = [g.mx, g.my];
+    const cov = covFrom(g.sx, g.sy, g.rho);
+
+    // samples
+    if (state.showScatter && state.samples > 0) {
+      ctx.fillStyle = color.replace("0.95", "0.12");
+      const rng = makeRNG((state.seed + i * 1337) | 0);
+      const n = state.samples;
+
+      // draw as tiny circles
+      for (let k = 0; k < n; k++) {
+        const p = sampleGaussian2(rng, mu, cov);
+        const s = worldToScreen(p);
+        if (s[0] < pad || s[0] > W-pad || s[1] < pad || s[1] > H-pad) continue;
+        ctx.beginPath();
+        ctx.arc(s[0], s[1], 1.4, 0, Math.PI*2);
+        ctx.fill();
+      }
+    }
+
+    // ellipses
+    ellipses.forEach((k, idx) => {
+      const alpha = Math.max(0.2, 0.95 - idx*0.25);
+      ctx.strokeStyle = color.replace("0.95", String(alpha));
+      ctx.lineWidth = (idx === 0 ? 2.5 : 2.0);
+      const pts = ellipsePoints(mu, cov, k, 240);
+      strokePath(ctx, pts.map(worldToScreen));
+    });
+
+    // mean marker
+    const m = worldToScreen(mu);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(m[0]-7, m[1]-7);
+    ctx.lineTo(m[0]+7, m[1]+7);
+    ctx.moveTo(m[0]-7, m[1]+7);
+    ctx.lineTo(m[0]+7, m[1]-7);
+    ctx.stroke();
+
+    // label
+    ctx.fillStyle = "rgba(231,234,240,0.9)";
+    ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace";
+    ctx.fillText(`q${i}`, m[0] + 10, m[1] - 10);
+  });
+
+  // Simulated dataset points
+  if (state.simPoints && state.simPoints.length) {
+    ctx.fillStyle = "rgba(247, 214, 85, 0.75)";
+    for (const p of state.simPoints) {
+      const s = worldToScreen(p);
+      if (s[0] < pad || s[0] > W-pad || s[1] < pad || s[1] > H-pad) continue;
+      ctx.beginPath();
+      ctx.arc(s[0], s[1], 2.2, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  // frame
+  ctx.strokeStyle = "rgba(255,255,255,0.12)";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(pad, pad, innerW, innerH);
+
+  // axis labels
+  ctx.fillStyle = "rgba(231,234,240,0.8)";
+  ctx.font = "13px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace";
+  ctx.fillText("z1", W - pad - 22, worldToScreen([0,0])[1] - 8);
+  ctx.fillText("z2", worldToScreen([0,0])[0] + 10, pad + 16);
+}
+
+function strokePath(ctx, pts) {
+  if (pts.length < 2) return;
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  ctx.closePath();
+  ctx.stroke();
+}
+
+function niceGridStep(R) {
+  // aim ~8-10 grid lines
+  const target = (2*R) / 9;
+  const pow10 = Math.pow(10, Math.floor(Math.log10(target)));
+  const m = target / pow10;
+  let step;
+  if (m < 1.5) step = 1 * pow10;
+  else if (m < 3.5) step = 2 * pow10;
+  else if (m < 7.5) step = 5 * pow10;
+  else step = 10 * pow10;
+  return step;
+}
+
+function parseEllipses(text) {
+  return (text || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean)
+    .map(Number)
+    .filter(x => Number.isFinite(x) && x > 0);
+}
+
+/* ===========================
+   UI state + rendering
+   =========================== */
+const DEFAULTS = [
+  { mx: 0.0, my: 0.0, sx: 1.0, sy: 1.0, rho: 0.0 },
+  { mx: 0.8, my: 0.2, sx: 0.5, sy: 1.2, rho: 0.3 },
+];
+
+let appState = {
+  samples: 2000,
+  seed: 0,
+  ellipsesText: "1,2",
+  range: 4,
+  showScatter: true,
+  showGrid: true,
+  equalAspect: true,
+  showPriorCircle: true,
+  pairKL: "",
+  aggMode: "mean",
+  panX: 0,
+  panY: 0,
+  autoCenter: true,
+  simSize: 240,
+  simInitStd: 3,
+  simLossKl: true,
+  simLossMmd: false,
+  simLossOrtho: false,
+  simWeightKl: 1,
+  simWeightMmd: 0.6,
+  simWeightOrtho: 0.4,
+  simLr: 0.08,
+  simSteps: 4,
+  simBandwidth: 1.2,
+  simRunning: false,
+  simPoints: [],
+  simLossValue: NaN,
+  simLossValues: { kl: NaN, mmd: NaN, ortho: NaN },
+  simTick: 0,
+  gaussians: JSON.parse(JSON.stringify(DEFAULTS)),
+};
+
+const els = {
+  cv: document.getElementById("cv"),
+  samples: document.getElementById("samples"),
+  seed: document.getElementById("seed"),
+  ellipses: document.getElementById("ellipses"),
+  range: document.getElementById("range"),
+  showScatter: document.getElementById("showScatter"),
+  showGrid: document.getElementById("showGrid"),
+  equalAspect: document.getElementById("equalAspect"),
+  showPriorCircle: document.getElementById("showPriorCircle"),
+  add: document.getElementById("add"),
+  reset: document.getElementById("reset"),
+  redraw: document.getElementById("redraw"),
+  export: document.getElementById("export"),
+  import: document.getElementById("import"),
+  pairKL: document.getElementById("pairKL"),
+  aggMode: document.getElementById("aggMode"),
+  simSize: document.getElementById("simSize"),
+  simInitStd: document.getElementById("simInitStd"),
+  simLossKl: document.getElementById("simLossKl"),
+  simLossMmd: document.getElementById("simLossMmd"),
+  simLossOrtho: document.getElementById("simLossOrtho"),
+  simWeightKl: document.getElementById("simWeightKl"),
+  simWeightMmd: document.getElementById("simWeightMmd"),
+  simWeightOrtho: document.getElementById("simWeightOrtho"),
+  simLr: document.getElementById("simLr"),
+  simSteps: document.getElementById("simSteps"),
+  simBandwidth: document.getElementById("simBandwidth"),
+  simInit: document.getElementById("simInit"),
+  simStep: document.getElementById("simStep"),
+  simRun: document.getElementById("simRun"),
+  simClear: document.getElementById("simClear"),
+  gaussList: document.getElementById("gaussList"),
+  stats: document.getElementById("stats"),
+};
+const ctx = els.cv.getContext("2d");
+
+function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
+
+function computeStats(state) {
+  const priorMu = [0,0];
+  const priorCov = [[1,0],[0,1]];
+
+  const lines = [];
+  lines.push("Per-Gaussian KL(q || N(0,I)):");
+  const kls = [];
+
+  for (let i = 0; i < state.gaussians.length; i++) {
+    const g = state.gaussians[i];
+    const mu = [g.mx, g.my];
+    const cov = covFrom(g.sx, g.sy, g.rho);
+    const corr = cov[0][1] / (g.sx * g.sy)
+    const kl = klGaussian(mu, cov, priorMu, priorCov);
+    kls.push(kl);
+    lines.push(`  q${i}: ${formatNum(kl)}`);
+    lines.push(`  q${i}: cov12=${formatNum(cov[0][1])}  rho=${formatNum(corr)}`);
+  }
+
+  const mode = state.aggMode;
+  let agg;
+  if (kls.length === 0) agg = NaN;
+  else if (mode === "mean") agg = kls.reduce((a,b)=>a+b,0) / kls.length;
+  else if (mode === "max") agg = Math.max(...kls);
+  else if (mode === "sum") agg = kls.reduce((a,b)=>a+b,0);
+  lines.push("");
+  lines.push(`${mode.toUpperCase()} KL over listed Gaussians: ${formatNum(agg)}`);
+
+  // Pairwise KL if requested
+  const pair = (state.pairKL || "").trim();
+  if (pair.length > 0) {
+    const parts = pair.split(",").map(s => s.trim());
+    if (parts.length === 2) {
+      const a = parseInt(parts[0], 10);
+      const b = parseInt(parts[1], 10);
+      if (Number.isFinite(a) && Number.isFinite(b) && a >= 0 && b >= 0 &&
+          a < state.gaussians.length && b < state.gaussians.length) {
+
+        const ga = state.gaussians[a], gb = state.gaussians[b];
+        const muA = [ga.mx, ga.my], muB = [gb.mx, gb.my];
+        const covA = covFrom(ga.sx, ga.sy, ga.rho);
+        const covB = covFrom(gb.sx, gb.sy, gb.rho);
+        const kab = klGaussian(muA, covA, muB, covB);
+        const kba = klGaussian(muB, covB, muA, covA);
+        lines.push("");
+        lines.push("Pairwise KL:");
+        lines.push(`  KL(q${a} || q${b}) = ${formatNum(kab)}`);
+        lines.push(`  KL(q${b} || q${a}) = ${formatNum(kba)}`);
+      } else {
+        lines.push("");
+        lines.push("Pairwise KL: invalid indices.");
+      }
+    } else {
+      lines.push("");
+      lines.push("Pairwise KL: format should be i,j");
+    }
+  }
+
+  const simPoints = state.simPoints || [];
+  if (simPoints.length > 0) {
+    const target = targetGaussianFromList(state.gaussians);
+    const data = datasetStats(simPoints);
+    lines.push("");
+    lines.push("Simulation:");
+    lines.push(`  loss(total) = ${formatNum(state.simLossValue)}`);
+    lines.push(`  loss(kl) = ${formatNum(state.simLossValues.kl)}  w=${formatNum(state.simWeightKl)}  on=${state.simLossKl}`);
+    lines.push(`  loss(mmd) = ${formatNum(state.simLossValues.mmd)}  w=${formatNum(state.simWeightMmd)}  on=${state.simLossMmd}`);
+    lines.push(`  loss(ortho) = ${formatNum(state.simLossValues.ortho)}  w=${formatNum(state.simWeightOrtho)}  on=${state.simLossOrtho}`);
+    lines.push(`  dataset μ=[${formatNum(data.mu[0])}, ${formatNum(data.mu[1])}]`);
+    lines.push(`  dataset cov11=${formatNum(data.cov[0][0])}  cov22=${formatNum(data.cov[1][1])}  cov12=${formatNum(data.cov[0][1])}`);
+    lines.push(`  target μ=[${formatNum(target.mu[0])}, ${formatNum(target.mu[1])}]`);
+    lines.push(`  target cov11=${formatNum(target.cov[0][0])}  cov22=${formatNum(target.cov[1][1])}  cov12=${formatNum(target.cov[0][1])}`);
+  } else {
+    lines.push("");
+    lines.push("Simulation: (no dataset initialized)");
+  }
+
+  // Quick “geometry” summary lines (tied to the numbers)
+  lines.push("");
+  lines.push("Reminders:");
+  lines.push("  - Mean shift increases KL via ~0.5*||μ||^2 (when prior is N(0,I)).");
+  lines.push("  - Shrinking / expanding variance changes KL via trace + logdet terms.");
+  lines.push("  - Rotation alone doesn't change KL to isotropic prior (only eigenvalues matter).");
+
+  return lines.join("\n");
+}
+
+function formatNum(x) {
+  if (!Number.isFinite(x)) return "NaN";
+  const ax = Math.abs(x);
+  if (ax > 1e6 || (ax > 0 && ax < 1e-4)) return x.toExponential(6);
+  return x.toFixed(6);
+}
+
+function initializeSimulation() {
+  const n = Math.max(0, Math.floor(appState.simSize));
+  const s = Math.max(0.1, +appState.simInitStd || 1);
+  const cov = [[s*s, 0], [0, s*s]];
+  const rng = makeRNG((appState.seed + 99173) | 0);
+  appState.simPoints = [];
+  for (let i = 0; i < n; i++) {
+    appState.simPoints.push(sampleGaussian2(rng, [0, 0], cov));
+  }
+  appState.simLossValue = NaN;
+  appState.simLossValues = { kl: NaN, mmd: NaN, ortho: NaN };
+  appState.simTick = 0;
+}
+
+function mmdLossAndGrad(points, targetPoints, sigma) {
+  const n = points.length;
+  const m = targetPoints.length;
+  const sigma2 = Math.max(1e-6, sigma * sigma);
+  const grads = points.map(() => [0, 0]);
+  const gradsXX = points.map(() => [0, 0]);
+  const gradsXY = points.map(() => [0, 0]);
+  let kxx = 0;
+  let kyy = 0;
+  let kxy = 0;
+
+  for (let i = 0; i < n; i++) {
+    const xi = points[i];
+    for (let j = 0; j < n; j++) {
+      const xj = points[j];
+      const dx = xi[0] - xj[0];
+      const dy = xi[1] - xj[1];
+      const k = Math.exp(-(dx*dx + dy*dy) / (2 * sigma2));
+      kxx += k;
+      gradsXX[i][0] += k * dx;
+      gradsXX[i][1] += k * dy;
+    }
+  }
+
+  for (let i = 0; i < m; i++) {
+    const yi = targetPoints[i];
+    for (let j = 0; j < m; j++) {
+      const yj = targetPoints[j];
+      const dx = yi[0] - yj[0];
+      const dy = yi[1] - yj[1];
+      const k = Math.exp(-(dx*dx + dy*dy) / (2 * sigma2));
+      kyy += k;
+    }
+  }
+
+  for (let i = 0; i < n; i++) {
+    const xi = points[i];
+    for (let j = 0; j < m; j++) {
+      const yj = targetPoints[j];
+      const dx = xi[0] - yj[0];
+      const dy = xi[1] - yj[1];
+      const k = Math.exp(-(dx*dx + dy*dy) / (2 * sigma2));
+      kxy += k;
+      gradsXY[i][0] += k * dx;
+      gradsXY[i][1] += k * dy;
+    }
+  }
+
+  const loss = (kxx / (n * n)) + (kyy / (m * m)) - (2 * kxy / (n * m));
+  const scaleXX = 2 / (n * n * sigma2);
+  const scaleXY = 2 / (n * m * sigma2);
+  for (let i = 0; i < n; i++) {
+    grads[i][0] = gradsXX[i][0] * scaleXX - gradsXY[i][0] * scaleXY;
+    grads[i][1] = gradsXX[i][1] * scaleXX - gradsXY[i][1] * scaleXY;
+  }
+
+  return { loss, grads };
+}
+
+function simulateStep() {
+  const points = appState.simPoints;
+  if (!points || points.length === 0) return;
+  const target = targetGaussianFromList(appState.gaussians);
+  const data = datasetStats(points);
+  const lr = Math.max(0, +appState.simLr || 0);
+  const wKl = appState.simLossKl ? Math.max(0, +appState.simWeightKl || 0) : 0;
+  const wMmd = appState.simLossMmd ? Math.max(0, +appState.simWeightMmd || 0) : 0;
+  const wOrtho = appState.simLossOrtho ? Math.max(0, +appState.simWeightOrtho || 0) : 0;
+  let totalLoss = 0;
+  let lossKl = NaN;
+  let lossMmd = NaN;
+  let lossOrtho = NaN;
+
+  if (wKl > 0) {
+    lossKl = klGaussian(data.mu, data.cov, target.mu, target.cov);
+    totalLoss += wKl * lossKl;
+    const diffMu = [target.mu[0] - data.mu[0], target.mu[1] - data.mu[1]];
+    const eps = 1e-4;
+    const covAdj = add2(data.cov, [[eps, 0], [0, eps]]);
+    const invCov = inv2(covAdj);
+    if (invCov) {
+      const adj = mm2(target.cov, invCov);
+      const w = clamp(lr * 0.5, 0, 1);
+      const M = [
+        [1 - w + w * adj[0][0], w * adj[0][1]],
+        [w * adj[1][0], 1 - w + w * adj[1][1]]
+      ];
+      for (const p of points) {
+        const r = [p[0] - data.mu[0], p[1] - data.mu[1]];
+        const r2 = [
+          M[0][0] * r[0] + M[0][1] * r[1],
+          M[1][0] * r[0] + M[1][1] * r[1]
+        ];
+        p[0] = data.mu[0] + r2[0] + lr * diffMu[0] * wKl;
+        p[1] = data.mu[1] + r2[1] + lr * diffMu[1] * wKl;
+      }
+    }
+  }
+
+  if (wMmd > 0) {
+    const rng = makeRNG((appState.seed + 1337 + appState.simTick) | 0);
+    const targetSamples = [];
+    for (let i = 0; i < points.length; i++) {
+      targetSamples.push(sampleGaussian2(rng, target.mu, target.cov));
+    }
+    const { loss, grads } = mmdLossAndGrad(points, targetSamples, Math.max(0.1, +appState.simBandwidth || 1));
+    lossMmd = loss;
+    totalLoss += wMmd * lossMmd;
+    for (let i = 0; i < points.length; i++) {
+      points[i][0] -= lr * wMmd * grads[i][0];
+      points[i][1] -= lr * wMmd * grads[i][1];
+    }
+  }
+
+  if (wOrtho > 0) {
+    const cov12 = data.cov[0][1];
+    lossOrtho = cov12 * cov12;
+    totalLoss += wOrtho * lossOrtho;
+    const n = points.length;
+    const scale = (2 * cov12) / n;
+    for (const p of points) {
+      const dx = p[0] - data.mu[0];
+      const dy = p[1] - data.mu[1];
+      p[0] -= lr * wOrtho * scale * dy;
+      p[1] -= lr * wOrtho * scale * dx;
+    }
+  }
+
+  appState.simLossValue = totalLoss;
+  appState.simLossValues = { kl: lossKl, mmd: lossMmd, ortho: lossOrtho };
+  appState.simTick += 1;
+}
+
+function simLoop() {
+  if (!appState.simRunning) return;
+  const steps = Math.max(1, appState.simSteps);
+  for (let i = 0; i < steps; i++) simulateStep();
+  render();
+  requestAnimationFrame(simLoop);
+}
+
+function readControlsIntoState() {
+  appState.samples = Math.max(0, parseInt(els.samples.value || "0", 10));
+  appState.seed = parseInt(els.seed.value || "0", 10) | 0;
+  appState.ellipsesText = els.ellipses.value || "";
+  appState.range = Math.max(0.5, +els.range.value || 4);
+  appState.showScatter = !!els.showScatter.checked;
+  appState.showGrid = !!els.showGrid.checked;
+  appState.equalAspect = !!els.equalAspect.checked;
+  appState.showPriorCircle = !!els.showPriorCircle.checked;
+  appState.pairKL = els.pairKL.value || "";
+  appState.aggMode = els.aggMode.value || "mean";
+  appState.simSize = Math.max(0, parseInt(els.simSize.value || "0", 10));
+  appState.simInitStd = Math.max(0.1, +els.simInitStd.value || 1);
+  appState.simLossKl = !!els.simLossKl.checked;
+  appState.simLossMmd = !!els.simLossMmd.checked;
+  appState.simLossOrtho = !!els.simLossOrtho.checked;
+  appState.simWeightKl = Math.max(0, +els.simWeightKl.value || 0);
+  appState.simWeightMmd = Math.max(0, +els.simWeightMmd.value || 0);
+  appState.simWeightOrtho = Math.max(0, +els.simWeightOrtho.value || 0);
+  appState.simLr = Math.max(0, +els.simLr.value || 0);
+  appState.simSteps = Math.max(1, parseInt(els.simSteps.value || "1", 10));
+  appState.simBandwidth = Math.max(0.1, +els.simBandwidth.value || 1);
+
+  // Sanitize gaussians
+  appState.gaussians.forEach(g => {
+    g.sx = Math.max(1e-6, +g.sx);
+    g.sy = Math.max(1e-6, +g.sy);
+    g.rho = clamp(+g.rho, -0.999, 0.999);
+    g.mx = +g.mx;
+    g.my = +g.my;
+  });
+  if (appState.autoCenter && appState.gaussians.length > 0) {
+    let sx = 0, sy = 0;
+    for (const g of appState.gaussians) { sx += g.mx; sy += g.my; }
+    appState.panX = sx / appState.gaussians.length;
+    appState.panY = sy / appState.gaussians.length;
+  }
+}
+
+function render() {
+  readControlsIntoState();
+
+  // plot
+  draw(ctx, appState);
+
+  // stats
+  els.stats.textContent = computeStats(appState);
+
+  // sim control label
+  if (els.simRun) {
+    els.simRun.textContent = appState.simRunning ? "Pause" : "Run";
+  }
+}
+
+function rebuildGaussianList() {
+  els.gaussList.innerHTML = "";
+  appState.gaussians.forEach((g, i) => {
+    const card = document.createElement("div");
+    card.className = "gauss-card";
+
+    const top = document.createElement("div");
+    top.className = "top";
+
+    const left = document.createElement("div");
+    left.style.display = "flex";
+    left.style.alignItems = "center";
+    left.style.gap = "10px";
+
+    const dot = document.createElement("div");
+    dot.style.width = "10px";
+    dot.style.height = "10px";
+    dot.style.borderRadius = "999px";
+    dot.style.background = createPalette(i);
+    dot.style.boxShadow = "0 0 0 3px rgba(255,255,255,0.06)";
+    left.appendChild(dot);
+
+    const title = document.createElement("div");
+    title.innerHTML = `<div style="font-weight:700">q${i}</div><div class="tiny mono">μ=[${g.mx}, ${g.my}]</div>`;
+    left.appendChild(title);
+
+    const pill = document.createElement("div");
+    pill.className = "pill mono";
+    pill.textContent = `color hsl(${((i*137.508)%360).toFixed(1)})`;
+    top.appendChild(left);
+    top.appendChild(pill);
+
+    const grid = document.createElement("div");
+    grid.className = "grid";
+    grid.innerHTML = `
+      <div><label>mx</label><input type="number" step="0.05" value="${g.mx}"></div>
+      <div><label>my</label><input type="number" step="0.05" value="${g.my}"></div>
+    `;
+
+    const grid3 = document.createElement("div");
+    grid3.className = "grid3";
+    grid3.innerHTML = `
+      <div><label>sx</label><input type="number" min="0.000001" step="0.05" value="${g.sx}"></div>
+      <div><label>sy</label><input type="number" min="0.000001" step="0.05" value="${g.sy}"></div>
+      <div><label>rho</label><input type="number" min="-0.999" max="0.999" step="0.05" value="${g.rho}"></div>
+    `;
+
+    const actions = document.createElement("div");
+    actions.className = "actions";
+
+    const dup = document.createElement("button");
+    dup.className = "secondary";
+    dup.textContent = "Duplicate";
+    dup.onclick = () => {
+      appState.gaussians.splice(i+1, 0, JSON.parse(JSON.stringify(g)));
+      rebuildGaussianList();
+      render();
+    };
+
+    const del = document.createElement("button");
+    del.className = "danger";
+    del.textContent = "Delete";
+    del.onclick = () => {
+      appState.gaussians.splice(i, 1);
+      rebuildGaussianList();
+      render();
+    };
+
+    actions.appendChild(dup);
+    actions.appendChild(del);
+
+    card.appendChild(top);
+    card.appendChild(grid);
+    card.appendChild(grid3);
+    card.appendChild(actions);
+
+    // Hook inputs
+    const inputs = card.querySelectorAll("input");
+    // grid: mx,my then grid3: sx,sy,rho in order
+    const mxEl = inputs[0], myEl = inputs[1], sxEl = inputs[2], syEl = inputs[3], rhoEl = inputs[4];
+
+    function bind(el, key, parser=(x)=>+x) {
+      el.addEventListener("input", () => {
+        g[key] = parser(el.value);
+        // keep μ display in header updated
+        title.querySelector(".mono").textContent = `μ=[${g.mx}, ${g.my}]`;
+        render();
+      });
+    }
+    bind(mxEl, "mx", x => +x);
+    bind(myEl, "my", x => +x);
+    bind(sxEl, "sx", x => Math.max(1e-6, +x));
+    bind(syEl, "sy", x => Math.max(1e-6, +x));
+    bind(rhoEl, "rho", x => clamp(+x, -0.999, 0.999));
+
+    els.gaussList.appendChild(card);
+  });
+}
+
+/* ===========================
+   Import / export
+   =========================== */
+function exportJSON() {
+  const payload = {
+    version: 1,
+    appState: {
+      samples: appState.samples,
+      seed: appState.seed,
+      ellipsesText: appState.ellipsesText,
+      range: appState.range,
+      showScatter: appState.showScatter,
+      showGrid: appState.showGrid,
+      equalAspect: appState.equalAspect,
+      showPriorCircle: appState.showPriorCircle,
+      pairKL: appState.pairKL,
+      aggMode: appState.aggMode,
+      simSize: appState.simSize,
+      simInitStd: appState.simInitStd,
+      simLossKl: appState.simLossKl,
+      simLossMmd: appState.simLossMmd,
+      simLossOrtho: appState.simLossOrtho,
+      simWeightKl: appState.simWeightKl,
+      simWeightMmd: appState.simWeightMmd,
+      simWeightOrtho: appState.simWeightOrtho,
+      simLr: appState.simLr,
+      simSteps: appState.simSteps,
+      simBandwidth: appState.simBandwidth,
+      gaussians: appState.gaussians,
+    }
+  };
+  const txt = JSON.stringify(payload, null, 2);
+  navigator.clipboard?.writeText(txt).catch(()=>{});
+  alert("Export JSON copied to clipboard.\n\n(If clipboard blocked, you can copy from the prompt.)");
+  prompt("Copy JSON:", txt);
+}
+
+function importJSON() {
+  const txt = prompt("Paste JSON exported from this app:");
+  if (!txt) return;
+  try {
+    const obj = JSON.parse(txt);
+    const st = obj?.appState;
+    if (!st || !Array.isArray(st.gaussians)) throw new Error("Invalid JSON shape.");
+
+    // apply
+    appState.samples = st.samples ?? appState.samples;
+    appState.seed = st.seed ?? appState.seed;
+    appState.ellipsesText = st.ellipsesText ?? appState.ellipsesText;
+    appState.range = st.range ?? appState.range;
+    appState.showScatter = st.showScatter ?? appState.showScatter;
+    appState.showGrid = st.showGrid ?? appState.showGrid;
+    appState.equalAspect = st.equalAspect ?? appState.equalAspect;
+    appState.showPriorCircle = st.showPriorCircle ?? appState.showPriorCircle;
+    appState.pairKL = st.pairKL ?? appState.pairKL;
+    appState.aggMode = st.aggMode ?? appState.aggMode;
+    appState.simSize = st.simSize ?? appState.simSize;
+    appState.simInitStd = st.simInitStd ?? appState.simInitStd;
+    appState.simLossKl = st.simLossKl ?? appState.simLossKl;
+    appState.simLossMmd = st.simLossMmd ?? appState.simLossMmd;
+    appState.simLossOrtho = st.simLossOrtho ?? appState.simLossOrtho;
+    appState.simWeightKl = st.simWeightKl ?? appState.simWeightKl;
+    appState.simWeightMmd = st.simWeightMmd ?? appState.simWeightMmd;
+    appState.simWeightOrtho = st.simWeightOrtho ?? appState.simWeightOrtho;
+    appState.simLr = st.simLr ?? appState.simLr;
+    appState.simSteps = st.simSteps ?? appState.simSteps;
+    appState.simBandwidth = st.simBandwidth ?? appState.simBandwidth;
+    appState.gaussians = st.gaussians.map(g => ({
+      mx: +g.mx, my: +g.my,
+      sx: Math.max(1e-6, +g.sx),
+      sy: Math.max(1e-6, +g.sy),
+      rho: clamp(+g.rho, -0.999, 0.999),
+    }));
+
+    // sync controls
+    els.samples.value = appState.samples;
+    els.seed.value = appState.seed;
+    els.ellipses.value = appState.ellipsesText;
+    els.range.value = appState.range;
+    els.showScatter.checked = appState.showScatter;
+    els.showGrid.checked = appState.showGrid;
+    els.equalAspect.checked = appState.equalAspect;
+    els.showPriorCircle.checked = appState.showPriorCircle;
+    els.pairKL.value = appState.pairKL;
+    els.aggMode.value = appState.aggMode;
+    els.simSize.value = appState.simSize;
+    els.simInitStd.value = appState.simInitStd;
+    els.simLossKl.checked = appState.simLossKl;
+    els.simLossMmd.checked = appState.simLossMmd;
+    els.simLossOrtho.checked = appState.simLossOrtho;
+    els.simWeightKl.value = appState.simWeightKl;
+    els.simWeightMmd.value = appState.simWeightMmd;
+    els.simWeightOrtho.value = appState.simWeightOrtho;
+    els.simLr.value = appState.simLr;
+    els.simSteps.value = appState.simSteps;
+    els.simBandwidth.value = appState.simBandwidth;
+
+    rebuildGaussianList();
+    render();
+  } catch (e) {
+    alert("Import failed: " + e.message);
+  }
+}
+
+/* ===========================
+   Wire up controls
+   =========================== */
+function wire() {
+  // global controls
+  [
+    els.samples, els.seed, els.ellipses, els.range,
+    els.showScatter, els.showGrid, els.equalAspect, els.showPriorCircle,
+    els.pairKL, els.aggMode,
+    els.simSize, els.simInitStd,
+    els.simLossKl, els.simLossMmd, els.simLossOrtho,
+    els.simWeightKl, els.simWeightMmd, els.simWeightOrtho,
+    els.simLr, els.simSteps, els.simBandwidth
+  ].forEach(el => {
+    el.addEventListener("input", render);
+    el.addEventListener("change", render);
+  });
+
+  els.add.onclick = () => {
+    appState.gaussians.push({ mx: 0, my: 0, sx: 1, sy: 1, rho: 0 });
+    rebuildGaussianList();
+    render();
+  };
+
+  els.reset.onclick = () => {
+    appState.gaussians = JSON.parse(JSON.stringify(DEFAULTS));
+    appState.samples = 2000;
+    appState.seed = 0;
+    appState.ellipsesText = "1,2";
+    appState.range = 4;
+    appState.showScatter = true;
+    appState.showGrid = true;
+    appState.equalAspect = true;
+    appState.showPriorCircle = true;
+    appState.pairKL = "";
+    appState.aggMode = "mean";
+    appState.simSize = 240;
+    appState.simInitStd = 3;
+    appState.simLossKl = true;
+    appState.simLossMmd = false;
+    appState.simLossOrtho = false;
+    appState.simWeightKl = 1;
+    appState.simWeightMmd = 0.6;
+    appState.simWeightOrtho = 0.4;
+    appState.simLr = 0.08;
+    appState.simSteps = 4;
+    appState.simBandwidth = 1.2;
+    appState.simRunning = false;
+    appState.simPoints = [];
+    appState.simLossValue = NaN;
+    appState.simLossValues = { kl: NaN, mmd: NaN, ortho: NaN };
+    appState.simTick = 0;
+
+    els.samples.value = appState.samples;
+    els.seed.value = appState.seed;
+    els.ellipses.value = appState.ellipsesText;
+    els.range.value = appState.range;
+    els.showScatter.checked = appState.showScatter;
+    els.showGrid.checked = appState.showGrid;
+    els.equalAspect.checked = appState.equalAspect;
+    els.showPriorCircle.checked = appState.showPriorCircle;
+    els.pairKL.value = appState.pairKL;
+    els.aggMode.value = appState.aggMode;
+    els.simSize.value = appState.simSize;
+    els.simInitStd.value = appState.simInitStd;
+    els.simLossKl.checked = appState.simLossKl;
+    els.simLossMmd.checked = appState.simLossMmd;
+    els.simLossOrtho.checked = appState.simLossOrtho;
+    els.simWeightKl.value = appState.simWeightKl;
+    els.simWeightMmd.value = appState.simWeightMmd;
+    els.simWeightOrtho.value = appState.simWeightOrtho;
+    els.simLr.value = appState.simLr;
+    els.simSteps.value = appState.simSteps;
+    els.simBandwidth.value = appState.simBandwidth;
+
+    rebuildGaussianList();
+    render();
+  };
+
+  els.redraw.onclick = render;
+  els.export.onclick = exportJSON;
+  els.import.onclick = importJSON;
+  els.simInit.onclick = () => {
+    readControlsIntoState();
+    initializeSimulation();
+    render();
+  };
+  els.simStep.onclick = () => {
+    readControlsIntoState();
+    simulateStep();
+    render();
+  };
+  els.simRun.onclick = () => {
+    readControlsIntoState();
+    appState.simRunning = !appState.simRunning;
+    render();
+    if (appState.simRunning) requestAnimationFrame(simLoop);
+  };
+  els.simClear.onclick = () => {
+    appState.simRunning = false;
+    appState.simPoints = [];
+    appState.simLossValue = NaN;
+    appState.simLossValues = { kl: NaN, mmd: NaN, ortho: NaN };
+    render();
+  };
+
+  // Resize canvas to device pixel ratio
+  const resize = () => {
+    const rect = els.cv.getBoundingClientRect();
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    // keep a nice internal resolution
+    els.cv.width = Math.floor(rect.width * dpr);
+    els.cv.height = Math.floor(rect.height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // draw in CSS pixels
+    render();
+  };
+  window.addEventListener("resize", resize);
+  setTimeout(resize, 50);
+
+  // Drag-to-pan on canvas
+  let dragging = false, lastX = 0, lastY = 0;
+
+  els.cv.addEventListener("pointerdown", (e) => {
+    dragging = true;
+    appState.autoCenter = false; // stop auto-centering once user interacts
+    lastX = e.clientX; lastY = e.clientY;
+    els.cv.setPointerCapture(e.pointerId);
+  });
+
+  els.cv.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - lastX;
+    const dy = e.clientY - lastY;
+    lastX = e.clientX; lastY = e.clientY;
+
+    const R = Math.max(0.5, +appState.range || 4);
+    const rect = els.cv.getBoundingClientRect();
+    const pad = 40;
+    const innerW = rect.width - 2*pad;
+    const innerH = rect.height - 2*pad;
+
+    const unitsPerPxX = (2*R) / innerW;
+    const unitsPerPxY = (2*R) / innerH;
+
+    appState.panX -= dx * unitsPerPxX;
+    appState.panY += dy * unitsPerPxY; // y drag is inverted in screen space
+    render();
+  });
+
+  els.cv.addEventListener("pointerup", (e) => {
+    dragging = false;
+    try { els.cv.releasePointerCapture(e.pointerId); } catch {}
+  });
+}
+
+rebuildGaussianList();
+wire();
+render();
+</script>
+</body>
+</html>
