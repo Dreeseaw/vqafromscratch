@@ -32,7 +32,7 @@ from model import VariationalAutoEncoderRes as VAEr
 
 
 DATA_DIR = "/Users/williamdreese/percy/vqa/VQA/Images/mscoco/"
-# torch.autograd.set_detect_anomaly(True) # use for NaN hunting
+SEED = 35
 
 
 ### Training, eval, & test loading
@@ -380,6 +380,9 @@ if __name__=="__main__":
     if device == "cpu":
         torch.set_num_threads(8)
         torch.set_num_interop_threads(1)
+
+    # Set RNG seed
+    torch.manual_seed(SEED)
 
     # load dynamic training set
     dset = "train2014"
