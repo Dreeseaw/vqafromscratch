@@ -185,6 +185,68 @@
 
         <div class="divider"></div>
 
+        <div>
+          <label style="font-weight:600; letter-spacing:0.2px;">Simulation</label>
+          <div class="tiny">Target distribution is the average of the listed Gaussians.</div>
+        </div>
+
+        <div class="row">
+          <div>
+            <label>Dataset size</label>
+            <input id="simSize" type="number" min="20" step="20" value="240" />
+          </div>
+          <div>
+            <label>Init spread (σ)</label>
+            <input id="simInitStd" type="number" min="0.2" step="0.2" value="3" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div>
+            <label>Loss function</label>
+            <select id="simLoss">
+              <option value="kl">KL to target Gaussian</option>
+              <option value="mmd">MMD (RBF) to target samples</option>
+              <option value="ortho">Orthogonal regularizer (decorrelate)</option>
+            </select>
+          </div>
+          <div>
+            <label>Loss weight</label>
+            <input id="simWeight" type="number" min="0" step="0.1" value="1" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div>
+            <label>Learning rate</label>
+            <input id="simLr" type="number" min="0.001" step="0.01" value="0.08" />
+          </div>
+          <div>
+            <label>Steps / frame</label>
+            <input id="simSteps" type="number" min="1" step="1" value="4" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div>
+            <label>RBF bandwidth (MMD)</label>
+            <input id="simBandwidth" type="number" min="0.1" step="0.1" value="1.2" />
+          </div>
+          <div>
+            <label>Target</label>
+            <div class="pill mono">avg of Gaussians</div>
+          </div>
+        </div>
+
+        <div class="btnbar">
+          <button id="simInit">Initialize dataset</button>
+          <button id="simStep" class="secondary">Step</button>
+          <button id="simRun" class="secondary">Run</button>
+          <button id="simClear" class="danger">Clear</button>
+        </div>
+
+        <div class="divider"></div>
+
         <label>Stats</label>
         <div class="stats mono" id="stats"></div>
 
@@ -358,6 +420,55 @@ function ellipsePoints(mu, cov, k, n=240) {
   return pts;
 }
 
+function add2(a, b) {
+  return [[a[0][0] + b[0][0], a[0][1] + b[0][1]], [a[1][0] + b[1][0], a[1][1] + b[1][1]]];
+}
+
+function scale2(M, s) {
+  return [[M[0][0] * s, M[0][1] * s], [M[1][0] * s, M[1][1] * s]];
+}
+
+function outer2(v, w) {
+  return [[v[0] * w[0], v[0] * w[1]], [v[1] * w[0], v[1] * w[1]]];
+}
+
+function targetGaussianFromList(list) {
+  if (!list || list.length === 0) {
+    return { mu: [0, 0], cov: [[1, 0], [0, 1]] };
+  }
+  const n = list.length;
+  let mx = 0, my = 0;
+  for (const g of list) { mx += g.mx; my += g.my; }
+  mx /= n; my /= n;
+  let cov = [[0, 0], [0, 0]];
+  for (const g of list) {
+    const mu = [g.mx, g.my];
+    const covG = covFrom(g.sx, g.sy, g.rho);
+    const diff = [mu[0] - mx, mu[1] - my];
+    cov = add2(cov, add2(covG, outer2(diff, diff)));
+  }
+  cov = scale2(cov, 1 / n);
+  return { mu: [mx, my], cov };
+}
+
+function datasetStats(points) {
+  const n = points.length;
+  if (!n) return { mu: [0, 0], cov: [[1, 0], [0, 1]] };
+  let mx = 0, my = 0;
+  for (const p of points) { mx += p[0]; my += p[1]; }
+  mx /= n; my /= n;
+  let c00 = 0, c01 = 0, c11 = 0;
+  for (const p of points) {
+    const dx = p[0] - mx;
+    const dy = p[1] - my;
+    c00 += dx * dx;
+    c01 += dx * dy;
+    c11 += dy * dy;
+  }
+  c00 /= n; c01 /= n; c11 /= n;
+  return { mu: [mx, my], cov: [[c00, c01], [c01, c11]] };
+}
+
 /* ===========================
    Canvas plotting helpers
    =========================== */
@@ -481,6 +592,18 @@ function draw(ctx, state) {
     ctx.fillText(`q${i}`, m[0] + 10, m[1] - 10);
   });
 
+  // Simulated dataset points
+  if (state.simPoints && state.simPoints.length) {
+    ctx.fillStyle = "rgba(247, 214, 85, 0.75)";
+    for (const p of state.simPoints) {
+      const s = worldToScreen(p);
+      if (s[0] < pad || s[0] > W-pad || s[1] < pad || s[1] > H-pad) continue;
+      ctx.beginPath();
+      ctx.arc(s[0], s[1], 2.2, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+
   // frame
   ctx.strokeStyle = "rgba(255,255,255,0.12)";
   ctx.lineWidth = 1;
@@ -546,6 +669,17 @@ let appState = {
   panX: 0,
   panY: 0,
   autoCenter: true,
+  simSize: 240,
+  simInitStd: 3,
+  simLoss: "kl",
+  simWeight: 1,
+  simLr: 0.08,
+  simSteps: 4,
+  simBandwidth: 1.2,
+  simRunning: false,
+  simPoints: [],
+  simLossValue: NaN,
+  simTick: 0,
   gaussians: JSON.parse(JSON.stringify(DEFAULTS)),
 };
 
@@ -566,6 +700,17 @@ const els = {
   import: document.getElementById("import"),
   pairKL: document.getElementById("pairKL"),
   aggMode: document.getElementById("aggMode"),
+  simSize: document.getElementById("simSize"),
+  simInitStd: document.getElementById("simInitStd"),
+  simLoss: document.getElementById("simLoss"),
+  simWeight: document.getElementById("simWeight"),
+  simLr: document.getElementById("simLr"),
+  simSteps: document.getElementById("simSteps"),
+  simBandwidth: document.getElementById("simBandwidth"),
+  simInit: document.getElementById("simInit"),
+  simStep: document.getElementById("simStep"),
+  simRun: document.getElementById("simRun"),
+  simClear: document.getElementById("simClear"),
   gaussList: document.getElementById("gaussList"),
   stats: document.getElementById("stats"),
 };
@@ -631,6 +776,22 @@ function computeStats(state) {
     }
   }
 
+  const simPoints = state.simPoints || [];
+  if (simPoints.length > 0) {
+    const target = targetGaussianFromList(state.gaussians);
+    const data = datasetStats(simPoints);
+    lines.push("");
+    lines.push("Simulation:");
+    lines.push(`  loss(${state.simLoss}) = ${formatNum(state.simLossValue)}`);
+    lines.push(`  dataset μ=[${formatNum(data.mu[0])}, ${formatNum(data.mu[1])}]`);
+    lines.push(`  dataset cov11=${formatNum(data.cov[0][0])}  cov22=${formatNum(data.cov[1][1])}  cov12=${formatNum(data.cov[0][1])}`);
+    lines.push(`  target μ=[${formatNum(target.mu[0])}, ${formatNum(target.mu[1])}]`);
+    lines.push(`  target cov11=${formatNum(target.cov[0][0])}  cov22=${formatNum(target.cov[1][1])}  cov12=${formatNum(target.cov[0][1])}`);
+  } else {
+    lines.push("");
+    lines.push("Simulation: (no dataset initialized)");
+  }
+
   // Quick “geometry” summary lines (tied to the numbers)
   lines.push("");
   lines.push("Reminders:");
@@ -648,6 +809,146 @@ function formatNum(x) {
   return x.toFixed(6);
 }
 
+function initializeSimulation() {
+  const n = Math.max(0, Math.floor(appState.simSize));
+  const s = Math.max(0.1, +appState.simInitStd || 1);
+  const cov = [[s*s, 0], [0, s*s]];
+  const rng = makeRNG((appState.seed + 99173) | 0);
+  appState.simPoints = [];
+  for (let i = 0; i < n; i++) {
+    appState.simPoints.push(sampleGaussian2(rng, [0, 0], cov));
+  }
+  appState.simLossValue = NaN;
+  appState.simTick = 0;
+}
+
+function mmdLossAndGrad(points, targetPoints, sigma) {
+  const n = points.length;
+  const m = targetPoints.length;
+  const sigma2 = Math.max(1e-6, sigma * sigma);
+  const grads = points.map(() => [0, 0]);
+  const gradsXX = points.map(() => [0, 0]);
+  const gradsXY = points.map(() => [0, 0]);
+  let kxx = 0;
+  let kyy = 0;
+  let kxy = 0;
+
+  for (let i = 0; i < n; i++) {
+    const xi = points[i];
+    for (let j = 0; j < n; j++) {
+      const xj = points[j];
+      const dx = xi[0] - xj[0];
+      const dy = xi[1] - xj[1];
+      const k = Math.exp(-(dx*dx + dy*dy) / (2 * sigma2));
+      kxx += k;
+      gradsXX[i][0] += k * dx;
+      gradsXX[i][1] += k * dy;
+    }
+  }
+
+  for (let i = 0; i < m; i++) {
+    const yi = targetPoints[i];
+    for (let j = 0; j < m; j++) {
+      const yj = targetPoints[j];
+      const dx = yi[0] - yj[0];
+      const dy = yi[1] - yj[1];
+      const k = Math.exp(-(dx*dx + dy*dy) / (2 * sigma2));
+      kyy += k;
+    }
+  }
+
+  for (let i = 0; i < n; i++) {
+    const xi = points[i];
+    for (let j = 0; j < m; j++) {
+      const yj = targetPoints[j];
+      const dx = xi[0] - yj[0];
+      const dy = xi[1] - yj[1];
+      const k = Math.exp(-(dx*dx + dy*dy) / (2 * sigma2));
+      kxy += k;
+      gradsXY[i][0] += k * dx;
+      gradsXY[i][1] += k * dy;
+    }
+  }
+
+  const loss = (kxx / (n * n)) + (kyy / (m * m)) - (2 * kxy / (n * m));
+  const scaleXX = 2 / (n * n * sigma2);
+  const scaleXY = 2 / (n * m * sigma2);
+  for (let i = 0; i < n; i++) {
+    grads[i][0] = gradsXX[i][0] * scaleXX - gradsXY[i][0] * scaleXY;
+    grads[i][1] = gradsXX[i][1] * scaleXX - gradsXY[i][1] * scaleXY;
+  }
+
+  return { loss, grads };
+}
+
+function simulateStep() {
+  const points = appState.simPoints;
+  if (!points || points.length === 0) return;
+  const target = targetGaussianFromList(appState.gaussians);
+  const data = datasetStats(points);
+  const lr = Math.max(0, +appState.simLr || 0);
+  const weight = Math.max(0, +appState.simWeight || 0);
+  const lossType = appState.simLoss;
+
+  if (lossType === "kl") {
+    const loss = klGaussian(data.mu, data.cov, target.mu, target.cov);
+    appState.simLossValue = loss;
+    const diffMu = [target.mu[0] - data.mu[0], target.mu[1] - data.mu[1]];
+    const eps = 1e-4;
+    const covAdj = add2(data.cov, [[eps, 0], [0, eps]]);
+    const invCov = inv2(covAdj);
+    if (!invCov) return;
+    const adj = mm2(target.cov, invCov);
+    const w = clamp(lr * 0.5, 0, 1);
+    const M = [
+      [1 - w + w * adj[0][0], w * adj[0][1]],
+      [w * adj[1][0], 1 - w + w * adj[1][1]]
+    ];
+    for (const p of points) {
+      const r = [p[0] - data.mu[0], p[1] - data.mu[1]];
+      const r2 = [
+        M[0][0] * r[0] + M[0][1] * r[1],
+        M[1][0] * r[0] + M[1][1] * r[1]
+      ];
+      p[0] = data.mu[0] + r2[0] + lr * diffMu[0] * weight;
+      p[1] = data.mu[1] + r2[1] + lr * diffMu[1] * weight;
+    }
+  } else if (lossType === "mmd") {
+    const rng = makeRNG((appState.seed + 1337 + appState.simTick) | 0);
+    const targetSamples = [];
+    for (let i = 0; i < points.length; i++) {
+      targetSamples.push(sampleGaussian2(rng, target.mu, target.cov));
+    }
+    const { loss, grads } = mmdLossAndGrad(points, targetSamples, Math.max(0.1, +appState.simBandwidth || 1));
+    appState.simLossValue = loss;
+    for (let i = 0; i < points.length; i++) {
+      points[i][0] -= lr * weight * grads[i][0];
+      points[i][1] -= lr * weight * grads[i][1];
+    }
+  } else if (lossType === "ortho") {
+    const cov12 = data.cov[0][1];
+    const loss = cov12 * cov12;
+    appState.simLossValue = loss;
+    const n = points.length;
+    const scale = (2 * cov12) / n;
+    for (const p of points) {
+      const dx = p[0] - data.mu[0];
+      const dy = p[1] - data.mu[1];
+      p[0] -= lr * weight * scale * dy;
+      p[1] -= lr * weight * scale * dx;
+    }
+  }
+  appState.simTick += 1;
+}
+
+function simLoop() {
+  if (!appState.simRunning) return;
+  const steps = Math.max(1, appState.simSteps);
+  for (let i = 0; i < steps; i++) simulateStep();
+  render();
+  requestAnimationFrame(simLoop);
+}
+
 function readControlsIntoState() {
   appState.samples = Math.max(0, parseInt(els.samples.value || "0", 10));
   appState.seed = parseInt(els.seed.value || "0", 10) | 0;
@@ -659,6 +960,13 @@ function readControlsIntoState() {
   appState.showPriorCircle = !!els.showPriorCircle.checked;
   appState.pairKL = els.pairKL.value || "";
   appState.aggMode = els.aggMode.value || "mean";
+  appState.simSize = Math.max(0, parseInt(els.simSize.value || "0", 10));
+  appState.simInitStd = Math.max(0.1, +els.simInitStd.value || 1);
+  appState.simLoss = els.simLoss.value || "kl";
+  appState.simWeight = Math.max(0, +els.simWeight.value || 0);
+  appState.simLr = Math.max(0, +els.simLr.value || 0);
+  appState.simSteps = Math.max(1, parseInt(els.simSteps.value || "1", 10));
+  appState.simBandwidth = Math.max(0.1, +els.simBandwidth.value || 1);
 
   // Sanitize gaussians
   appState.gaussians.forEach(g => {
@@ -684,6 +992,11 @@ function render() {
 
   // stats
   els.stats.textContent = computeStats(appState);
+
+  // sim control label
+  if (els.simRun) {
+    els.simRun.textContent = appState.simRunning ? "Pause" : "Run";
+  }
 }
 
 function rebuildGaussianList() {
@@ -802,6 +1115,13 @@ function exportJSON() {
       showPriorCircle: appState.showPriorCircle,
       pairKL: appState.pairKL,
       aggMode: appState.aggMode,
+      simSize: appState.simSize,
+      simInitStd: appState.simInitStd,
+      simLoss: appState.simLoss,
+      simWeight: appState.simWeight,
+      simLr: appState.simLr,
+      simSteps: appState.simSteps,
+      simBandwidth: appState.simBandwidth,
       gaussians: appState.gaussians,
     }
   };
@@ -830,6 +1150,13 @@ function importJSON() {
     appState.showPriorCircle = st.showPriorCircle ?? appState.showPriorCircle;
     appState.pairKL = st.pairKL ?? appState.pairKL;
     appState.aggMode = st.aggMode ?? appState.aggMode;
+    appState.simSize = st.simSize ?? appState.simSize;
+    appState.simInitStd = st.simInitStd ?? appState.simInitStd;
+    appState.simLoss = st.simLoss ?? appState.simLoss;
+    appState.simWeight = st.simWeight ?? appState.simWeight;
+    appState.simLr = st.simLr ?? appState.simLr;
+    appState.simSteps = st.simSteps ?? appState.simSteps;
+    appState.simBandwidth = st.simBandwidth ?? appState.simBandwidth;
     appState.gaussians = st.gaussians.map(g => ({
       mx: +g.mx, my: +g.my,
       sx: Math.max(1e-6, +g.sx),
@@ -848,6 +1175,13 @@ function importJSON() {
     els.showPriorCircle.checked = appState.showPriorCircle;
     els.pairKL.value = appState.pairKL;
     els.aggMode.value = appState.aggMode;
+    els.simSize.value = appState.simSize;
+    els.simInitStd.value = appState.simInitStd;
+    els.simLoss.value = appState.simLoss;
+    els.simWeight.value = appState.simWeight;
+    els.simLr.value = appState.simLr;
+    els.simSteps.value = appState.simSteps;
+    els.simBandwidth.value = appState.simBandwidth;
 
     rebuildGaussianList();
     render();
@@ -864,7 +1198,9 @@ function wire() {
   [
     els.samples, els.seed, els.ellipses, els.range,
     els.showScatter, els.showGrid, els.equalAspect, els.showPriorCircle,
-    els.pairKL, els.aggMode
+    els.pairKL, els.aggMode,
+    els.simSize, els.simInitStd, els.simLoss, els.simWeight,
+    els.simLr, els.simSteps, els.simBandwidth
   ].forEach(el => {
     el.addEventListener("input", render);
     el.addEventListener("change", render);
@@ -888,6 +1224,17 @@ function wire() {
     appState.showPriorCircle = true;
     appState.pairKL = "";
     appState.aggMode = "mean";
+    appState.simSize = 240;
+    appState.simInitStd = 3;
+    appState.simLoss = "kl";
+    appState.simWeight = 1;
+    appState.simLr = 0.08;
+    appState.simSteps = 4;
+    appState.simBandwidth = 1.2;
+    appState.simRunning = false;
+    appState.simPoints = [];
+    appState.simLossValue = NaN;
+    appState.simTick = 0;
 
     els.samples.value = appState.samples;
     els.seed.value = appState.seed;
@@ -899,6 +1246,13 @@ function wire() {
     els.showPriorCircle.checked = appState.showPriorCircle;
     els.pairKL.value = appState.pairKL;
     els.aggMode.value = appState.aggMode;
+    els.simSize.value = appState.simSize;
+    els.simInitStd.value = appState.simInitStd;
+    els.simLoss.value = appState.simLoss;
+    els.simWeight.value = appState.simWeight;
+    els.simLr.value = appState.simLr;
+    els.simSteps.value = appState.simSteps;
+    els.simBandwidth.value = appState.simBandwidth;
 
     rebuildGaussianList();
     render();
@@ -907,6 +1261,28 @@ function wire() {
   els.redraw.onclick = render;
   els.export.onclick = exportJSON;
   els.import.onclick = importJSON;
+  els.simInit.onclick = () => {
+    readControlsIntoState();
+    initializeSimulation();
+    render();
+  };
+  els.simStep.onclick = () => {
+    readControlsIntoState();
+    simulateStep();
+    render();
+  };
+  els.simRun.onclick = () => {
+    readControlsIntoState();
+    appState.simRunning = !appState.simRunning;
+    render();
+    if (appState.simRunning) requestAnimationFrame(simLoop);
+  };
+  els.simClear.onclick = () => {
+    appState.simRunning = false;
+    appState.simPoints = [];
+    appState.simLossValue = NaN;
+    render();
+  };
 
   // Resize canvas to device pixel ratio
   const resize = () => {

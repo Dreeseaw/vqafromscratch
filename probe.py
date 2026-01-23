@@ -34,7 +34,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
-from model import VariationalAutoEncoder as VAE, VAEConfig
+from model import VariationalAutoEncoder as VAE,VariationalAutoEncoderRes as VAEr, VAEConfig
 from train import Logger
 
 # match train.py defaults
@@ -42,6 +42,7 @@ DATA_DIR_DEFAULT = "/Users/williamdreese/percy/vqa/VQA/Images/mscoco/"
 ANNO_DIR_DEFAULT = "/Users/williamdreese/percy/vqa/VQA/Annotations/"
 COLOR_MEAN = (0.485, 0.456, 0.406)
 COLOR_STD  = (0.229, 0.224, 0.225)
+SEED = 35
 
 
 # -------------------------
@@ -340,9 +341,14 @@ def run_probe(ckpt_path: str, args: argparse.Namespace) -> None:
     logger.log(f"[probe] train samples: {len(train_ds)} | val samples: {len(val_ds)}\n")
 
     # load frozen VAE
-    vae = VAE(VAEConfig()).to(device)
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-    vae.load_state_dict(ckpt["model_state_dict"])
+    try:
+        vae = VAE(VAEConfig()).to(device)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+        vae.load_state_dict(ckpt["model_state_dict"])
+    except:
+        vae = VAEr(VAEConfig()).to(device)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+        vae.load_state_dict(ckpt["model_state_dict"])
     vae.eval()
     for p in vae.parameters():
         p.requires_grad_(False)
@@ -464,6 +470,7 @@ def run_probe(ckpt_path: str, args: argparse.Namespace) -> None:
 
 
 def run_probes_lockstep(ckpt_paths: list[str], args: argparse.Namespace) -> None:
+    torch.manual_seed(SEED)
     train_ann = load_json(args.train_ann_json)
     val_ann = load_json(args.val_ann_json)
     train_targets = build_coco_object_targets(train_ann)
@@ -497,11 +504,17 @@ def run_probes_lockstep(ckpt_paths: list[str], args: argparse.Namespace) -> None
         logger.log(f"[probe] label_mode: {args.label_mode} | use_mu: {args.use_mu}\n")
         logger.log(f"[probe] device: {device}\n")
         logger.log(f"[probe] num_classes: {C}\n")
+        logger.log(f"[probe] rng seed: {SEED}\n")
         logger.log(f"[probe] train samples: {len(train_ds)} | val samples: {len(val_ds)}\n")
 
-        vae = VAE(VAEConfig()).to(device)
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-        vae.load_state_dict(ckpt["model_state_dict"])
+        try:
+            vae = VAE(VAEConfig()).to(device)
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+            vae.load_state_dict(ckpt["model_state_dict"])
+        except:
+            vae = VAEr(VAEConfig()).to(device)
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+            vae.load_state_dict(ckpt["model_state_dict"])
         vae.eval()
         for p in vae.parameters():
             p.requires_grad_(False)

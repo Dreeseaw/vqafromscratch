@@ -41,6 +41,17 @@ bun web app for us to track experiments in both real time and reload old ones.
 ```
 and navigate to `localhost:3000` in your browser. Multiple instances can be run for tab-by-tab comparisons.
 
+
+Probing
+-------
+Linear probes on mu are used to test downstream task efficiency. Multiple probes may be run in parallel and share the same batch, making them almost 2x as fast when running 3 in parallel, relative to 3 sequential runs.
+
+```bash
+> python3 probe.py --ckpt logs/sl_d2_b01/step_10001.tar --use_mu
+> python3 probe.py --ckpts logs/model1/step_10001.tar logs/model2/step_10001.tar --use_mu --multi_mode=lockstep
+```
+
+
 Create mp4 of step_nnn.png's 
 ----------------------------
 This was cooler when my goal was focused on pretty reconstructions.
@@ -51,3 +62,11 @@ This was cooler when my goal was focused on pretty reconstructions.
 ffmpeg -y -r 30 -f concat -safe 0 -i frames.txt \
   -c:v libx264 -pix_fmt yuv420p -crf 18 out.mp4
 ```
+
+Gaussian Visualizaton app
+-------------------------
+Go to Chrome and use 'file:///' in the search bar to pull up the 
+file search functionality, and navigate to <project>/gaus/index.html.
+
+Super handy for getting simple 2d visualizations of how gaussians move
+under different pressures (loss functions).

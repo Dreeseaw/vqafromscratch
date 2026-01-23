@@ -191,7 +191,7 @@ function computeSlopeSeries(points, alpha = 0.01) {
 // RD scatter plot
 // -------------------------
 function drawRDScatter(ctx, canvas, points) {
-  const maxPoints = 20002;
+  const maxPoints = 70002;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   if (points.length < 5) return;
 
@@ -228,7 +228,7 @@ function drawRDScatter(ctx, canvas, points) {
   // No fancy colormap: just grayscale alpha.
   // Also sub-sample for performance if huge.
   const N = pts.length;
-  const maxPts = 1000;
+  const maxPts = 10000;
   const stride = Math.max(1, Math.floor(N / maxPts));
 
   for (let i = 0; i < maxPts; i += 1) {
@@ -246,7 +246,7 @@ function drawRDScatter(ctx, canvas, points) {
   }
   
   function drawCentroidTrail() {
-    const K = 20; // number of segments across time
+    const K = 40; // number of segments across time
     const N = pts.length;
     if (N < 50) return;
 
@@ -305,7 +305,7 @@ function draw() {
   const rl = data.map(d => Math.min(d.rl, 0.6));
 
   // KL log view (for the KL plot only)
-  const klClamp = 20.0;
+  const klClamp = 10.0;
   let klLog = data.map(d => Math.max(d.kl, klClamp));
   // let klLog = data.map(d => Math.log10(Math.max(d.kl, 0) + eps));
 

@@ -28,6 +28,7 @@ from torchvision import transforms
 from torchvision.utils import save_image
 
 from model import VariationalAutoEncoder as VAE, VAEConfig
+from model import VariationalAutoEncoderRes as VAEr
 
 
 DATA_DIR = "/Users/williamdreese/percy/vqa/VQA/Images/mscoco/"
@@ -100,18 +101,19 @@ class Logger:
             print("this run_id already exists (np ckpt) - exitting")
             sys.exit(1)
 
+        self._fn = self._base+LOGFILE
+        if self._probe:
+            self._fn = self._base+f'logfile_probe{self._ckpt}.txt'
+        elif self._ckpt:
+            self._fn = self._base+f'logfile_from_{self._ckpt}.txt'
+
     def log(self, txt):
         print(txt)
-        fn = self._base+LOGFILE
-        if self._probe:
-            fn = self._base+f'logfile_probe.txt'
-        elif self._ckpt:
-            fn = self._base+f'logfile_from_{self._ckpt}.txt'
         
         # just create new file for logging if it's a continue training run,
         # to avoid dual-writing the same step to a file
         # (let web app read both and dedupe)
-        with open(fn, 'a') as f:
+        with open(self._fn, 'a') as f:
             f.write(txt)
 
 def log_params(model, logger):
@@ -349,15 +351,12 @@ def set_decoder_trainable(vae, step) -> (float, float, float):
     manages training schedules & constants + freezing/unfreezing vae components
     returns:
         alpha (float): term for mmd weight
-        beta (float): term for kl weight
+        beta (float): term for kl weight (Original VAE paper B = 0.00521 due to normalization)
         gamma (float): term for ortho reg weight
     """
-    # return 0.001    # beta = 0.2
-    # return 0.00521  # beta = 1 from original vae paper
-    #if step < 10_001:
-    #    return (200.0, 0.0005, 0.0)
-    return (0.0, 0.0005, 0.0)  # let the model have a lil kl
-    # return (100.0, 0.0)    # start playing with alpha > 0, beta = 0
+    # if step < 5001:
+    #     return (200.0, 0.0005, 0.0) 
+    return (0.0, 0.0005, 0.001)  # let the model have a lil ortho
 
 
 ### Training loop
@@ -391,7 +390,7 @@ if __name__=="__main__":
         shuffle=True,
         num_workers=1,
         persistent_workers=True,
-        prefetch_factor=1,
+        prefetch_factor=2,
     )
 
     # uncomment for overfit testing
@@ -507,7 +506,7 @@ if __name__=="__main__":
                 vae.train()
 
             # save weights for future testing/ training/ probing every 1000
-            if global_step % 1000 == 1 and global_step != 1:
+            if global_step % 2000 == 1 and global_step != 1:
                 checkpoint_path = f'logs/{run_id}/step_{global_step}.tar'
                 if checkpoint_id:
                     checkpoint_path = f'logs/{run_id}/step_{global_step}_from_{checkpoint_id}.tar'
