@@ -42,7 +42,7 @@ DATA_DIR_DEFAULT = "/Users/williamdreese/percy/vqa/VQA/Images/mscoco/"
 ANNO_DIR_DEFAULT = "/Users/williamdreese/percy/vqa/VQA/Annotations/"
 COLOR_MEAN = (0.485, 0.456, 0.406)
 COLOR_STD  = (0.229, 0.224, 0.225)
-SEED = 35
+SEED = 2026
 
 
 # -------------------------

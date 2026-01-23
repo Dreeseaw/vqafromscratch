@@ -201,18 +201,21 @@
           </div>
         </div>
 
-        <div class="row">
-          <div>
-            <label>Loss function</label>
-            <select id="simLoss">
-              <option value="kl">KL to target Gaussian</option>
-              <option value="mmd">MMD (RBF) to target samples</option>
-              <option value="ortho">Orthogonal regularizer (decorrelate)</option>
-            </select>
+        <div class="row3">
+          <div class="gauss-card" style="padding:10px;">
+            <label class="chk" style="margin:0 0 8px;"><input id="simLossKl" type="checkbox" checked /> KL to target Gaussian</label>
+            <label>Weight</label>
+            <input id="simWeightKl" type="number" min="0" step="0.1" value="1" />
           </div>
-          <div>
-            <label>Loss weight</label>
-            <input id="simWeight" type="number" min="0" step="0.1" value="1" />
+          <div class="gauss-card" style="padding:10px;">
+            <label class="chk" style="margin:0 0 8px;"><input id="simLossMmd" type="checkbox" /> MMD (RBF) to target samples</label>
+            <label>Weight</label>
+            <input id="simWeightMmd" type="number" min="0" step="0.1" value="0.6" />
+          </div>
+          <div class="gauss-card" style="padding:10px;">
+            <label class="chk" style="margin:0 0 8px;"><input id="simLossOrtho" type="checkbox" /> Orthogonal regularizer (decorrelate)</label>
+            <label>Weight</label>
+            <input id="simWeightOrtho" type="number" min="0" step="0.1" value="0.4" />
           </div>
         </div>
 
@@ -671,14 +674,19 @@ let appState = {
   autoCenter: true,
   simSize: 240,
   simInitStd: 3,
-  simLoss: "kl",
-  simWeight: 1,
+  simLossKl: true,
+  simLossMmd: false,
+  simLossOrtho: false,
+  simWeightKl: 1,
+  simWeightMmd: 0.6,
+  simWeightOrtho: 0.4,
   simLr: 0.08,
   simSteps: 4,
   simBandwidth: 1.2,
   simRunning: false,
   simPoints: [],
   simLossValue: NaN,
+  simLossValues: { kl: NaN, mmd: NaN, ortho: NaN },
   simTick: 0,
   gaussians: JSON.parse(JSON.stringify(DEFAULTS)),
 };
@@ -702,8 +710,12 @@ const els = {
   aggMode: document.getElementById("aggMode"),
   simSize: document.getElementById("simSize"),
   simInitStd: document.getElementById("simInitStd"),
-  simLoss: document.getElementById("simLoss"),
-  simWeight: document.getElementById("simWeight"),
+  simLossKl: document.getElementById("simLossKl"),
+  simLossMmd: document.getElementById("simLossMmd"),
+  simLossOrtho: document.getElementById("simLossOrtho"),
+  simWeightKl: document.getElementById("simWeightKl"),
+  simWeightMmd: document.getElementById("simWeightMmd"),
+  simWeightOrtho: document.getElementById("simWeightOrtho"),
   simLr: document.getElementById("simLr"),
   simSteps: document.getElementById("simSteps"),
   simBandwidth: document.getElementById("simBandwidth"),
@@ -782,7 +794,10 @@ function computeStats(state) {
     const data = datasetStats(simPoints);
     lines.push("");
     lines.push("Simulation:");
-    lines.push(`  loss(${state.simLoss}) = ${formatNum(state.simLossValue)}`);
+    lines.push(`  loss(total) = ${formatNum(state.simLossValue)}`);
+    lines.push(`  loss(kl) = ${formatNum(state.simLossValues.kl)}  w=${formatNum(state.simWeightKl)}  on=${state.simLossKl}`);
+    lines.push(`  loss(mmd) = ${formatNum(state.simLossValues.mmd)}  w=${formatNum(state.simWeightMmd)}  on=${state.simLossMmd}`);
+    lines.push(`  loss(ortho) = ${formatNum(state.simLossValues.ortho)}  w=${formatNum(state.simWeightOrtho)}  on=${state.simLossOrtho}`);
     lines.push(`  dataset μ=[${formatNum(data.mu[0])}, ${formatNum(data.mu[1])}]`);
     lines.push(`  dataset cov11=${formatNum(data.cov[0][0])}  cov22=${formatNum(data.cov[1][1])}  cov12=${formatNum(data.cov[0][1])}`);
     lines.push(`  target μ=[${formatNum(target.mu[0])}, ${formatNum(target.mu[1])}]`);
@@ -819,6 +834,7 @@ function initializeSimulation() {
     appState.simPoints.push(sampleGaussian2(rng, [0, 0], cov));
   }
   appState.simLossValue = NaN;
+  appState.simLossValues = { kl: NaN, mmd: NaN, ortho: NaN };
   appState.simTick = 0;
 }
 
@@ -887,57 +903,71 @@ function simulateStep() {
   const target = targetGaussianFromList(appState.gaussians);
   const data = datasetStats(points);
   const lr = Math.max(0, +appState.simLr || 0);
-  const weight = Math.max(0, +appState.simWeight || 0);
-  const lossType = appState.simLoss;
+  const wKl = appState.simLossKl ? Math.max(0, +appState.simWeightKl || 0) : 0;
+  const wMmd = appState.simLossMmd ? Math.max(0, +appState.simWeightMmd || 0) : 0;
+  const wOrtho = appState.simLossOrtho ? Math.max(0, +appState.simWeightOrtho || 0) : 0;
+  let totalLoss = 0;
+  let lossKl = NaN;
+  let lossMmd = NaN;
+  let lossOrtho = NaN;
 
-  if (lossType === "kl") {
-    const loss = klGaussian(data.mu, data.cov, target.mu, target.cov);
-    appState.simLossValue = loss;
+  if (wKl > 0) {
+    lossKl = klGaussian(data.mu, data.cov, target.mu, target.cov);
+    totalLoss += wKl * lossKl;
     const diffMu = [target.mu[0] - data.mu[0], target.mu[1] - data.mu[1]];
     const eps = 1e-4;
     const covAdj = add2(data.cov, [[eps, 0], [0, eps]]);
     const invCov = inv2(covAdj);
-    if (!invCov) return;
-    const adj = mm2(target.cov, invCov);
-    const w = clamp(lr * 0.5, 0, 1);
-    const M = [
-      [1 - w + w * adj[0][0], w * adj[0][1]],
-      [w * adj[1][0], 1 - w + w * adj[1][1]]
-    ];
-    for (const p of points) {
-      const r = [p[0] - data.mu[0], p[1] - data.mu[1]];
-      const r2 = [
-        M[0][0] * r[0] + M[0][1] * r[1],
-        M[1][0] * r[0] + M[1][1] * r[1]
+    if (invCov) {
+      const adj = mm2(target.cov, invCov);
+      const w = clamp(lr * 0.5, 0, 1);
+      const M = [
+        [1 - w + w * adj[0][0], w * adj[0][1]],
+        [w * adj[1][0], 1 - w + w * adj[1][1]]
       ];
-      p[0] = data.mu[0] + r2[0] + lr * diffMu[0] * weight;
-      p[1] = data.mu[1] + r2[1] + lr * diffMu[1] * weight;
+      for (const p of points) {
+        const r = [p[0] - data.mu[0], p[1] - data.mu[1]];
+        const r2 = [
+          M[0][0] * r[0] + M[0][1] * r[1],
+          M[1][0] * r[0] + M[1][1] * r[1]
+        ];
+        p[0] = data.mu[0] + r2[0] + lr * diffMu[0] * wKl;
+        p[1] = data.mu[1] + r2[1] + lr * diffMu[1] * wKl;
+      }
     }
-  } else if (lossType === "mmd") {
+  }
+
+  if (wMmd > 0) {
     const rng = makeRNG((appState.seed + 1337 + appState.simTick) | 0);
     const targetSamples = [];
     for (let i = 0; i < points.length; i++) {
       targetSamples.push(sampleGaussian2(rng, target.mu, target.cov));
     }
     const { loss, grads } = mmdLossAndGrad(points, targetSamples, Math.max(0.1, +appState.simBandwidth || 1));
-    appState.simLossValue = loss;
+    lossMmd = loss;
+    totalLoss += wMmd * lossMmd;
     for (let i = 0; i < points.length; i++) {
-      points[i][0] -= lr * weight * grads[i][0];
-      points[i][1] -= lr * weight * grads[i][1];
+      points[i][0] -= lr * wMmd * grads[i][0];
+      points[i][1] -= lr * wMmd * grads[i][1];
     }
-  } else if (lossType === "ortho") {
+  }
+
+  if (wOrtho > 0) {
     const cov12 = data.cov[0][1];
-    const loss = cov12 * cov12;
-    appState.simLossValue = loss;
+    lossOrtho = cov12 * cov12;
+    totalLoss += wOrtho * lossOrtho;
     const n = points.length;
     const scale = (2 * cov12) / n;
     for (const p of points) {
       const dx = p[0] - data.mu[0];
       const dy = p[1] - data.mu[1];
-      p[0] -= lr * weight * scale * dy;
-      p[1] -= lr * weight * scale * dx;
+      p[0] -= lr * wOrtho * scale * dy;
+      p[1] -= lr * wOrtho * scale * dx;
     }
   }
+
+  appState.simLossValue = totalLoss;
+  appState.simLossValues = { kl: lossKl, mmd: lossMmd, ortho: lossOrtho };
   appState.simTick += 1;
 }
 
@@ -962,8 +992,12 @@ function readControlsIntoState() {
   appState.aggMode = els.aggMode.value || "mean";
   appState.simSize = Math.max(0, parseInt(els.simSize.value || "0", 10));
   appState.simInitStd = Math.max(0.1, +els.simInitStd.value || 1);
-  appState.simLoss = els.simLoss.value || "kl";
-  appState.simWeight = Math.max(0, +els.simWeight.value || 0);
+  appState.simLossKl = !!els.simLossKl.checked;
+  appState.simLossMmd = !!els.simLossMmd.checked;
+  appState.simLossOrtho = !!els.simLossOrtho.checked;
+  appState.simWeightKl = Math.max(0, +els.simWeightKl.value || 0);
+  appState.simWeightMmd = Math.max(0, +els.simWeightMmd.value || 0);
+  appState.simWeightOrtho = Math.max(0, +els.simWeightOrtho.value || 0);
   appState.simLr = Math.max(0, +els.simLr.value || 0);
   appState.simSteps = Math.max(1, parseInt(els.simSteps.value || "1", 10));
   appState.simBandwidth = Math.max(0.1, +els.simBandwidth.value || 1);
@@ -1117,8 +1151,12 @@ function exportJSON() {
       aggMode: appState.aggMode,
       simSize: appState.simSize,
       simInitStd: appState.simInitStd,
-      simLoss: appState.simLoss,
-      simWeight: appState.simWeight,
+      simLossKl: appState.simLossKl,
+      simLossMmd: appState.simLossMmd,
+      simLossOrtho: appState.simLossOrtho,
+      simWeightKl: appState.simWeightKl,
+      simWeightMmd: appState.simWeightMmd,
+      simWeightOrtho: appState.simWeightOrtho,
       simLr: appState.simLr,
       simSteps: appState.simSteps,
       simBandwidth: appState.simBandwidth,
@@ -1152,8 +1190,12 @@ function importJSON() {
     appState.aggMode = st.aggMode ?? appState.aggMode;
     appState.simSize = st.simSize ?? appState.simSize;
     appState.simInitStd = st.simInitStd ?? appState.simInitStd;
-    appState.simLoss = st.simLoss ?? appState.simLoss;
-    appState.simWeight = st.simWeight ?? appState.simWeight;
+    appState.simLossKl = st.simLossKl ?? appState.simLossKl;
+    appState.simLossMmd = st.simLossMmd ?? appState.simLossMmd;
+    appState.simLossOrtho = st.simLossOrtho ?? appState.simLossOrtho;
+    appState.simWeightKl = st.simWeightKl ?? appState.simWeightKl;
+    appState.simWeightMmd = st.simWeightMmd ?? appState.simWeightMmd;
+    appState.simWeightOrtho = st.simWeightOrtho ?? appState.simWeightOrtho;
     appState.simLr = st.simLr ?? appState.simLr;
     appState.simSteps = st.simSteps ?? appState.simSteps;
     appState.simBandwidth = st.simBandwidth ?? appState.simBandwidth;
@@ -1177,8 +1219,12 @@ function importJSON() {
     els.aggMode.value = appState.aggMode;
     els.simSize.value = appState.simSize;
     els.simInitStd.value = appState.simInitStd;
-    els.simLoss.value = appState.simLoss;
-    els.simWeight.value = appState.simWeight;
+    els.simLossKl.checked = appState.simLossKl;
+    els.simLossMmd.checked = appState.simLossMmd;
+    els.simLossOrtho.checked = appState.simLossOrtho;
+    els.simWeightKl.value = appState.simWeightKl;
+    els.simWeightMmd.value = appState.simWeightMmd;
+    els.simWeightOrtho.value = appState.simWeightOrtho;
     els.simLr.value = appState.simLr;
     els.simSteps.value = appState.simSteps;
     els.simBandwidth.value = appState.simBandwidth;
@@ -1199,7 +1245,9 @@ function wire() {
     els.samples, els.seed, els.ellipses, els.range,
     els.showScatter, els.showGrid, els.equalAspect, els.showPriorCircle,
     els.pairKL, els.aggMode,
-    els.simSize, els.simInitStd, els.simLoss, els.simWeight,
+    els.simSize, els.simInitStd,
+    els.simLossKl, els.simLossMmd, els.simLossOrtho,
+    els.simWeightKl, els.simWeightMmd, els.simWeightOrtho,
     els.simLr, els.simSteps, els.simBandwidth
   ].forEach(el => {
     el.addEventListener("input", render);
@@ -1226,14 +1274,19 @@ function wire() {
     appState.aggMode = "mean";
     appState.simSize = 240;
     appState.simInitStd = 3;
-    appState.simLoss = "kl";
-    appState.simWeight = 1;
+    appState.simLossKl = true;
+    appState.simLossMmd = false;
+    appState.simLossOrtho = false;
+    appState.simWeightKl = 1;
+    appState.simWeightMmd = 0.6;
+    appState.simWeightOrtho = 0.4;
     appState.simLr = 0.08;
     appState.simSteps = 4;
     appState.simBandwidth = 1.2;
     appState.simRunning = false;
     appState.simPoints = [];
     appState.simLossValue = NaN;
+    appState.simLossValues = { kl: NaN, mmd: NaN, ortho: NaN };
     appState.simTick = 0;
 
     els.samples.value = appState.samples;
@@ -1248,8 +1301,12 @@ function wire() {
     els.aggMode.value = appState.aggMode;
     els.simSize.value = appState.simSize;
     els.simInitStd.value = appState.simInitStd;
-    els.simLoss.value = appState.simLoss;
-    els.simWeight.value = appState.simWeight;
+    els.simLossKl.checked = appState.simLossKl;
+    els.simLossMmd.checked = appState.simLossMmd;
+    els.simLossOrtho.checked = appState.simLossOrtho;
+    els.simWeightKl.value = appState.simWeightKl;
+    els.simWeightMmd.value = appState.simWeightMmd;
+    els.simWeightOrtho.value = appState.simWeightOrtho;
     els.simLr.value = appState.simLr;
     els.simSteps.value = appState.simSteps;
     els.simBandwidth.value = appState.simBandwidth;
@@ -1281,6 +1338,7 @@ function wire() {
     appState.simRunning = false;
     appState.simPoints = [];
     appState.simLossValue = NaN;
+    appState.simLossValues = { kl: NaN, mmd: NaN, ortho: NaN };
     render();
   };
 
