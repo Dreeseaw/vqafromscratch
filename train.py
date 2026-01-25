@@ -27,8 +27,8 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.utils import save_image
 
-from model import VariationalAutoEncoder as VAE, VAEConfig
-from model import VariationalAutoEncoderRes as VAEr
+from vae import VariationalAutoEncoder as VAE, VAEConfig
+from vae import VariationalAutoEncoderRes as VAEr
 
 
 DATA_DIR = "/Users/williamdreese/percy/vqa/VQA/Images/mscoco/"
@@ -411,7 +411,7 @@ if __name__=="__main__":
 
     # torch object creation
     config = VAEConfig() 
-    vae = VAE(config).to(device)
+    vae = VAEr(config).to(device)
     opt = torch.optim.Adam(vae.parameters(), lr=0.001, weight_decay=0.0001)
 
     if checkpoint_id:

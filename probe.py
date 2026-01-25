@@ -34,7 +34,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
-from model import VariationalAutoEncoder as VAE,VariationalAutoEncoderRes as VAEr, VAEConfig
+from vae import VariationalAutoEncoder as VAE,VariationalAutoEncoderRes as VAEr, VAEConfig
 from train import Logger
 
 # match train.py defaults
@@ -42,6 +42,7 @@ DATA_DIR_DEFAULT = "/Users/williamdreese/percy/vqa/VQA/Images/mscoco/"
 ANNO_DIR_DEFAULT = "/Users/williamdreese/percy/vqa/VQA/Annotations/"
 COLOR_MEAN = (0.485, 0.456, 0.406)
 COLOR_STD  = (0.229, 0.224, 0.225)
+SEED = 35
 
 
 # -------------------------
@@ -313,6 +314,7 @@ def build_dataloaders(
 # Main
 # -------------------------
 def run_probe(ckpt_path: str, args: argparse.Namespace) -> None:
+    torch.manual_seed(SEED)
     ckpt_path = os.path.expanduser(ckpt_path)
     run_id, ckpt_step = infer_run_and_step_from_ckpt(ckpt_path)
     checkpoint_id_for_logger = ckpt_step if ckpt_step >= 0 else 0

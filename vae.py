@@ -96,6 +96,43 @@ class ConvUpBlock_NoBN(nn.Module):
     def forward(self, x):
         return self._block(x)
 
+
+class ResBlock_NoBN(nn.Module):
+    def __init__(self, c, act=nn.ReLU(inplace=True)):
+        super().__init__()
+        self.conv1 = nn.Conv2d(c, c, 3, padding=1)
+        self.act = act
+        self.conv2 = nn.Conv2d(c, c, 3, padding=1)
+
+    def forward(self, x):
+        return x + self.conv2(self.act(self.conv1(x)))
+
+
+class ResUpBlock(nn.Module):
+    def __init__(self, ic, oc, act=nn.ReLU(inplace=True)):
+        super().__init__()
+        self._up = nn.Upsample(scale_factor=2, mode="nearest")
+        self._conv = nn.Conv2d(ic, oc, kernel_size=3, padding=1)
+        self._res = ResBlock_NoBN(oc, act)
+        self._skip = (
+            nn.Conv2d(ic, oc, 1)
+            if ic != oc
+            else nn.Identity()
+        )
+
+    def forward(self, x):
+        # upsample before sending through residual
+        x_upped = self._up(x)
+
+        # run upsampled x through normal conv,
+        # identity gets rechanneled if needed
+        y = self._conv(x_upped)
+        skip = self._skip(x_upped)
+
+        # combine and run through simple conv-act-conv res
+        return self._res(y + skip)
+
+
 """
 Baseline Encoder/decoder abstractions
 """
@@ -123,7 +160,7 @@ class Encoder(nn.Module):
 
 
 """
-ResNet-ish replacement for your half-VGG encoder.
+ResNet-ish replacement
 Output spatial size: 7x7 (for 224x224 input), same as before.
 """
 class ResEncoder(nn.Module):
@@ -134,22 +171,22 @@ class ResEncoder(nn.Module):
         self._encoder = nn.Sequential(
             # 224x224
             ResBlock(3, 64, stride=2),
-            # ResBlock(64, 64, stride=1),
+            ResBlock(64, 64, stride=1),
 
             # 112x112
-            ResBlock(64, 96, stride=2),
-            # ResBlock(128, 128, stride=1),
+            ResBlock(64, 128, stride=2),
+            ResBlock(128, 128, stride=1),
 
             # 56x56
-            ResBlock(96, 128, stride=2),
-            # ResBlock(256, 256, stride=1),
+            ResBlock(128, 192, stride=2),
+            ResBlock(192, 192, stride=1),
 
             # 28x28
-            ResBlock(128, 192, stride=2),
-            # ResBlock(256, 256, stride=1),
+            ResBlock(192, 256, stride=2),
+            ResBlock(256, 256, stride=1),
 
             # 14x14
-            ResBlock(192, 256, stride=2),
+            ResBlock(256, 256, stride=2),
             # ResBlock(256, 256, stride=1),
             # -> 7x7
         )
@@ -166,20 +203,25 @@ class Decoder(nn.Module):
         # latent comes with spatial structure - no need to recreate
         # seed does not upsample, but preps signal for upsampling
         self._seed = nn.Sequential(
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.Conv2d(16, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
+            nn.Conv2d(96, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 192, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
         )
         
         # focused on upsampling into a real RGB image
         self._decoder = nn.Sequential(
-            ConvUpBlock_NoBN(128, 96, act=nn.Identity()),  # 7
-            nn.Conv2d(96, 96, kernel_size=3, padding=1),
+            ConvUpBlock_NoBN(192, 128, act=nn.Identity()),  # 7
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            ConvUpBlock_NoBN(96, 64),   # 14
+            ConvUpBlock_NoBN(128, 96),   # 14
+            nn.Conv2d(96, 64, kernel_size=3, padding=1),
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             ConvUpBlock_NoBN(64, 32),   # 28 
@@ -191,6 +233,53 @@ class Decoder(nn.Module):
     def forward(self, z):
         h = self._seed(z) 
         return self._decoder(h)
+
+"""
+Apply resnet principles to decoding in an attempt
+to eliminate the need to allocate KL on stupid stuff
+"""
+class ResDecoder(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self._config = config
+        
+        # same meta-arch as v1 decoder - upsample channels before upsampling space
+        # repeat upchannel -> act -> res pattern
+        self._seed = nn.Sequential(
+            nn.Conv2d(16, 64, 3, padding=1),
+            nn.ReLU(inplace=True),
+            ResBlock_NoBN(64),
+            # nn.Conv2d(32, 64, 3, padding=1),
+            # nn.ReLU(inplace=True),
+            # ResBlock_NoBN(64),
+            # nn.Conv2d(64, 128, 3, padding=1),
+            # nn.ReLU(inplace=True),
+            # ResBlock_NoBN(128),
+            # nn.Conv2d(96, 128, 3, padding=1),
+            # nn.ReLU(inplace=True),
+            # ResBlock_NoBN(128),
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.ReLU(inplace=True),
+            ResBlock_NoBN(128),
+        )
+
+        self._decode = nn.Sequential(
+            ResUpBlock(128, 96),  # 7x7 -> 14x14
+            # ResBlock_NoBN(128),
+            ResUpBlock(96, 64),  # 14 -> 28
+            # ResBlock_NoBN(96),
+            ResUpBlock(64, 64),  # 28 -> 56
+            # ResBlock_NoBN(64),
+            ResUpBlock(64, 32),  # 56 -> 112
+            # ResBlock_NoBN(32),
+            ResUpBlock(32, 16),  # 112 -> 224
+            # ResBlock_NoBN(16),
+            nn.Conv2d(16, 3, kernel_size=3, padding=1),
+        )
+
+    def forward(self, z):
+        h = self._seed(z)
+        return self._decode(h)
 
 
 class SpatialPosteriorHead(nn.Module):
@@ -220,7 +309,7 @@ class VariationalAutoEncoderRes(nn.Module):
         self._post_head = SpatialPosteriorHead(256, 16)
 
         # [B,C,7,7] -> [B,3,W,H]
-        self._decoder = Decoder(config)
+        self._decoder = ResDecoder(config)
 
     def forward(self, x):
         # grab some 2d features
