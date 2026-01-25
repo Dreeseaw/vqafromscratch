@@ -305,12 +305,12 @@ function draw() {
   const rl = data.map(d => Math.min(d.rl, 0.6));
 
   // KL log view (for the KL plot only)
-  const klClamp = 10.0;
+  const klClamp = 20.0;
   let klLog = data.map(d => Math.max(d.kl, klClamp));
   // let klLog = data.map(d => Math.log10(Math.max(d.kl, 0) + eps));
 
   // Weighted KL (raw)
-  const mmdMulti = 10000.0;
+  const mmdMulti = 100.0;
   const mmdClamp = 1.0;
   let mmd = data.map(d => Math.min(d.mmd*mmdMulti, mmdClamp));
 
@@ -319,7 +319,7 @@ function draw() {
   const { outSteps: slopeSteps, outSlope: slopes } = computeSlopeSeries(rdPoints, 0.01);
 
   // Clamp slope for readability
-  const SCLAMP = 0.5;
+  const SCLAMP = 1.0;
   const slopesClamped = slopes.map(v => Math.max(-SCLAMP, Math.min(SCLAMP, v)));
 
   drawSingleSeries(ctxL, cL, steps, loss, "Loss", "green");
