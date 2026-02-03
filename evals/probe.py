@@ -4,17 +4,17 @@ probe.py
 Linear probe on VAE latent z (flattened [B,16,7,7] -> [B,784]) using COCO-style annotations.
 
 Key changes vs prior version:
-- Uses your Logger from train.py (same folder import).
+- Uses your Logger from train/train.py.
 - Adds CLI arg to choose label mode: --label_mode {multilabel,singlelabel}
   - multilabel: multi-hot object presence (BCEWithLogits + F1 metric)
   - singlelabel: pick ONE category per image (most frequent category in that image) (CrossEntropy + top1 acc)
 
 Example:
-python3 probe.py --ckpt logs/my_run/step_4000.tar --label_mode multilabel
-python3 probe.py --ckpt logs/my_run/step_4000.tar --label_mode singlelabel
-python3 probe.py --ckpts logs/run1/step_2000.tar logs/run2/step_4000.tar --max_parallel 2
-python3 probe.py --ckpts logs/run1/step_2000.tar logs/run2/step_4000.tar --multi_mode lockstep
-python3 probe.py --ckpt logs/my_run/step_4000.tar --amp --compile
+python3 -m evals.probe --ckpt logs/my_run/step_4000.tar --label_mode multilabel
+python3 -m evals.probe --ckpt logs/my_run/step_4000.tar --label_mode singlelabel
+python3 -m evals.probe --ckpts logs/run1/step_2000.tar logs/run2/step_4000.tar --max_parallel 2
+python3 -m evals.probe --ckpts logs/run1/step_2000.tar logs/run2/step_4000.tar --multi_mode lockstep
+python3 -m evals.probe --ckpt logs/my_run/step_4000.tar --amp --compile
 """
 
 import os
@@ -34,8 +34,8 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
-from vae import VariationalAutoEncoder as VAE,VariationalAutoEncoderRes as VAEr, VAEConfig
-from train import Logger
+from models.vae import VariationalAutoEncoder as VAE, VariationalAutoEncoderRes as VAEr, VAEConfig
+from train.train import Logger
 
 # match train.py defaults
 DATA_DIR_DEFAULT = "/Users/williamdreese/percy/vqa/VQA/Images/mscoco/"

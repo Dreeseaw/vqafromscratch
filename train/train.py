@@ -2,10 +2,10 @@
 training code for vae
 
 new run
-> python3 train.py my_fun_run_id
+> python3 -m train.train my_fun_run_id
 
 continue from weights (in this case, from step 4000)
-> python3 train.py my_fun_run_id 4000
+> python3 -m train.train my_fun_run_id 4000
 
 results saved in 
 - /logs/<run_id>/logfile.txt
@@ -27,8 +27,8 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.utils import save_image
 
-from vae import VariationalAutoEncoder as VAE, VAEConfig
-from vae import VariationalAutoEncoderRes as VAEr
+from models.vae import VariationalAutoEncoder as VAE, VAEConfig
+from models.vae import VariationalAutoEncoderRes as VAEr
 
 
 DATA_DIR = "/Users/williamdreese/percy/vqa/VQA/Images/mscoco/"
