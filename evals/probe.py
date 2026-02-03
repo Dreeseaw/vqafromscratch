@@ -38,8 +38,8 @@ from models.vae import VariationalAutoEncoder as VAE, VariationalAutoEncoderRes 
 from train.train import Logger
 
 # match train.py defaults
-DATA_DIR_DEFAULT = "/Users/williamdreese/percy/vqa/VQA/Images/mscoco/"
-ANNO_DIR_DEFAULT = "/Users/williamdreese/percy/vqa/VQA/Annotations/"
+DATA_DIR_DEFAULT = "/Users/williamdreese/percy/vqa/vqafromscratch/images/mscoco/"
+ANNO_DIR_DEFAULT = "/Users/williamdreese/percy/vqa/vqafromscratch/annotations/"
 COLOR_MEAN = (0.485, 0.456, 0.406)
 COLOR_STD  = (0.229, 0.224, 0.225)
 SEED = 35

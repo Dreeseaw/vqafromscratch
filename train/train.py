@@ -31,7 +31,7 @@ from models.vae import VariationalAutoEncoder as VAE, VAEConfig
 from models.vae import VariationalAutoEncoderRes as VAEr
 
 
-DATA_DIR = "/Users/williamdreese/percy/vqa/VQA/Images/mscoco/"
+DATA_DIR = "/Users/williamdreese/percy/vqa/vqafromscratch/images/mscoco/"
 SEED = 35
 
 
