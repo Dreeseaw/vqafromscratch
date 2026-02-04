@@ -29,6 +29,7 @@ from torchvision.utils import save_image
 
 from models.vae import VariationalAutoEncoder as VAE, VAEConfig
 from models.vae import VariationalAutoEncoderRes as VAEr
+from models.vae import ViTVAE as ViTVAE
 
 
 DATA_DIR = "/Users/williamdreese/percy/vqa/vqafromscratch/images/mscoco/"
@@ -368,7 +369,7 @@ if __name__=="__main__":
     # hyperparams
     epochs = 20_000  # by the time my kids have kids
     global_step = 0
-    batch_size = 96
+    batch_size = 128
 
     # cpu performance guidance
     device = "cpu" 
@@ -391,9 +392,10 @@ if __name__=="__main__":
         dataset, 
         batch_size=batch_size, 
         shuffle=True,
-        num_workers=1,
+        num_workers=8,
         persistent_workers=True,
-        prefetch_factor=2,
+        prefetch_factor=4,
+        pin_memory=False,
     )
 
     # uncomment for overfit testing
@@ -410,8 +412,8 @@ if __name__=="__main__":
     )
 
     # torch object creation
-    config = VAEConfig() 
-    vae = VAEr(config).to(device)
+    config = VAEConfig(latent_dim=256, cbld=256) 
+    vae = ViTVAE(config).to(device)
     opt = torch.optim.Adam(vae.parameters(), lr=0.001, weight_decay=0.0001)
 
     if checkpoint_id:
