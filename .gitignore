@@ -6,3 +6,4 @@ logs/*
 __pycache__/*
 images/*
 annotations/*
+docs/*.pdf

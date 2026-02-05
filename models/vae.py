@@ -287,6 +287,54 @@ class ViTEncoder(nn.Module):
 
 
 """
+ViT decoder (token -> patch -> image)
+"""
+class ViTDecoder(nn.Module):
+    def __init__(self, config, in_channels: int = 16):
+        super().__init__()
+        self._config = config
+
+        # project spatial latent into token dim
+        self._z_proj = nn.Conv2d(in_channels, config.latent_dim, kernel_size=1)
+        self._cls = nn.Parameter(torch.zeros(1, 1, config.latent_dim))
+
+        # mirror encoder blocks
+        self._core_blocks = nn.Sequential(
+            *[ViTBlock(config, n_heads=4) for _ in range(5)]
+        )
+        self._ln = nn.LayerNorm(config.latent_dim)
+
+        # map tokens back to pixel patches
+        self._to_patch = nn.Linear(
+            config.latent_dim, 
+            3 * config.p_s * config.p_s,
+        )
+
+    def forward(self, z):
+        # z: [B,C,7,7] (or config.feature_h/feature_w)
+        z = self._z_proj(z)
+        tokens = z.flatten(2).transpose(1, 2)  # [B,N,D]
+        tokens = torch.cat([
+            self._cls.expand(z.shape[0], -1, -1),
+            tokens,
+        ], dim=1)
+
+        t = self._core_blocks(tokens)
+        pos = self._ln(t[:, 1:, :])
+        patches = self._to_patch(pos)  # [B,N,3*ps*ps]
+
+        b = z.shape[0]
+        h = self._config.feature_h
+        w = self._config.feature_w
+        ps = self._config.p_s
+
+        patches = patches.view(b, h, w, 3, ps, ps)
+        img = patches.permute(0, 3, 1, 4, 2, 5).contiguous()
+        img = img.view(b, 3, h * ps, w * ps)
+        return img
+
+
+"""
 Base decoder
 """
 class Decoder(nn.Module):
