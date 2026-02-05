@@ -1,6 +1,8 @@
 """
 define models used in project
 """
+import copy
+
 import torch
 import torch.nn as nn
 
@@ -263,7 +265,7 @@ class ViTEncoder(nn.Module):
 
         # L layers of blocks with N heads and D dim
         self._core_blocks = nn.Sequential(
-            *[ViTBlock(config, n_heads=4) for _ in range(5)]
+            *[ViTBlock(config, n_heads=16) for _ in range(5)]
         )
         
         # Spatial latent transform
@@ -292,15 +294,19 @@ ViT decoder (token -> patch -> image)
 class ViTDecoder(nn.Module):
     def __init__(self, config, in_channels: int = 16):
         super().__init__()
+        dec_config = copy.deepcopy(config)
+        dec_config.latent_dim = config.latent_dim // 2
+        dec_config.core_block_lin_dim = config.core_block_lin_dim // 2
+        config = dec_config
         self._config = config
 
         # project spatial latent into token dim
         self._z_proj = nn.Conv2d(in_channels, config.latent_dim, kernel_size=1)
         self._cls = nn.Parameter(torch.zeros(1, 1, config.latent_dim))
 
-        # mirror encoder blocks
+        # mirror encoder blocks minus some depth
         self._core_blocks = nn.Sequential(
-            *[ViTBlock(config, n_heads=4) for _ in range(5)]
+            *[ViTBlock(config, n_heads=8) for _ in range(3)]
         )
         self._ln = nn.LayerNorm(config.latent_dim)
 
@@ -445,6 +451,24 @@ class ViTVAE(nn.Module):
         self._encoder = ViTEncoder(config)
         self._post_head = SpatialPosteriorHead(256, 16)
         self._decoder = ResDecoder(config)
+
+    def forward(self, x):
+        f = self._encoder(x)
+        mu, lv = self._post_head(f)
+        clipped_lv = torch.clamp(lv, min=-10.0, max=1.0)  # help combat exploding gradients
+        std = torch.exp(clipped_lv / 2.0)
+        sample = mu  + (torch.randn_like(std) * std)  # reparam trick
+
+        x_hat = self._decoder(sample)
+        return x_hat, sample, mu, clipped_lv
+
+class ViTVAE2(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self._config = config
+        self._encoder = ViTEncoder(config)
+        self._post_head = SpatialPosteriorHead(256, 16)
+        self._decoder = ViTDecoder(config)
 
     def forward(self, x):
         f = self._encoder(x)

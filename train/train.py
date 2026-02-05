@@ -29,7 +29,7 @@ from torchvision.utils import save_image
 
 from models.vae import VariationalAutoEncoder as VAE, VAEConfig
 from models.vae import VariationalAutoEncoderRes as VAEr
-from models.vae import ViTVAE as ViTVAE
+from models.vae import ViTVAE, ViTVAE2
 
 
 DATA_DIR = "/Users/williamdreese/percy/vqa/vqafromscratch/images/mscoco/"
@@ -357,7 +357,7 @@ def set_decoder_trainable(vae, step) -> (float, float, float):
     """
     # if step < 5001:
     #     return (200.0, 0.0005, 0.0) 
-    return (0.0, 0.0005, 0.001)  # let the model have a lil ortho
+    return (0.0, 0.00521, 0.0)  # let the model have a lil ortho
 
 
 ### Training loop
@@ -392,7 +392,7 @@ if __name__=="__main__":
         dataset, 
         batch_size=batch_size, 
         shuffle=True,
-        num_workers=8,
+        num_workers=4,
         persistent_workers=True,
         prefetch_factor=4,
         pin_memory=False,
@@ -412,8 +412,8 @@ if __name__=="__main__":
     )
 
     # torch object creation
-    config = VAEConfig(latent_dim=256, cbld=256) 
-    vae = ViTVAE(config).to(device)
+    config = VAEConfig(latent_dim=768, cbld=1536) 
+    vae = ViTVAE2(config).to(device)
     opt = torch.optim.Adam(vae.parameters(), lr=0.001, weight_decay=0.0001)
 
     if checkpoint_id:

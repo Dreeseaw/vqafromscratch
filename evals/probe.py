@@ -35,7 +35,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
 from models.vae import VariationalAutoEncoder as VAE, VariationalAutoEncoderRes as VAEr, VAEConfig
-from models.vae import ViTVAE
+from models.vae import ViTVAE2 as ViTVAE
 from train.train import Logger
 
 # match train.py defaults
@@ -515,7 +515,8 @@ def run_probes_lockstep(ckpt_paths: list[str], args: argparse.Namespace) -> None
             vae.load_state_dict(ckpt["model_state_dict"])
         except:
             try:
-                config = VAEConfig(latent_dim=256, cbld=256) 
+                # config = VAEConfig(latent_dim=256, cbld=256) 
+                config = VAEConfig(latent_dim=768, cbld=1536) 
                 vae = ViTVAE(config).to(device)
                 ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
                 vae.load_state_dict(ckpt["model_state_dict"])
