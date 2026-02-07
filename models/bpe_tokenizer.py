@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Tuple, Union
+import unicodedata
 from time import perf_counter
 
 import torch
@@ -10,25 +11,79 @@ import torch.nn as nn
 Token = Tuple[int, ...]
 Pair = Tuple[Token, Token]
 
+_PUNCT_TRANSLATION = str.maketrans(
+    {
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201A": "'",
+        "\u201B": "'",
+        "\u201C": '"',
+        "\u201D": '"',
+        "\u201E": '"',
+        "\u201F": '"',
+        "\u00AB": '"',
+        "\u00BB": '"',
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2212": "-",
+        "\uFE63": "-",
+        "\uFF0D": "-",
+        "\u2044": "/",
+        "\u2215": "/",
+        "\uFF0F": "/",
+        "\u2026": "...",
+        "\u00A0": " ",
+        "\u2007": " ",
+        "\u202F": " ",
+        "\u200B": "",
+    }
+)
+
 
 @dataclass(frozen=True)
 class BPESpecial:
     pad: str = "<pad>"
+    unk: str = "<unk>"
     bos: str = "<bos>"
     eos: str = "<eos>"
     mask: str = "<mask>"
+    vis: str = "<vis>"
+    txt: str = "<txt>"
 
 
 class ByteBPETokenizer(nn.Module):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        num_extra_tokens: int = 16,
+        normalize_nfkc: bool = True,
+        normalize_punct: bool = True,
+        max_numeric_token_len: int = 4,
+    ) -> None:
         super().__init__()
         self.special = BPESpecial()
-        self._special_tokens: Dict[str, Token] = {
-            self.special.pad: (-1,),
-            self.special.bos: (-2,),
-            self.special.eos: (-3,),
-            self.special.mask: (-4,),
-        }
+        self.num_extra_tokens = num_extra_tokens
+        self.normalize_nfkc = normalize_nfkc
+        self.normalize_punct = normalize_punct
+        self.max_numeric_token_len = max_numeric_token_len
+
+        self.extra_tokens: List[str] = [
+            f"<extra_{i}>" for i in range(self.num_extra_tokens)
+        ]
+        self._special_token_order: List[str] = [
+            self.special.pad,
+            self.special.unk,
+            self.special.bos,
+            self.special.eos,
+            self.special.mask,
+            self.special.vis,
+            self.special.txt,
+        ] + self.extra_tokens
+
+        self._special_tokens: Dict[str, Token] = {}
+        next_id = -1
+        for name in self._special_token_order:
+            self._special_tokens[name] = (next_id,)
+            next_id -= 1
         self._special_names: Dict[Token, str] = {
             v: k for k, v in self._special_tokens.items()
         }
@@ -40,10 +95,7 @@ class ByteBPETokenizer(nn.Module):
     # -------------------------
     def _rebuild_vocab(self) -> None:
         self.id_to_token: List[Token] = [
-            self._special_tokens[self.special.pad],
-            self._special_tokens[self.special.bos],
-            self._special_tokens[self.special.eos],
-            self._special_tokens[self.special.mask],
+            self._special_tokens[name] for name in self._special_token_order
         ]
         self.id_to_token.extend([(i,) for i in range(256)])
         for pair in self.merges:
@@ -55,6 +107,26 @@ class ByteBPETokenizer(nn.Module):
             pair: i for i, pair in enumerate(self.merges)
         }
 
+    def _normalize_text(self, text: str) -> str:
+        if self.normalize_nfkc:
+            text = unicodedata.normalize("NFKC", text)
+        if self.normalize_punct:
+            text = text.translate(_PUNCT_TRANSLATION)
+        return text
+
+    @staticmethod
+    def _is_digit_token(tok: Token) -> bool:
+        return bool(tok) and all(48 <= b <= 57 for b in tok)
+
+    def _reject_pair(self, pair: Pair) -> bool:
+        # Avoid merging long numeric strings into a single token.
+        if self.max_numeric_token_len <= 0:
+            return False
+        combined = pair[0] + pair[1]
+        if len(combined) > self.max_numeric_token_len and self._is_digit_token(combined):
+            return True
+        return False
+
     def train_bpe(
         self,
         texts: Iterable[str],
@@ -63,7 +135,8 @@ class ByteBPETokenizer(nn.Module):
     ) -> None:
         sequences: List[List[Token]] = []
         for text in texts:
-            b = text.encode("utf-8")
+            norm = self._normalize_text(text)
+            b = norm.encode("utf-8")
             if b:
                 sequences.append([(byte,) for byte in b])
 
@@ -82,8 +155,17 @@ class ByteBPETokenizer(nn.Module):
                     prev = tok
             if not pair_counts:
                 break
-            best_pair, best_freq = max(pair_counts.items(), key=lambda x: x[1])
-            if best_freq < min_pair_freq:
+            best_pair = None
+            best_freq = 0
+            for pair, freq in pair_counts.items():
+                if freq < min_pair_freq:
+                    continue
+                if self._reject_pair(pair):
+                    continue
+                if freq > best_freq:
+                    best_pair = pair
+                    best_freq = freq
+            if best_pair is None:
                 break
             self.merges.append(best_pair)
             sequences = [self._merge_pair(seq, best_pair) for seq in sequences]
@@ -128,7 +210,8 @@ class ByteBPETokenizer(nn.Module):
     def encode(
         self, text: str, add_bos: bool = True, add_eos: bool = True
     ) -> torch.LongTensor:
-        tokens = self._bpe([(b,) for b in text.encode("utf-8")])
+        norm = self._normalize_text(text)
+        tokens = self._bpe([(b,) for b in norm.encode("utf-8")])
         ids = [self.token_to_id[tok] for tok in tokens]
         if add_bos:
             ids = [self.bos_id] + ids
@@ -197,35 +280,83 @@ class ByteBPETokenizer(nn.Module):
         payload = {
             "merges": self.merges,
             "special_tokens": self._special_tokens,
+            "special_token_order": self._special_token_order,
+            "config": {
+                "num_extra_tokens": self.num_extra_tokens,
+                "normalize_nfkc": self.normalize_nfkc,
+                "normalize_punct": self.normalize_punct,
+                "max_numeric_token_len": self.max_numeric_token_len,
+            },
         }
         torch.save(payload, path)
 
     @classmethod
     def load(cls, path: str, device=None) -> "ByteBPETokenizer":
         data = torch.load(path, map_location=device if device else "cpu")
-        tok = cls()
+        config = data.get("config", {})
+        tok = cls(
+            num_extra_tokens=int(config.get("num_extra_tokens", 16)),
+            normalize_nfkc=bool(config.get("normalize_nfkc", True)),
+            normalize_punct=bool(config.get("normalize_punct", True)),
+            max_numeric_token_len=int(config.get("max_numeric_token_len", 4)),
+        )
         if "special_tokens" in data:
             tok._special_tokens = data["special_tokens"]
             tok._special_names = {v: k for k, v in tok._special_tokens.items()}
+            order = data.get("special_token_order")
+            if isinstance(order, list) and order:
+                tok._special_token_order = order
+            else:
+                # Backward compatibility: keep known tokens in default order.
+                order = []
+                for name in tok._special_token_order:
+                    if name in tok._special_tokens:
+                        order.append(name)
+                tok._special_token_order = order
         tok.merges = data.get("merges", [])
         tok._rebuild_vocab()
         return tok
 
     @property
     def pad_id(self) -> int:
-        return 0
+        return self.token_to_id[self._special_tokens[self.special.pad]]
 
     @property
     def bos_id(self) -> int:
-        return 1
+        return self.token_to_id[self._special_tokens[self.special.bos]]
 
     @property
     def eos_id(self) -> int:
-        return 2
+        return self.token_to_id[self._special_tokens[self.special.eos]]
+
+    @property
+    def unk_id(self) -> int:
+        return self.token_to_id[self._special_tokens[self.special.unk]]
 
     @property
     def mask_id(self) -> int:
-        return 3
+        return self.token_to_id[self._special_tokens[self.special.mask]]
+
+    @property
+    def vis_id(self) -> int:
+        return self.token_to_id[self._special_tokens[self.special.vis]]
+
+    @property
+    def txt_id(self) -> int:
+        return self.token_to_id[self._special_tokens[self.special.txt]]
+
+    @property
+    def special_tokens(self) -> List[str]:
+        return list(self._special_token_order)
+
+    @property
+    def config(self) -> Dict[str, Union[int, bool]]:
+        return {
+            "num_extra_tokens": self.num_extra_tokens,
+            "normalize_nfkc": self.normalize_nfkc,
+            "normalize_punct": self.normalize_punct,
+            "max_numeric_token_len": self.max_numeric_token_len,
+        }
 
     @property
     def vocab_size(self) -> int:
