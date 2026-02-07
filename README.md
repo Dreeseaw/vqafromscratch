@@ -47,8 +47,8 @@ Probing
 Linear probes on mu are used to test downstream task efficiency. Multiple probes may be run in parallel and share the same batch, making them almost 2x as fast when running 3 in parallel, relative to 3 sequential runs.
 
 ```bash
-> python3 probe.py --ckpt logs/sl_d2_b01/step_10001.tar --use_mu
-> python3 probe.py --ckpts logs/model1/step_10001.tar logs/model2/step_10001.tar --use_mu --multi_mode=lockstep
+> python3 -m evals.probe --ckpt logs/sl_d2_b01/step_10001.tar --use_mu
+> python3 -m evals.probe --ckpts logs/model1/step_10001.tar logs/model2/step_10001.tar --use_mu --multi_mode=lockstep
 ```
 
 
