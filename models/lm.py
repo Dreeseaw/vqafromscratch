@@ -226,28 +226,29 @@ class TransformerV1(nn.Module):
         embeds = self._pos_embed(embeds)
         kv_cache = self._encode(embeds)
         out = self._decode(embeds, kv_cache)
-        hN = out[:, -1, :]
-        return self._lm_head(hN)
+        return self._lm_head(out)
 
 
 if __name__=="__main__":
-    B, S, V = 10, 16, 64
-    lmc = LMConfig(vocab_size=V, embed_size=128, layers=2)
+    B, S, V, E, L = 10, 16, 64, 128, 2
+    lmc = LMConfig(vocab_size=V, embed_size=E, layers=L)
     t = TransformerV1(lmc)
-
-    batch = torch.randint(0, V, (B, S))
-    targets = batch[:, 1:]
 
     t.train()
     opt = torch.optim.Adam(t.parameters(), lr=0.001, weight_decay=0.0001)
-    # crit = nn.CrossEntropyLoss()
 
-    for _ in range(10):
-        nt = list()
+    for _ in range(10000):
+        batch   = torch.randint(0, V, (B, S))
+        inputs  = batch[:, :-1]
+        targets = batch[:, 1:]
+
+        '''nt = list()
         for idx in range(1, batch.shape[1]):
             nt.append(t(batch[:, :idx]))
+        predictions = torch.stack(nt, dim=1)'''
 
-        predictions = torch.stack(nt, dim=1)
+        predictions = t(inputs)
+
         loss = F.cross_entropy(predictions.transpose(1, 2), targets)
 
         opt.zero_grad()
