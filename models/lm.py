@@ -43,19 +43,25 @@ class LMConfig:
         self, 
         vocab_size: int = 16384, 
         embed_size: int = 768,
+        num_heads: int = 8,
         mlp_ratio: int = 4,
         layers: int = 5,
         max_seq_len: int = 2048,
         tie_embeds: bool = False,
+        attn_impl: str = "sdpa",
+        sdp_backend: str = "auto",
         config_file: str = None, 
     ):
         # load defaults/ params first
         self.vocab_size = vocab_size
         self.embed_size = embed_size
+        self.num_heads = num_heads
         self.mlp_ratio = mlp_ratio
         self.layers = layers
         self.max_seq_len = max_seq_len
         self.tie_embeds = tie_embeds
+        self.attn_impl = attn_impl
+        self.sdp_backend = sdp_backend
         self._config_file = config_file
 
         # if given, overwrite loaded params from yaml
@@ -65,6 +71,19 @@ class LMConfig:
             for key, value in data.items():
                 if hasattr(self, key):
                     setattr(self, key, value)
+        if self.embed_size % self.num_heads != 0:
+            raise ValueError(
+                f"embed_size ({self.embed_size}) must be divisible by num_heads ({self.num_heads})."
+            )
+        head_dim = self.embed_size // self.num_heads
+        if head_dim % 2 != 0:
+            raise ValueError(
+                f"head_dim ({head_dim}) must be even for RoPE (embed_size/num_heads)."
+            )
+        if self.attn_impl not in ("sdpa", "eager"):
+            raise ValueError("attn_impl must be 'sdpa' or 'eager'.")
+        if self.sdp_backend not in ("auto", "flash", "mem_efficient", "math"):
+            raise ValueError("sdp_backend must be one of: auto, flash, mem_efficient, math.")
 
 
 class RotaryEmbedding(nn.Module):
@@ -88,6 +107,10 @@ class RotaryEmbedding(nn.Module):
         return cos, sin
 
     def _apply_rotary(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        # Broadcast cos/sin to match x shape for arbitrary leading dims.
+        while cos.dim() < x.dim():
+            cos = cos.unsqueeze(-2)
+            sin = sin.unsqueeze(-2)
         x1 = x[..., 0::2]
         x2 = x[..., 1::2]
         x_rot = torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
@@ -106,10 +129,14 @@ class TransformerEncoderBlock(nn.Module):
         super().__init__()
 
         # MHA sublayer
-        # TODO: implement MHA over SDPA
         E = config.embed_size
-        self._wk, self._wv, self._wq = nn.Linear(E, E), nn.Linear(E, E), nn.Linear(E, E)
-        self._scalar = 1.0 / math.sqrt(E)
+        self._num_heads = config.num_heads
+        self._head_dim = E // config.num_heads
+        self._in_proj = nn.Linear(E, 3 * E)
+        self._out_proj = nn.Linear(E, E)
+        self._scalar = 1.0 / math.sqrt(self._head_dim)
+        self._attn_impl = config.attn_impl
+        self._sdp_backend = config.sdp_backend
         self._ln1 = nn.LayerNorm(E)
 
         # MLP sublayer
@@ -121,22 +148,54 @@ class TransformerEncoderBlock(nn.Module):
         )
         self._ln2 = nn.LayerNorm(E)
 
+    def _attn(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, pad_mask=None, is_causal=False):
+        """
+            q, k, v: [B, H, S, D]
+            pad_mask: [B, S] (True = mask)
+        """
+        attn_mask = None
+        q_len = q.size(-2)
+        k_len = k.size(-2)
+        if pad_mask is not None:
+            attn_mask = pad_mask[:, None, None, :].expand(-1, 1, q_len, -1)
+        if is_causal:
+            causal = torch.triu(
+                torch.ones(q_len, k_len, device=q.device, dtype=torch.bool),
+                diagonal=1,
+            )[None, None, :, :]
+            attn_mask = causal if attn_mask is None else (attn_mask | causal)
+        if self._attn_impl == "sdpa":
+            if q.device.type == "cuda" and self._sdp_backend != "auto":
+                with torch.backends.cuda.sdp_kernel(
+                    enable_flash=(self._sdp_backend == "flash"),
+                    enable_mem_efficient=(self._sdp_backend == "mem_efficient"),
+                    enable_math=(self._sdp_backend == "math"),
+                ):
+                    return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
+            return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self._scalar
+        if attn_mask is not None:
+            scores = scores.masked_fill(attn_mask, torch.finfo(scores.dtype).min)
+        return torch.matmul(F.softmax(scores, dim=-1), v)
+
     def forward(self, x: torch.Tensor, pad_mask=None, rope=None):
         """
             x: [B, S, E] tensor
         """
-        wq = self._wq(x)
-        wk = self._wk(x)
+        B, S, E = x.shape
+        qkv = self._in_proj(x)
+        wq, wk, wv = qkv.chunk(3, dim=-1)
+        wq = wq.view(B, S, self._num_heads, self._head_dim)
+        wk = wk.view(B, S, self._num_heads, self._head_dim)
+        wv = wv.view(B, S, self._num_heads, self._head_dim)
         if rope is not None:
             wq, wk = rope.apply(wq, wk)
-        wk = torch.transpose(wk, 1, 2)
-        wv = self._wv(x)
-        scores = torch.bmm(wq, wk) * self._scalar
-        if pad_mask is not None:
-            mask_value = torch.finfo(scores.dtype).min
-            scores = scores.masked_fill(pad_mask[:, None, :], mask_value)
-        h = torch.bmm(F.softmax(scores, dim=2), wv)
-        x = self._ln1(x + h)
+        wq = wq.transpose(1, 2)
+        wk = wk.transpose(1, 2)
+        wv = wv.transpose(1, 2)
+        h = self._attn(wq, wk, wv, pad_mask=pad_mask, is_causal=False)
+        h = h.transpose(1, 2).contiguous().view(B, S, E)
+        x = self._ln1(x + self._out_proj(h))
         
         x = x + self._mlp(x)
         return self._ln2(x)
@@ -149,15 +208,21 @@ class TransformerDecoderBlock(nn.Module):
         super().__init__()
         # CSA, MHA, & MLP thirds
         E = config.embed_size
+        self._num_heads = config.num_heads
+        self._head_dim = E // config.num_heads
+        self._attn_impl = config.attn_impl
+        self._sdp_backend = config.sdp_backend
 
         # CSA sublayer
-        self._wk, self._wv, self._wq = nn.Linear(E, E), nn.Linear(E, E), nn.Linear(E, E)
-        self._scalar = 1.0 / math.sqrt(E)
+        self._self_in_proj = nn.Linear(E, 3 * E)
+        self._self_out_proj = nn.Linear(E, E)
+        self._scalar = 1.0 / math.sqrt(self._head_dim)
         self._ln1 = nn.LayerNorm(E)
 
         # Enc-MHA sublayer
-        # TODO: implement MHA over SDPA
-        self._wk2, self._wv2, self._wq2 = nn.Linear(E, E), nn.Linear(E, E), nn.Linear(E, E)
+        self._cross_q = nn.Linear(E, E)
+        self._cross_kv = nn.Linear(E, 2 * E)
+        self._cross_out_proj = nn.Linear(E, E)
         self._ln2 = nn.LayerNorm(E)
 
         # MLP sublayer
@@ -169,38 +234,65 @@ class TransformerDecoderBlock(nn.Module):
         )
         self._ln3 = nn.LayerNorm(E)
 
+    def _attn(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, pad_mask=None, is_causal=False):
+        attn_mask = None
+        q_len = q.size(-2)
+        k_len = k.size(-2)
+        if pad_mask is not None:
+            attn_mask = pad_mask[:, None, None, :].expand(-1, 1, q_len, -1)
+        if is_causal:
+            causal = torch.triu(
+                torch.ones(q_len, k_len, device=q.device, dtype=torch.bool),
+                diagonal=1,
+            )[None, None, :, :]
+            attn_mask = causal if attn_mask is None else (attn_mask | causal)
+        if self._attn_impl == "sdpa":
+            if q.device.type == "cuda" and self._sdp_backend != "auto":
+                with torch.backends.cuda.sdp_kernel(
+                    enable_flash=(self._sdp_backend == "flash"),
+                    enable_mem_efficient=(self._sdp_backend == "mem_efficient"),
+                    enable_math=(self._sdp_backend == "math"),
+                ):
+                    return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
+            return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self._scalar
+        if attn_mask is not None:
+            scores = scores.masked_fill(attn_mask, torch.finfo(scores.dtype).min)
+        return torch.matmul(F.softmax(scores, dim=-1), v)
+
     def forward(self, x: torch.Tensor, kv: torch.Tensor, self_pad_mask=None, enc_pad_mask=None, rope=None):
         """
             x: [B, S, E] tensor
             kv: [B, S, E] (cache for that layer only)
         """
         (B, S, E) = x.shape
-        mask = torch.triu(torch.ones(S, S, device=x.device, dtype=torch.bool), diagonal=1)
-        wq = self._wq(x)
-        wk = self._wk(x)
+        qkv = self._self_in_proj(x)
+        wq, wk, wv = qkv.chunk(3, dim=-1)
+        wq = wq.view(B, S, self._num_heads, self._head_dim)
+        wk = wk.view(B, S, self._num_heads, self._head_dim)
+        wv = wv.view(B, S, self._num_heads, self._head_dim)
         if rope is not None:
             wq, wk = rope.apply(wq, wk)
-        wk = torch.transpose(wk, 1, 2)
-        wv = self._wv(x)
-        mask_value = torch.finfo(wq.dtype).min
-        scores = torch.bmm(wq, wk) * self._scalar
-        if self_pad_mask is not None:
-            mask = mask | self_pad_mask[:, None, :]
-        masked_scores = scores.masked_fill(mask, mask_value)
-        h1 = torch.bmm(F.softmax(masked_scores, dim=2), wv)
-        x = self._ln1(x + h1)
+        wq = wq.transpose(1, 2)
+        wk = wk.transpose(1, 2)
+        wv = wv.transpose(1, 2)
+        h1 = self._attn(wq, wk, wv, pad_mask=self_pad_mask, is_causal=True)
+        h1 = h1.transpose(1, 2).contiguous().view(B, S, E)
+        x = self._ln1(x + self._self_out_proj(h1))
         
-        wq2 = self._wq2(x)
-        wk2 = self._wk2(kv)
+        wq2 = self._cross_q(x)
+        wk2, wv2 = self._cross_kv(kv).chunk(2, dim=-1)
+        wq2 = wq2.view(B, S, self._num_heads, self._head_dim)
+        wk2 = wk2.view(B, kv.size(1), self._num_heads, self._head_dim)
+        wv2 = wv2.view(B, kv.size(1), self._num_heads, self._head_dim)
         if rope is not None:
             wq2, wk2 = rope.apply(wq2, wk2)
-        wk2 = torch.transpose(wk2, 1, 2)
-        wv2 = self._wv2(kv)
-        scores2 = torch.bmm(wq2, wk2) * self._scalar
-        if enc_pad_mask is not None:
-            scores2 = scores2.masked_fill(enc_pad_mask[:, None, :], mask_value)
-        h2 = torch.bmm(F.softmax(scores2, dim=2), wv2)
-        x = self._ln2(x + h2)
+        wq2 = wq2.transpose(1, 2)
+        wk2 = wk2.transpose(1, 2)
+        wv2 = wv2.transpose(1, 2)
+        h2 = self._attn(wq2, wk2, wv2, pad_mask=enc_pad_mask, is_causal=False)
+        h2 = h2.transpose(1, 2).contiguous().view(B, S, E)
+        x = self._ln2(x + self._cross_out_proj(h2))
 
         return self._ln3(x + self._mlp(x))
 
@@ -211,7 +303,7 @@ class TransformerV1(nn.Module):
         self._config = config
         # self._embed = nn.Linear(config.vocab_size, config.embed_size, bias=False)
         self._embed = nn.Embedding(config.vocab_size, config.embed_size)
-        self._rope = RotaryEmbedding(config.embed_size, max_len=config.max_seq_len)
+        self._rope = RotaryEmbedding(config.embed_size // config.num_heads, max_len=config.max_seq_len)
         self._enc_blocks = nn.ModuleList([TransformerEncoderBlock(config, i) for i in range(config.layers)])
         self._dec_blocks = nn.ModuleList([TransformerDecoderBlock(config, i) for i in range(config.layers)])
         self._unembed = nn.Linear(config.embed_size, config.vocab_size, bias=False)
@@ -235,7 +327,7 @@ class TransformerV1(nn.Module):
         kv = list()
         for block in self._enc_blocks:
             x = block(x, pad_mask=pad_mask, rope=self._rope)
-            kv.append(x.clone())
+            kv.append(x)
         return torch.stack(kv, dim=1)
         
     def _decode(self, x: torch.Tensor, kv: torch.Tensor, self_pad_mask=None, enc_pad_mask=None) -> torch.Tensor:
@@ -264,17 +356,40 @@ class TransformerV1(nn.Module):
 
 
 if __name__=="__main__":
-    # quick overfit test
+    # for testing sizes + overfit testing
 
-    B, S, V, E, L = 10, 16, 64, 128, 2
+    B, S, V, E, L = 10, 1024, 16278, 768, 5
     lmc = LMConfig(vocab_size=V, embed_size=E, layers=L)
     t = TransformerV1(lmc)
 
+    total_params, total_bytes = 0, 0
+    for name, param in t.named_parameters():
+        total_params += param.numel()
+        total_bytes += param.nelement() * param.element_size()
+    enc_params, enc_bytes = 0, 0
+    for name, param in t._enc_blocks.named_parameters():
+        enc_params += param.numel()
+        enc_bytes += param.nelement() * param.element_size()
+    dec_params, dec_bytes = 0, 0
+    for name, param in t._dec_blocks.named_parameters():
+        dec_params += param.numel()
+        dec_bytes += param.nelement() * param.element_size()
+    param_size_mb = total_bytes / (1024**2)
+    enc_param_size_mb = enc_bytes / (1024**2)
+    dec_param_size_mb = dec_bytes / (1024**2)
+    latent_param_size_mb = param_size_mb - (enc_param_size_mb + dec_param_size_mb)
+    print(f"Total: {total_params:,}")
+    print(f"Total size (MB): {param_size_mb:.4f}")
+    print(f"Encoder size (MB): {enc_param_size_mb:.4f}")
+    print(f"Decoder size (MB): {dec_param_size_mb:.4f}")
+    print(f"Emb/other size (MB): {latent_param_size_mb:.4f}")
+
+    # overfit run
     t.train()
     opt = torch.optim.Adam(t.parameters(), lr=0.001, weight_decay=0.0001)
 
     batch = torch.randint(0, V, (B, S))
-    for _ in range(10000):
+    for _ in range(100):
         inputs  = batch[:, :-1]
         targets = batch[:, 1:]
 

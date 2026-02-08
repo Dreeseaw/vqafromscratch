@@ -8,3 +8,4 @@ images/*
 annotations/*
 docs/*.pdf
 data/wiki_coco/*
+data/pretraining/*
