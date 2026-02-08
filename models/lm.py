@@ -65,9 +65,6 @@ class LMConfig:
                     setattr(self, key, value)
 
 
-# Source - https://stackoverflow.com/a/77445896
-# Posted by Yakov Dan, modified by community. See post 'Timeline' for change history
-# Retrieved 2026-02-07, License - CC BY-SA 4.0
 class PositionalEncoding(nn.Module):
 
     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
@@ -83,8 +80,8 @@ class PositionalEncoding(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Arguments:
-            x: Tensor, shape ``[batch_size, seq_len, embedding_dim]``
+            x: [B, S, E] tensor
+            returns [B, S, E] tensor, positionally encoded
         """
         x = x + self.pe[:, :x.size(1)]
         return self.dropout(x)
