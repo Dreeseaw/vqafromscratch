@@ -7,6 +7,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import yaml
 
 """
 not even a baseline, just to test myself
@@ -57,8 +58,36 @@ class LMConfig:
 
         # if given, overwrite loaded params from yaml
         if self._config_file:
-            # pseudo
-            self = yaml.load(self._config_file)
+            with open(self._config_file, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            for key, value in data.items():
+                if hasattr(self, key):
+                    setattr(self, key, value)
+
+
+# Source - https://stackoverflow.com/a/77445896
+# Posted by Yakov Dan, modified by community. See post 'Timeline' for change history
+# Retrieved 2026-02-07, License - CC BY-SA 4.0
+class PositionalEncoding(nn.Module):
+
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(1, max_len, d_model)
+        pe[0, :, 0::2] = torch.sin(position * div_term)
+        pe[0, :, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Arguments:
+            x: Tensor, shape ``[batch_size, seq_len, embedding_dim]``
+        """
+        x = x + self.pe[:, :x.size(1)]
+        return self.dropout(x)
 
 
 class TransformerEncoderBlock(nn.Module):
@@ -85,10 +114,10 @@ class TransformerEncoderBlock(nn.Module):
         """
             x: [B, S, E] tensor
         """
-        wk = self._wk(x)
-        wq = torch.transpose(self._wq(x), 1, 2) 
+        wq = self._wq(x)
+        wk = torch.transpose(self._wk(x), 1, 2) 
         wv = self._wv(x)
-        h = torch.bmm(F.softmax(torch.bmm(wk, wq) * self._scalar, dim=2), wv)
+        h = torch.bmm(F.softmax(torch.bmm(wq, wk) * self._scalar, dim=2), wv)
         x = self._ln1(x + h)
         
         x = x + self._mlp(x)
@@ -105,7 +134,7 @@ class TransformerDecoderBlock(nn.Module):
 
         # CSA sublayer
         self._wk, self._wv, self._wq = nn.Linear(E, E), nn.Linear(E, E), nn.Linear(E, E)
-        self._scalar = torch.tensor(1.0 / math.sqrt(E))
+        self._scalar = 1.0 / math.sqrt(E)
         self._ln1 = nn.LayerNorm(E)
 
         # Enc-MHA sublayer
@@ -127,17 +156,20 @@ class TransformerDecoderBlock(nn.Module):
             x: [B, S, E] tensor
             kv: [B, S, E] (cache for that layer only)
         """
-        # TODO: masking!!! 
-        wk = self._wk(x)
-        wq = torch.transpose(self._wq(x), 1, 2) 
+        (B, S, E) = x.shape
+        mask = torch.triu(torch.ones(S, S, device=x.device, dtype=torch.bool), diagonal=1)
+        wq = self._wq(x)
+        wk = torch.transpose(self._wk(x), 1, 2) 
         wv = self._wv(x)
-        h1 = torch.bmm(F.softmax(torch.bmm(wk, wq) * self._scalar, dim=2), wv)
+        mask_value = torch.finfo(wq.dtype).min
+        masked_scores = (torch.bmm(wq, wk) * self._scalar).masked_fill(mask, mask_value)
+        h1 = torch.bmm(F.softmax(masked_scores, dim=2), wv)
         x = self._ln1(x + h1)
         
-        wk2 = self._wk2(kv)
-        wq2 = torch.transpose(self._wq2(x), 1, 2) 
+        wq2 = self._wq2(x)
+        wk2 = torch.transpose(self._wk2(kv), 1, 2) 
         wv2 = self._wv2(kv)
-        h2 = torch.bmm(F.softmax(torch.bmm(wk2, wq2) * self._scalar, dim=2), wv2)
+        h2 = torch.bmm(F.softmax(torch.bmm(wq2, wk2) * self._scalar, dim=2), wv2)
         x = self._ln2(x + h2)
 
         return self._ln3(x + self._mlp(x))
@@ -147,27 +179,22 @@ class TransformerV1(nn.Module):
     def __init__(self, config: LMConfig):
         super().__init__()
         self._config = config
-        self._embed = nn.Linear(config.vocab_size, config.embed_size)
-        # TODO: positional embeddings
-        #self._enc_blocks = nn.Sequential(
-        #    *[TransformerEncoderBlock(config, i) for i in range(config.layers)]
-        #)
-        #self._dec_blocks = nn.Sequential(
-        #    *[TransformerDecoderBlock(config, i) for i in range(config.layers)]
-        #)
-        self._enc_blocks = [TransformerEncoderBlock(config, i) for i in range(config.layers)]
-        self._dec_blocks = [TransformerDecoderBlock(config, i) for i in range(config.layers)]
-        self._unembed = nn.Linear(config.embed_size, config.vocab_size)
+        # self._embed = nn.Linear(config.vocab_size, config.embed_size, bias=False)
+        self._embed = nn.Embedding(config.vocab_size, config.embed_size)
+        self._pos_embed = PositionalEncoding(config.embed_size, dropout=0.0)
+        self._enc_blocks = nn.ModuleList([TransformerEncoderBlock(config, i) for i in range(config.layers)])
+        self._dec_blocks = nn.ModuleList([TransformerDecoderBlock(config, i) for i in range(config.layers)])
+        self._unembed = nn.Linear(config.embed_size, config.vocab_size, bias=False)
         if config.tie_embeds:
-            self._unembed.weight = nn.Parameter(self._embed.weight.t())
+            self._unembed.weight = self._embed.weight
 
     def _lm_head(self, h: torch.Tensor) -> torch.Tensor:
         """
             h: [B, E] tensor (embedded values)
 
-            out: [B, E] tensor (logprobs)
+            out: [B, E] tensor (logits)
         """
-        return F.softmax(self._unembed(h), dim=1)
+        return self._unembed(h)
 
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -195,10 +222,11 @@ class TransformerV1(nn.Module):
 
     def forward(self, seq: torch.Tensor):
         """
-            seq: [B, S, V] tensor
+            seq: [B, S] tensor
         """
-        (B, S, V) = seq.shape
+        (B, S) = seq.shape
         embeds = self._embed(seq)
+        embeds = self._pos_embed(embeds)
         kv_cache = self._encode(embeds)
         out = self._decode(embeds, kv_cache)
         hN = out[:, -1, :]
@@ -210,20 +238,22 @@ if __name__=="__main__":
     lmc = LMConfig(vocab_size=V, embed_size=128, layers=2)
     t = TransformerV1(lmc)
 
-    batch = torch.randn(B, S, V)
-    targets = batch[:, 1:, :]
+    batch = torch.randint(0, V, (B, S))
+    targets = batch[:, 1:]
 
     t.train()
     opt = torch.optim.Adam(t.parameters(), lr=0.001, weight_decay=0.0001)
-    crit = nn.CrossEntropyLoss()
+    # crit = nn.CrossEntropyLoss()
 
-    nt = list()
-    for idx in range(1, batch.shape[1]):
-        nt.append(t(batch[:, :idx, :]))
+    for _ in range(10):
+        nt = list()
+        for idx in range(1, batch.shape[1]):
+            nt.append(t(batch[:, :idx]))
 
-    predictions = torch.stack(nt, dim=1)
-    loss = crit(targets, predictions)
+        predictions = torch.stack(nt, dim=1)
+        loss = F.cross_entropy(predictions.transpose(1, 2), targets)
 
-    opt.zero_grad()
-    loss.backward()
-    opt.step()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        print(loss.detach())
