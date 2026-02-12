@@ -47,6 +47,7 @@ def _load_model_from_ckpt(ckpt_path: str, device: str):
         attn_impl=str(cfg_raw.get("attn_impl", "sdpa")),
         sdp_backend=str(cfg_raw.get("sdp_backend", "auto")),
         cosine_attn=bool(cfg_raw.get("cosine_attn", False)),
+        v_rmsnorm=bool(cfg_raw.get("v_rmsnorm", False)),
         layerscale=bool(cfg_raw.get("layerscale", False)),
         layerscale_init=float(cfg_raw.get("layerscale_init", 1e-5)),
     )

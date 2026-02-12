@@ -102,6 +102,12 @@ def _apply_layerscale(x: torch.Tensor, scale: Optional[torch.Tensor]) -> torch.T
     return x * scale
 
 
+def _rms_norm_last_dim(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    x_f = x.float()
+    inv_rms = torch.rsqrt(torch.mean(x_f * x_f, dim=-1, keepdim=True) + eps)
+    return x * inv_rms.to(dtype=x.dtype)
+
+
 class LMConfig:
     """
     Store all LM configurables - including arch & training params, all in one place
@@ -120,6 +126,7 @@ class LMConfig:
         attn_impl: str = "sdpa",
         sdp_backend: str = "auto",
         cosine_attn: bool = False,
+        v_rmsnorm: bool = False,
         layerscale: bool = False,
         layerscale_init: float = 1e-5,
         config_file: str = None, 
@@ -137,6 +144,7 @@ class LMConfig:
         self.attn_impl = attn_impl
         self.sdp_backend = sdp_backend
         self.cosine_attn = cosine_attn
+        self.v_rmsnorm = v_rmsnorm
         self.layerscale = layerscale
         self.layerscale_init = layerscale_init
         self._config_file = config_file
@@ -217,6 +225,8 @@ class TransformerEncoderBlock(nn.Module):
         self._attn_impl = config.attn_impl
         self._sdp_backend = config.sdp_backend
         self._cosine_attn = bool(getattr(config, "cosine_attn", False))
+        self._v_rmsnorm = bool(getattr(config, "v_rmsnorm", False))
+        self._v_rmsnorm_eps = 1e-6
         self._qk_norm_eps = 1e-6
         self._layerscale = bool(getattr(config, "layerscale", False))
         self._layerscale_init = float(getattr(config, "layerscale_init", 1e-5))
@@ -363,6 +373,8 @@ class TransformerEncoderBlock(nn.Module):
         wq = wq.view(B, S, self._num_heads, self._head_dim)
         wk = wk.view(B, S, self._num_heads, self._head_dim)
         wv = wv.view(B, S, self._num_heads, self._head_dim)
+        if self._v_rmsnorm:
+            wv = _rms_norm_last_dim(wv, eps=self._v_rmsnorm_eps)
         if rope is not None:
             wq, wk = rope.apply(wq, wk)
         wq = wq.transpose(1, 2)
@@ -398,6 +410,8 @@ class TransformerDecoderBlock(nn.Module):
         self._attn_impl = config.attn_impl
         self._sdp_backend = config.sdp_backend
         self._cosine_attn = bool(getattr(config, "cosine_attn", False))
+        self._v_rmsnorm = bool(getattr(config, "v_rmsnorm", False))
+        self._v_rmsnorm_eps = 1e-6
         self._qk_norm_eps = 1e-6
         self._layerscale = bool(getattr(config, "layerscale", False))
         self._layerscale_init = float(getattr(config, "layerscale_init", 1e-5))
@@ -558,6 +572,8 @@ class TransformerDecoderBlock(nn.Module):
         wq = wq.view(B, S, self._num_heads, self._head_dim)
         wk = wk.view(B, S, self._num_heads, self._head_dim)
         wv = wv.view(B, S, self._num_heads, self._head_dim)
+        if self._v_rmsnorm:
+            wv = _rms_norm_last_dim(wv, eps=self._v_rmsnorm_eps)
         if rope is not None:
             wq, wk = rope.apply(wq, wk)
         wq = wq.transpose(1, 2)
@@ -582,6 +598,8 @@ class TransformerDecoderBlock(nn.Module):
         wq2 = wq2.view(B, S, self._num_heads, self._head_dim)
         wk2 = wk2.view(B, kv.size(1), self._num_heads, self._head_dim)
         wv2 = wv2.view(B, kv.size(1), self._num_heads, self._head_dim)
+        if self._v_rmsnorm:
+            wv2 = _rms_norm_last_dim(wv2, eps=self._v_rmsnorm_eps)
         if rope is not None:
             wq2, wk2 = rope.apply(wq2, wk2)
         wq2 = wq2.transpose(1, 2)

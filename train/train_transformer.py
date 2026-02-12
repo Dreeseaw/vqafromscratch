@@ -694,6 +694,11 @@ def main():
         help="Normalize Q/K before attention dot-product (cosine attention).",
     )
     parser.add_argument(
+        "--v_rmsnorm",
+        action="store_true",
+        help="RMS-normalize projected V per head before attention.",
+    )
+    parser.add_argument(
         "--layerscale",
         action="store_true",
         help="Enable LayerScale on residual branches.",
@@ -901,6 +906,7 @@ def main():
         attn_impl=args.attn_impl,
         sdp_backend=args.sdp_backend,
         cosine_attn=args.cosine_attn,
+        v_rmsnorm=args.v_rmsnorm,
         layerscale=args.layerscale,
         layerscale_init=args.layerscale_init,
     )
