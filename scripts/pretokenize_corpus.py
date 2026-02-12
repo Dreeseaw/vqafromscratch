@@ -31,6 +31,7 @@ WIKI_HEADING_RE = re.compile(r"={2,}([^=]+)={2,}")
 WIKI_BOLD_ITALIC_RE = re.compile(r"'{2,}")
 WIKI_TEMPLATE_RE = re.compile(r"\{\{[^{}\n]*\}\}")
 WORD_RE = re.compile(r"\S+")
+PARA_SPLIT_RE = re.compile(r"(?:\n\s*){2,}")
 
 
 def _json_loads(line: str) -> Dict:
@@ -97,6 +98,97 @@ def _hash_text(text: str) -> str:
 def _hash_ids(ids: Sequence[int]) -> str:
     arr = np.asarray(ids, dtype="<i4")
     return hashlib.sha1(arr.tobytes()).hexdigest()
+
+
+def _stable_unit_interval(key: str) -> float:
+    digest = hashlib.sha1(key.encode("utf-8")).digest()
+    n = int.from_bytes(digest[:8], byteorder="big", signed=False)
+    return n / float(1 << 64)
+
+
+def _assign_split(doc_id: str, split_train: float, split_val: float, split_test: float) -> str:
+    total = split_train + split_val + split_test
+    if total <= 0:
+        raise ValueError("Split ratios must sum to > 0.")
+    t = split_train / total
+    v = split_val / total
+    u = _stable_unit_interval(doc_id)
+    if u < t:
+        return "train"
+    if u < (t + v):
+        return "val"
+    return "test"
+
+
+def _split_paragraphs(text: str) -> List[str]:
+    parts = PARA_SPLIT_RE.split(text)
+    out: List[str] = []
+    for part in parts:
+        p = part.strip()
+        if p:
+            out.append(p)
+    return out
+
+
+def _pack_paragraph_ids(
+    paragraph_ids: Sequence[Sequence[int]],
+    sep_ids: Sequence[int],
+    segment_token_cap: int,
+) -> List[List[int]]:
+    if segment_token_cap <= 0:
+        raise ValueError("segment_token_cap must be > 0")
+    packed: List[List[int]] = []
+    cur: List[int] = []
+    for para in paragraph_ids:
+        if not para:
+            continue
+        need = len(para) if not cur else len(sep_ids) + len(para)
+        if cur and (len(cur) + need > segment_token_cap):
+            packed.append(cur)
+            cur = []
+        if cur and sep_ids:
+            cur.extend(int(x) for x in sep_ids)
+        cur.extend(int(x) for x in para)
+        if len(cur) >= segment_token_cap:
+            packed.append(cur)
+            cur = []
+    if cur:
+        packed.append(cur)
+    return packed
+
+
+def _window_tokens(ids: Sequence[int], window_len: int, stride: int) -> List[List[int]]:
+    if window_len <= 0:
+        raise ValueError("window_len must be > 0")
+    if stride <= 0:
+        raise ValueError("stride must be > 0")
+    n = len(ids)
+    if n <= window_len:
+        return [list(int(x) for x in ids)]
+    last_start = n - window_len
+    starts = list(range(0, last_start + 1, stride))
+    if not starts:
+        starts = [0]
+    if starts[-1] != last_start:
+        starts.append(last_start)
+    windows = [list(int(x) for x in ids[s : s + window_len]) for s in starts]
+    for seq in windows:
+        if len(seq) != window_len:
+            raise AssertionError("Window length mismatch in sliding window generation.")
+    return windows
+
+
+def _percentile_from_hist(length_counts: np.ndarray, q: float) -> int:
+    total = int(length_counts.sum())
+    if total <= 0:
+        return 0
+    threshold = max(1, int(np.ceil(total * q)))
+    csum = 0
+    for length in range(1, int(length_counts.shape[0])):
+        csum += int(length_counts[length])
+        if csum >= threshold:
+            return length
+    return int(length_counts.shape[0] - 1)
 
 
 @dataclass(frozen=True)
@@ -184,75 +276,120 @@ def _expand_inputs(inputs: Sequence[InputSpec], exts: Sequence[str]) -> List[Inp
     return out
 
 
-def _iter_docs_from_txt(path: str, mode: str) -> Iterator[Tuple[str, int]]:
+def _iter_docs_from_txt(path: str, mode: str) -> Iterator[Tuple[str, str, int]]:
     with _open_text(path) as f:
         if mode == "file":
             text = f.read()
             if text:
-                yield text, _count_words(text)
+                yield f"{path}::doc:0", text, _count_words(text)
             return
-        for line in f:
+        for line_idx, line in enumerate(f, start=1):
             line = line.strip()
             if line:
-                yield line, _count_words(line)
+                yield f"{path}::line:{line_idx}", line, _count_words(line)
 
 def _iter_docs_from_jsonl(
     path: str, text_key: str, word_count_key: str
-) -> Iterator[Tuple[str, Optional[int]]]:
+) -> Iterator[Tuple[str, str, Optional[int]]]:
     with _open_text(path) as f:
-        for line in f:
+        for line_idx, line in enumerate(f, start=1):
             if not line.strip():
                 continue
             obj = _json_loads(line)
             text = obj.get(text_key)
             if isinstance(text, str) and text:
                 wc = obj.get(word_count_key)
-                yield text, wc if isinstance(wc, int) else None
+                hint = obj.get("doc_id")
+                if hint is None:
+                    hint = obj.get("id")
+                if hint is None:
+                    hint = obj.get("title")
+                if isinstance(hint, (str, int)):
+                    doc_id = f"{path}::line:{line_idx}::{hint}"
+                else:
+                    doc_id = f"{path}::line:{line_idx}"
+                yield doc_id, text, wc if isinstance(wc, int) else None
 
 
 def _iter_docs_from_json(
     path: str, text_key: str, word_count_key: str, list_key: str
-) -> Iterator[Tuple[str, Optional[int]]]:
+) -> Iterator[Tuple[str, str, Optional[int]]]:
     with _open_text(path) as f:
         obj = json.load(f)
     if isinstance(obj, list):
-        for item in obj:
+        for idx, item in enumerate(obj):
             if isinstance(item, dict):
                 text = item.get(text_key)
                 if isinstance(text, str) and text:
                     wc = item.get(word_count_key)
-                    yield text, wc if isinstance(wc, int) else None
+                    hint = item.get("doc_id")
+                    if hint is None:
+                        hint = item.get("id")
+                    if hint is None:
+                        hint = item.get("title")
+                    if isinstance(hint, (str, int)):
+                        doc_id = f"{path}::idx:{idx}::{hint}"
+                    else:
+                        doc_id = f"{path}::idx:{idx}"
+                    yield doc_id, text, wc if isinstance(wc, int) else None
         return
     if isinstance(obj, dict):
         if list_key:
             items = obj.get(list_key)
             if isinstance(items, list):
-                for item in items:
+                for idx, item in enumerate(items):
                     if isinstance(item, dict):
                         text = item.get(text_key)
                         if isinstance(text, str) and text:
                             wc = item.get(word_count_key)
-                            yield text, wc if isinstance(wc, int) else None
+                            hint = item.get("doc_id")
+                            if hint is None:
+                                hint = item.get("id")
+                            if hint is None:
+                                hint = item.get("title")
+                            if isinstance(hint, (str, int)):
+                                doc_id = f"{path}::{list_key}:{idx}::{hint}"
+                            else:
+                                doc_id = f"{path}::{list_key}:{idx}"
+                            yield doc_id, text, wc if isinstance(wc, int) else None
                 return
         if isinstance(obj.get(text_key), str):
             wc = obj.get(word_count_key)
-            yield obj[text_key], wc if isinstance(wc, int) else None
+            hint = obj.get("doc_id")
+            if hint is None:
+                hint = obj.get("id")
+            if hint is None:
+                hint = obj.get("title")
+            if isinstance(hint, (str, int)):
+                doc_id = f"{path}::root::{hint}"
+            else:
+                doc_id = f"{path}::root"
+            yield doc_id, obj[text_key], wc if isinstance(wc, int) else None
             return
         docs = obj.get("documents")
         if isinstance(docs, list):
-            for item in docs:
+            for idx, item in enumerate(docs):
                 if isinstance(item, dict):
                     text = item.get(text_key)
                     if isinstance(text, str) and text:
                         wc = item.get(word_count_key)
-                        yield text, wc if isinstance(wc, int) else None
+                        hint = item.get("doc_id")
+                        if hint is None:
+                            hint = item.get("id")
+                        if hint is None:
+                            hint = item.get("title")
+                        if isinstance(hint, (str, int)):
+                            doc_id = f"{path}::documents:{idx}::{hint}"
+                        else:
+                            doc_id = f"{path}::documents:{idx}"
+                        yield doc_id, text, wc if isinstance(wc, int) else None
             return
     raise ValueError(f"Unsupported JSON structure in {path}")
 
 
 def iter_documents(
     path: str, text_key: str, txt_mode: str, word_count_key: str, list_key: str
-) -> Iterator[Tuple[str, Optional[int]]]:
+) -> Iterator[Tuple[str, str, Optional[int]]]:
     ext = _infer_extension(path)
     if ext == ".txt":
         yield from _iter_docs_from_txt(path, txt_mode)
@@ -274,7 +411,7 @@ def _estimate_total_words(
     total_words = 0
     total_docs = 0
     for path in files:
-        for text, wc in iter_documents(path, text_key, txt_mode, word_count_key, list_key):
+        for _doc_id, text, wc in iter_documents(path, text_key, txt_mode, word_count_key, list_key):
             total_docs += 1
             if isinstance(wc, int) and wc >= 0:
                 total_words += wc
@@ -469,7 +606,8 @@ def _process_doc_impl(
     normalization: str,
     max_seq_len: int,
     stride: int,
-    drop_last_window: bool,
+    segment_token_cap: int,
+    sep_ids: Sequence[int],
     dedup_docs: bool,
     add_bos: bool,
     add_eos: bool,
@@ -480,36 +618,46 @@ def _process_doc_impl(
     if not cleaned:
         return None
     doc_hash = _hash_text(cleaned) if dedup_docs else None
-    ids = encode_fn(cleaned)
-    if not ids:
+    paragraphs = _split_paragraphs(cleaned)
+    if not paragraphs:
         return None
     content_max_len = max_seq_len
     if add_bos:
         content_max_len -= 1
-    if add_eos:
-        content_max_len -= 1
     if content_max_len <= 0:
         raise ValueError("max_seq_len too small to fit special tokens.")
+    if stride > content_max_len:
+        raise ValueError("stride must be <= max content length after BOS reservation.")
 
-    def _wrap(seq: Sequence[int]) -> List[int]:
-        out: List[int] = []
-        if add_bos:
-            out.append(int(bos_id))
-        out.extend(int(x) for x in seq)
-        if add_eos:
-            out.append(int(eos_id))
-        return out
+    para_ids: List[List[int]] = []
+    for para in paragraphs:
+        ids = encode_fn(para)
+        if ids:
+            para_ids.append([int(x) for x in ids])
+    if not para_ids:
+        return None
 
-    if len(ids) <= content_max_len:
-        return doc_hash, [_wrap(ids)]
+    segments = _pack_paragraph_ids(
+        paragraph_ids=para_ids,
+        sep_ids=sep_ids,
+        segment_token_cap=segment_token_cap,
+    )
+
     seqs: List[Sequence[int]] = []
-    start = 0
-    while start < len(ids):
-        end = start + content_max_len
-        if end > len(ids) and drop_last_window:
-            break
-        seqs.append(_wrap(ids[start:end]))
-        start += stride
+    for segment_ids in segments:
+        ids = list(int(x) for x in segment_ids)
+        if add_eos:
+            ids.append(int(eos_id))
+        windows = _window_tokens(ids, content_max_len, stride)
+        for window in windows:
+            out = list(window)
+            if add_bos:
+                out = [int(bos_id)] + out
+            if len(out) > max_seq_len:
+                raise AssertionError("Window length exceeded max_seq_len.")
+            seqs.append(out)
+    if not seqs:
+        return None
     return doc_hash, seqs
 
 
@@ -522,7 +670,7 @@ def _worker_init(
     normalization: str,
     max_seq_len: int,
     stride: int,
-    drop_last_window: bool,
+    segment_token_cap: int,
     dedup_docs: bool,
     add_bos: bool,
     add_eos: bool,
@@ -531,11 +679,13 @@ def _worker_init(
 ) -> None:
     global _WORKER_ENCODE, _WORKER_CFG
     _WORKER_ENCODE = _build_encode_fn(_load_tokenizer(tokenizer_spec))
+    sep_ids = _WORKER_ENCODE("\n")
     _WORKER_CFG = {
         "normalization": normalization,
         "max_seq_len": max_seq_len,
         "stride": stride,
-        "drop_last_window": drop_last_window,
+        "segment_token_cap": segment_token_cap,
+        "sep_ids": [int(x) for x in sep_ids],
         "dedup_docs": dedup_docs,
         "add_bos": add_bos,
         "add_eos": add_eos,
@@ -550,23 +700,27 @@ def _worker_init(
         pass
 
 
-def _worker_process_doc(payload: Tuple[str, Optional[int]]) -> Optional[Tuple[Optional[str], List[Sequence[int]]]]:
+def _worker_process_doc(
+    payload: Tuple[str, str, Optional[int]]
+) -> Tuple[str, Optional[Tuple[Optional[str], List[Sequence[int]]]]]:
     if _WORKER_ENCODE is None:
         raise RuntimeError("Worker tokenizer not initialized.")
-    text, _wc = payload
-    return _process_doc_impl(
+    doc_id, text, _wc = payload
+    result = _process_doc_impl(
         _WORKER_ENCODE,
         text=text,
         normalization=str(_WORKER_CFG["normalization"]),
         max_seq_len=int(_WORKER_CFG["max_seq_len"]),
         stride=int(_WORKER_CFG["stride"]),
-        drop_last_window=bool(_WORKER_CFG["drop_last_window"]),
+        segment_token_cap=int(_WORKER_CFG["segment_token_cap"]),
+        sep_ids=_WORKER_CFG["sep_ids"],  # type: ignore[arg-type]
         dedup_docs=bool(_WORKER_CFG["dedup_docs"]),
         add_bos=bool(_WORKER_CFG["add_bos"]),
         add_eos=bool(_WORKER_CFG["add_eos"]),
         bos_id=_WORKER_CFG["bos_id"],
         eos_id=_WORKER_CFG["eos_id"],
     )
+    return doc_id, result
 
 
 def _token_str(tokenizer, idx: int) -> str:
@@ -657,6 +811,62 @@ def _print_token_stats(
     print(f"  top-{top_n} coverage: {100.0 * top_sum / total:.2f}%")
 
 
+def _length_buckets(length_counts: np.ndarray, max_seq_len: int) -> Dict[str, int]:
+    b1_end = min(64, max_seq_len)
+    b2_start = 65
+    b2_end = min(128, max_seq_len)
+    b3_start = 129
+    b3_end = min(256, max_seq_len)
+
+    out = {
+        "1-64": int(length_counts[1 : b1_end + 1].sum()) if b1_end >= 1 else 0,
+        "65-128": int(length_counts[b2_start : b2_end + 1].sum()) if b2_end >= b2_start else 0,
+        "129-256": int(length_counts[b3_start : b3_end + 1].sum()) if b3_end >= b3_start else 0,
+        "257+": int(length_counts[257:].sum()) if max_seq_len >= 257 else 0,
+    }
+    return out
+
+
+def _write_split_manifest_json(
+    out_dir: str,
+    split: str,
+    max_seq_len: int,
+    stride: int,
+    vocab_size: Optional[int],
+    docs: int,
+    windows: int,
+    total_tokens: int,
+    length_counts: np.ndarray,
+    sample_doc_ids: Sequence[str],
+) -> None:
+    avg_len = float(total_tokens) / float(max(1, windows))
+    hist = _length_buckets(length_counts, max_seq_len)
+    p50 = _percentile_from_hist(length_counts, 0.50)
+    p95 = _percentile_from_hist(length_counts, 0.95)
+    p99 = _percentile_from_hist(length_counts, 0.99)
+    payload = {
+        "split": split,
+        "max_seq_len": int(max_seq_len),
+        "stride": int(stride),
+        "tokenizer_vocab_size": None if vocab_size is None else int(vocab_size),
+        "counts": {
+            "docs": int(docs),
+            "windows": int(windows),
+            "examples": int(windows),
+            "total_tokens_prepad": int(total_tokens),
+            "avg_len": avg_len,
+            "p50_len": int(p50),
+            "p95_len": int(p95),
+            "p99_len": int(p99),
+        },
+        "length_histogram": hist,
+        "sample_doc_ids": list(sample_doc_ids),
+    }
+    path = os.path.join(out_dir, "manifest.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Pre-tokenize and review a large text corpus for encoder-decoder training."
@@ -672,8 +882,17 @@ def main() -> None:
     )
     ap.add_argument("--out-dir", required=True, help="Output directory for shards.")
     ap.add_argument("--tokenizer", required=True, help="Tokenizer .pt path or module:attr.")
-    ap.add_argument("--max-seq-len", type=int, default=1024)
-    ap.add_argument("--stride", type=int, default=512)
+    ap.add_argument("--max-seq-len", "--max_seq_len", dest="max_seq_len", type=int, default=256)
+    ap.add_argument("--stride", type=int, default=64)
+    ap.add_argument(
+        "--segment-token-cap",
+        type=int,
+        default=1024,
+        help="Paragraph packing cap before sliding windows.",
+    )
+    ap.add_argument("--split-train", "--split_train", dest="split_train", type=float, default=0.95)
+    ap.add_argument("--split-val", "--split_val", dest="split_val", type=float, default=0.04)
+    ap.add_argument("--split-test", "--split_test", dest="split_test", type=float, default=0.01)
     ap.add_argument("--add-bos", action="store_true", help="Prepend BOS to each sequence.")
     ap.add_argument("--add-eos", action="store_true", help="Append EOS to each sequence.")
     ap.add_argument("--no-add-bos", action="store_false", dest="add_bos")
@@ -703,7 +922,13 @@ def main() -> None:
         choices=["NFC", "NFKC", "OFF"],
         default="NFKC",
     )
-    ap.add_argument("--drop-last-window", action="store_true")
+    ap.add_argument(
+        "--drop-last-window",
+        action="store_true",
+        help="Deprecated: ignored; final end-aligned window is always kept.",
+    )
+    ap.add_argument("--dedup-docs", action="store_true", dest="dedup_docs")
+    ap.add_argument("--dedup-seqs", action="store_true", dest="dedup_seqs")
     ap.add_argument("--no-dedup-docs", action="store_false", dest="dedup_docs")
     ap.add_argument("--no-dedup-seqs", action="store_false", dest="dedup_seqs")
     ap.add_argument("--no-load-dedup", action="store_false", dest="load_dedup")
@@ -719,13 +944,13 @@ def main() -> None:
     ap.add_argument("--mp-chunk", type=int, default=16)
 
     ap.set_defaults(
-        dedup_docs=True,
-        dedup_seqs=True,
+        dedup_docs=False,
+        dedup_seqs=False,
         load_dedup=True,
         persist_dedup=True,
         eta_scan=True,
         add_bos=False,
-        add_eos=False,
+        add_eos=True,
     )
 
     args = ap.parse_args()
@@ -734,17 +959,20 @@ def main() -> None:
         raise SystemExit("--max-seq-len must be > 0")
     if args.stride <= 0:
         raise SystemExit("--stride must be > 0")
+    if args.segment_token_cap <= 0:
+        raise SystemExit("--segment-token-cap must be > 0")
     if args.workers < 1:
         raise SystemExit("--workers must be >= 1")
     if args.mp_chunk <= 0:
         raise SystemExit("--mp-chunk must be > 0")
+    if args.split_train < 0 or args.split_val < 0 or args.split_test < 0:
+        raise SystemExit("Split ratios must be non-negative.")
+    split_sum = args.split_train + args.split_val + args.split_test
+    if split_sum <= 0:
+        raise SystemExit("Split ratios must sum to > 0.")
 
     out_dir = args.out_dir
     os.makedirs(out_dir, exist_ok=True)
-    shards_dir = os.path.join(out_dir, "shards")
-    os.makedirs(shards_dir, exist_ok=True)
-    manifest_path = os.path.join(out_dir, "manifest.jsonl")
-
     tokenizer = _load_tokenizer(args.tokenizer) if args.workers == 1 else None
     encode_fn = _build_encode_fn(tokenizer) if tokenizer is not None else None
     vocab_size = None
@@ -768,12 +996,20 @@ def main() -> None:
         raise SystemExit("BOS requested but --bos-id not set and tokenizer has no bos_id.")
     if args.add_eos and eos_id is None:
         raise SystemExit("EOS requested but --eos-id not set and tokenizer has no eos_id.")
+    if pad_id is None:
+        raise SystemExit("PAD token id is required (set --pad-id or use tokenizer with pad_id).")
+    if eos_id is None:
+        raise SystemExit("EOS token id is required (set --eos-id or use tokenizer with eos_id).")
+    if int(pad_id) == int(eos_id):
+        raise SystemExit("PAD and EOS must be distinct token ids.")
 
-    content_max_len = args.max_seq_len - (1 if args.add_bos else 0) - (1 if args.add_eos else 0)
+    content_max_len = args.max_seq_len - (1 if args.add_bos else 0)
     if content_max_len <= 0:
         raise SystemExit("--max-seq-len too small for requested special tokens.")
     if args.stride > content_max_len:
-        raise SystemExit("--stride must be <= max content length after adding BOS/EOS.")
+        raise SystemExit("--stride must be <= max content length after BOS reservation.")
+    if args.drop_last_window:
+        print("warning: --drop-last-window is deprecated and ignored (final end-aligned window is always kept).")
 
     meta_extensions = sorted(
         [e.strip() for e in args.extensions.split(",") if e.strip()]
@@ -782,6 +1018,7 @@ def main() -> None:
         "max_seq_len": args.max_seq_len,
         "content_max_len": content_max_len,
         "stride": args.stride,
+        "segment_token_cap": args.segment_token_cap,
         "normalization": args.normalization,
         "dedup_docs": bool(args.dedup_docs),
         "dedup_seqs": bool(args.dedup_seqs),
@@ -797,7 +1034,13 @@ def main() -> None:
         "bos_id": bos_id,
         "eos_id": eos_id,
         "pad_id": pad_id,
+        "split_train": args.split_train,
+        "split_val": args.split_val,
+        "split_test": args.split_test,
     }
+    if vocab_size is not None:
+        if int(pad_id) >= vocab_size or int(eos_id) >= vocab_size:
+            raise SystemExit("PAD/EOS ids must be within tokenizer vocab size.")
     _write_meta(out_dir, meta)
 
     doc_hashes: set = set()
@@ -831,14 +1074,32 @@ def main() -> None:
     if not inputs:
         raise SystemExit("No input files found.")
 
-    next_id = _next_shard_id(shards_dir)
-    writer = ShardWriter(
-        out_dir=out_dir,
-        start_id=next_id,
-        max_seqs=args.shard_max_seqs,
-        max_tokens=args.shard_max_tokens,
-        manifest_path=manifest_path,
-    )
+    split_names = ("train", "val", "test")
+    split_writers: Dict[str, ShardWriter] = {}
+    split_doc_ids: Dict[str, set] = {k: set() for k in split_names}
+    split_docs: Dict[str, int] = {k: 0 for k in split_names}
+    split_total_seqs: Dict[str, int] = {k: 0 for k in split_names}
+    split_total_tokens: Dict[str, int] = {k: 0 for k in split_names}
+    split_length_counts: Dict[str, np.ndarray] = {
+        k: np.zeros(args.max_seq_len + 1, dtype=np.int64) for k in split_names
+    }
+    split_sample_doc_ids: Dict[str, List[str]] = {k: [] for k in split_names}
+    split_seqs_at_max: Dict[str, int] = {k: 0 for k in split_names}
+
+    for split in split_names:
+        split_out = os.path.join(out_dir, split)
+        os.makedirs(split_out, exist_ok=True)
+        split_shards_dir = os.path.join(split_out, "shards")
+        os.makedirs(split_shards_dir, exist_ok=True)
+        _write_meta(split_out, {**meta, "split": split})
+        next_id = _next_shard_id(split_shards_dir)
+        split_writers[split] = ShardWriter(
+            out_dir=split_out,
+            start_id=next_id,
+            max_seqs=args.shard_max_seqs,
+            max_tokens=args.shard_max_tokens,
+            manifest_path=os.path.join(split_out, "manifest.jsonl"),
+        )
 
     length_counts = np.zeros(args.max_seq_len + 1, dtype=np.int64)
     seqs_at_max = 0
@@ -849,6 +1110,7 @@ def main() -> None:
     dup_docs = 0
     dup_seqs = 0
     empty_docs = 0
+    doc_to_split: Dict[str, str] = {}
 
     if vocab_size is not None:
         token_counts = np.zeros(vocab_size, dtype=np.int64)
@@ -886,10 +1148,10 @@ def main() -> None:
 
     words_seen = 0
 
-    def _doc_iter() -> Iterator[Tuple[str, Optional[int]]]:
+    def _doc_iter() -> Iterator[Tuple[str, str, Optional[int]]]:
         nonlocal raw_docs, words_seen
         for spec in inputs:
-            for doc, wc in iter_documents(
+            for doc_id, doc, wc in iter_documents(
                 spec.path,
                 spec.text_key,
                 spec.txt_docs,
@@ -903,9 +1165,12 @@ def main() -> None:
                     words_seen += wc
                 else:
                     words_seen += _count_words(doc)
-                yield doc, wc
+                yield doc_id, doc, wc
 
-    def _consume_result(result: Optional[Tuple[Optional[str], List[Sequence[int]]]]) -> None:
+    def _consume_result(
+        doc_id: str,
+        result: Optional[Tuple[Optional[str], List[Sequence[int]]]],
+    ) -> None:
         nonlocal empty_docs, dup_docs, dup_seqs, total_docs, total_seqs, total_tokens, seqs_at_max, token_counts, token_counter, last_log_t, last_docs, last_seqs, last_tokens
         if result is None:
             empty_docs += 1
@@ -920,6 +1185,21 @@ def main() -> None:
             if doc_hash_f is not None:
                 doc_hash_f.write(doc_hash + "\n")
 
+        split_name = _assign_split(
+            doc_id,
+            split_train=args.split_train,
+            split_val=args.split_val,
+            split_test=args.split_test,
+        )
+        prev_split = doc_to_split.get(doc_id)
+        if prev_split is not None and prev_split != split_name:
+            raise RuntimeError(f"Leak check failed: doc_id {doc_id!r} mapped to both {prev_split} and {split_name}.")
+        doc_to_split[doc_id] = split_name
+        if doc_id in split_doc_ids[split_name]:
+            raise RuntimeError(f"Duplicate doc_id within split {split_name}: {doc_id!r}")
+        split_doc_ids[split_name].add(doc_id)
+
+        wrote_any = False
         for seq in doc_seqs:
             if args.dedup_seqs:
                 sh = _hash_ids(seq)
@@ -930,14 +1210,22 @@ def main() -> None:
                 if seq_hash_f is not None:
                     seq_hash_f.write(sh + "\n")
 
-            writer.add(seq)
+            if len(seq) > args.max_seq_len:
+                raise AssertionError("window lengths never exceed max_seq_len check failed")
+            split_writers[split_name].add(seq)
 
             seqlen = len(seq)
+            wrote_any = True
             length_counts[seqlen] += 1
             total_seqs += 1
             total_tokens += seqlen
             if seqlen == args.max_seq_len:
                 seqs_at_max += 1
+            split_length_counts[split_name][seqlen] += 1
+            split_total_seqs[split_name] += 1
+            split_total_tokens[split_name] += seqlen
+            if seqlen == args.max_seq_len:
+                split_seqs_at_max[split_name] += 1
 
             if token_counts is not None:
                 arr = np.asarray(seq, dtype=np.int64)
@@ -950,7 +1238,11 @@ def main() -> None:
                 for tid in seq:
                     token_counter[int(tid)] = token_counter.get(int(tid), 0) + 1
 
-        total_docs += 1
+        if wrote_any:
+            total_docs += 1
+            split_docs[split_name] += 1
+            if len(split_sample_doc_ids[split_name]) < 8:
+                split_sample_doc_ids[split_name].append(doc_id)
         now = time.perf_counter()
         should_log = False
         if args.log_every and total_docs % args.log_every == 0:
@@ -988,21 +1280,23 @@ def main() -> None:
             last_tokens = total_tokens
 
     if args.workers == 1:
-        for doc, _wc in _doc_iter():
+        sep_ids = encode_fn("\n") if encode_fn is not None else []
+        for doc_id, doc, _wc in _doc_iter():
             result = _process_doc_impl(
                 encode_fn,
                 text=doc,
                 normalization=args.normalization,
                 max_seq_len=args.max_seq_len,
                 stride=args.stride,
-                drop_last_window=args.drop_last_window,
+                segment_token_cap=args.segment_token_cap,
+                sep_ids=sep_ids,
                 dedup_docs=args.dedup_docs,
                 add_bos=args.add_bos,
                 add_eos=args.add_eos,
                 bos_id=bos_id,
                 eos_id=eos_id,
             )
-            _consume_result(result)
+            _consume_result(doc_id, result)
     else:
         ctx = mp.get_context("spawn")
         with ctx.Pool(
@@ -1013,7 +1307,7 @@ def main() -> None:
                 args.normalization,
                 args.max_seq_len,
                 args.stride,
-                args.drop_last_window,
+                args.segment_token_cap,
                 args.dedup_docs,
                 args.add_bos,
                 args.add_eos,
@@ -1021,12 +1315,35 @@ def main() -> None:
                 eos_id,
             ),
         ) as pool:
-            for result in pool.imap(
+            for doc_id, result in pool.imap(
                 _worker_process_doc, _doc_iter(), chunksize=args.mp_chunk
             ):
-                _consume_result(result)
+                _consume_result(doc_id, result)
 
-    writer.flush()
+    for split in split_names:
+        split_writers[split].flush()
+    train_val_leak = split_doc_ids["train"].intersection(split_doc_ids["val"])
+    train_test_leak = split_doc_ids["train"].intersection(split_doc_ids["test"])
+    val_test_leak = split_doc_ids["val"].intersection(split_doc_ids["test"])
+    if train_val_leak or train_test_leak or val_test_leak:
+        raise RuntimeError("Leak check failed: doc_id appears in multiple splits.")
+
+    for split in split_names:
+        bucket = _length_buckets(split_length_counts[split], args.max_seq_len)
+        if int(bucket.get("257+", 0)) != 0:
+            raise AssertionError(f"{split}: 257+ length bucket must be zero.")
+        _write_split_manifest_json(
+            out_dir=os.path.join(out_dir, split),
+            split=split,
+            max_seq_len=args.max_seq_len,
+            stride=args.stride,
+            vocab_size=vocab_size,
+            docs=split_docs[split],
+            windows=split_total_seqs[split],
+            total_tokens=split_total_tokens[split],
+            length_counts=split_length_counts[split],
+            sample_doc_ids=split_sample_doc_ids[split],
+        )
     if doc_hash_f is not None:
         doc_hash_f.close()
     if seq_hash_f is not None:
@@ -1038,6 +1355,13 @@ def main() -> None:
     print(f"Docs kept: {total_docs}")
     print(f"Docs dropped (dup): {dup_docs}")
     print(f"Docs dropped (empty): {empty_docs}")
+    if total_docs > 0:
+        print(
+            "Split doc ratios (train/val/test): "
+            f"{split_docs['train'] / total_docs:.4f} / "
+            f"{split_docs['val'] / total_docs:.4f} / "
+            f"{split_docs['test'] / total_docs:.4f}"
+        )
     print(f"Sequences produced: {total_seqs}")
     print(f"Sequences dropped (dup): {dup_seqs}")
     print(f"Total tokens: {total_tokens}")

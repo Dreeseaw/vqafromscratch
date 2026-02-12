@@ -3,10 +3,12 @@ language modeling components of vqa
 """
 import sys
 import math
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 import yaml
 
 """
@@ -35,6 +37,71 @@ class RNN(nn.Module):
 """
 Transformer-based approaches
 """
+
+
+def _masked_mean_std(values: torch.Tensor, keep_mask: Optional[torch.Tensor] = None) -> Tuple[float, float]:
+    vals = values.float()
+    if keep_mask is not None:
+        mask = keep_mask.to(device=vals.device, dtype=torch.bool)
+        while mask.dim() < vals.dim():
+            mask = mask.unsqueeze(1)
+        mask = mask.expand_as(vals)
+        selected = vals[mask]
+    else:
+        selected = vals.reshape(-1)
+    if selected.numel() == 0:
+        return float("nan"), float("nan")
+    mean = float(selected.mean().item())
+    std = float(selected.std(unbiased=False).item())
+    return mean, std
+
+
+def _build_attn_masks(
+    pad_mask: Optional[torch.Tensor],
+    q_len: int,
+    k_len: int,
+    device: torch.device,
+    is_causal: bool,
+):
+    key_pad_mask = None
+    if pad_mask is not None:
+        key_pad_mask = pad_mask[:, None, None, :]
+
+    if key_pad_mask is not None and not key_pad_mask.any():
+        key_pad_mask = None
+
+    sdpa_causal = bool(is_causal and key_pad_mask is None)
+    sdpa_mask = None
+    blocked = None
+
+    causal = None
+    if is_causal:
+        causal = torch.triu(
+            torch.ones(q_len, k_len, device=device, dtype=torch.bool),
+            diagonal=1,
+        )[None, None, :, :]
+
+    if key_pad_mask is not None:
+        if is_causal:
+            blocked = key_pad_mask | causal
+            sdpa_mask = ~blocked
+        else:
+            blocked = key_pad_mask.expand(-1, 1, q_len, -1)
+            sdpa_mask = ~key_pad_mask
+    elif causal is not None:
+        blocked = causal
+
+    return key_pad_mask, sdpa_causal, sdpa_mask, blocked
+
+
+def _apply_layerscale(x: torch.Tensor, scale: Optional[torch.Tensor]) -> torch.Tensor:
+    if scale is None:
+        return x
+    if scale.dtype != x.dtype:
+        scale = scale.to(dtype=x.dtype)
+    return x * scale
+
+
 class LMConfig:
     """
     Store all LM configurables - including arch & training params, all in one place
@@ -48,8 +115,13 @@ class LMConfig:
         layers: int = 5,
         max_seq_len: int = 2048,
         tie_embeds: bool = False,
+        causal_lm: bool = True,
+        activation_checkpointing: bool = False,
         attn_impl: str = "sdpa",
         sdp_backend: str = "auto",
+        cosine_attn: bool = False,
+        layerscale: bool = False,
+        layerscale_init: float = 1e-5,
         config_file: str = None, 
     ):
         # load defaults/ params first
@@ -60,8 +132,13 @@ class LMConfig:
         self.layers = layers
         self.max_seq_len = max_seq_len
         self.tie_embeds = tie_embeds
+        self.causal_lm = causal_lm
+        self.activation_checkpointing = activation_checkpointing
         self.attn_impl = attn_impl
         self.sdp_backend = sdp_backend
+        self.cosine_attn = cosine_attn
+        self.layerscale = layerscale
+        self.layerscale_init = layerscale_init
         self._config_file = config_file
 
         # if given, overwrite loaded params from yaml
@@ -84,6 +161,8 @@ class LMConfig:
             raise ValueError("attn_impl must be 'sdpa' or 'eager'.")
         if self.sdp_backend not in ("auto", "flash", "mem_efficient", "math"):
             raise ValueError("sdp_backend must be one of: auto, flash, mem_efficient, math.")
+        if float(self.layerscale_init) < 0.0:
+            raise ValueError("layerscale_init must be >= 0.")
 
 
 class RotaryEmbedding(nn.Module):
@@ -137,6 +216,15 @@ class TransformerEncoderBlock(nn.Module):
         self._scalar = 1.0 / math.sqrt(self._head_dim)
         self._attn_impl = config.attn_impl
         self._sdp_backend = config.sdp_backend
+        self._cosine_attn = bool(getattr(config, "cosine_attn", False))
+        self._qk_norm_eps = 1e-6
+        self._layerscale = bool(getattr(config, "layerscale", False))
+        self._layerscale_init = float(getattr(config, "layerscale_init", 1e-5))
+        self._ls_attn = None
+        self._ls_mlp = None
+        if self._layerscale:
+            self._ls_attn = nn.Parameter(torch.full((E,), self._layerscale_init))
+            self._ls_mlp = nn.Parameter(torch.full((E,), self._layerscale_init))
         self._ln1 = nn.LayerNorm(E)
 
         # MLP sublayer
@@ -148,22 +236,91 @@ class TransformerEncoderBlock(nn.Module):
         )
         self._ln2 = nn.LayerNorm(E)
 
-    def _attn(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, pad_mask=None, is_causal=False):
+    def _attn(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        pad_mask=None,
+        q_pad_mask=None,
+        is_causal=False,
+        debug_capture: Optional[Dict[str, Any]] = None,
+        capture_attn_scores: bool = False,
+    ):
         """
             q, k, v: [B, H, S, D]
             pad_mask: [B, S] (True = mask)
         """
-        attn_mask = None
         q_len = q.size(-2)
         k_len = k.size(-2)
-        if pad_mask is not None:
-            attn_mask = pad_mask[:, None, None, :].expand(-1, 1, q_len, -1)
-        if is_causal:
-            causal = torch.triu(
-                torch.ones(q_len, k_len, device=q.device, dtype=torch.bool),
-                diagonal=1,
-            )[None, None, :, :]
-            attn_mask = causal if attn_mask is None else (attn_mask | causal)
+        key_pad_mask, sdpa_causal, sdpa_mask, blocked = _build_attn_masks(
+            pad_mask=pad_mask,
+            q_len=q_len,
+            k_len=k_len,
+            device=q.device,
+            is_causal=is_causal,
+        )
+        q_attn, k_attn = q, k
+        score_scale = self._scalar
+        if self._cosine_attn:
+            q_attn = F.normalize(q_attn, p=2.0, dim=-1, eps=self._qk_norm_eps)
+            k_attn = F.normalize(k_attn, p=2.0, dim=-1, eps=self._qk_norm_eps)
+            score_scale = 1.0
+
+        if debug_capture is not None:
+            q_norm = q.float().norm(dim=-1)
+            k_norm = k.float().norm(dim=-1)
+            v_norm = v.float().norm(dim=-1)
+            q_keep = None if q_pad_mask is None else ~q_pad_mask
+            k_keep = None if pad_mask is None else ~pad_mask
+            q_mean, q_std = _masked_mean_std(q_norm, q_keep)
+            k_mean, k_std = _masked_mean_std(k_norm, k_keep)
+            v_mean, v_std = _masked_mean_std(v_norm, k_keep)
+            debug_capture["q_mag_mean"] = q_mean
+            debug_capture["q_mag_std"] = q_std
+            debug_capture["k_mag_mean"] = k_mean
+            debug_capture["k_mag_std"] = k_std
+            debug_capture["v_mag_mean"] = v_mean
+            debug_capture["v_mag_std"] = v_std
+
+            if capture_attn_scores:
+                raw_scores = torch.matmul(q_attn.float(), k_attn.float().transpose(-2, -1)) * score_scale
+                if blocked is not None:
+                    blocked_for_scores = blocked
+                    if blocked_for_scores.size(0) == 1 and raw_scores.size(0) > 1:
+                        blocked_for_scores = blocked_for_scores.expand(raw_scores.size(0), -1, -1, -1)
+                    valid = ~blocked_for_scores
+                    masked_scores = raw_scores.masked_fill(blocked_for_scores, torch.finfo(raw_scores.dtype).min)
+                else:
+                    valid = torch.ones(
+                        raw_scores.size(0), 1, q_len, k_len, device=raw_scores.device, dtype=torch.bool
+                    )
+                    masked_scores = raw_scores
+
+                valid_scores = raw_scores[valid.expand_as(raw_scores)]
+                if valid_scores.numel() > 0:
+                    debug_capture["attn_score_mean"] = float(valid_scores.mean().item())
+                    debug_capture["attn_score_std"] = float(valid_scores.std(unbiased=False).item())
+                    debug_capture["attn_score_min"] = float(valid_scores.min().item())
+                    debug_capture["attn_score_max"] = float(valid_scores.max().item())
+                else:
+                    debug_capture["attn_score_mean"] = float("nan")
+                    debug_capture["attn_score_std"] = float("nan")
+                    debug_capture["attn_score_min"] = float("nan")
+                    debug_capture["attn_score_max"] = float("nan")
+
+                probs = torch.softmax(masked_scores, dim=-1)
+                valid_row = valid.any(dim=-1, keepdim=True)
+                probs = torch.where(valid_row, probs, torch.zeros_like(probs))
+                if probs.size(0) > 0:
+                    debug_capture["attn_prob_grid"] = probs[0].mean(dim=0).detach().cpu()
+                score0 = raw_scores[0]
+                valid0 = valid[0].expand_as(score0)
+                score0 = score0.masked_fill(~valid0, float("nan"))
+                score_grid = torch.nanmean(score0, dim=0)
+                score_grid = torch.nan_to_num(score_grid, nan=0.0, posinf=0.0, neginf=0.0)
+                debug_capture["attn_score_grid"] = score_grid.detach().cpu()
+
         if self._attn_impl == "sdpa":
             if q.device.type == "cuda" and self._sdp_backend != "auto":
                 with torch.backends.cuda.sdp_kernel(
@@ -171,14 +328,32 @@ class TransformerEncoderBlock(nn.Module):
                     enable_mem_efficient=(self._sdp_backend == "mem_efficient"),
                     enable_math=(self._sdp_backend == "math"),
                 ):
-                    return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
-            return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self._scalar
-        if attn_mask is not None:
-            scores = scores.masked_fill(attn_mask, torch.finfo(scores.dtype).min)
+                    return F.scaled_dot_product_attention(
+                        q_attn, k_attn, v, attn_mask=sdpa_mask, is_causal=sdpa_causal, scale=score_scale
+                    )
+            return F.scaled_dot_product_attention(
+                q_attn, k_attn, v, attn_mask=sdpa_mask, is_causal=sdpa_causal, scale=score_scale
+            )
+        scores = torch.matmul(q_attn, k_attn.transpose(-2, -1)) * score_scale
+        if key_pad_mask is not None:
+            scores = scores.masked_fill(key_pad_mask, torch.finfo(scores.dtype).min)
+        if is_causal:
+            causal = torch.triu(
+                torch.ones(q_len, k_len, device=q.device, dtype=torch.bool),
+                diagonal=1,
+            )[None, None, :, :]
+            scores = scores.masked_fill(causal, torch.finfo(scores.dtype).min)
         return torch.matmul(F.softmax(scores, dim=-1), v)
 
-    def forward(self, x: torch.Tensor, pad_mask=None, rope=None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        pad_mask=None,
+        rope=None,
+        is_causal: bool = False,
+        debug_capture: Optional[Dict[str, Any]] = None,
+        capture_attn_scores: bool = False,
+    ):
         """
             x: [B, S, E] tensor
         """
@@ -193,12 +368,22 @@ class TransformerEncoderBlock(nn.Module):
         wq = wq.transpose(1, 2)
         wk = wk.transpose(1, 2)
         wv = wv.transpose(1, 2)
-        h = self._attn(wq, wk, wv, pad_mask=pad_mask, is_causal=False)
+        h = self._attn(
+            wq,
+            wk,
+            wv,
+            pad_mask=pad_mask,
+            q_pad_mask=pad_mask,
+            is_causal=is_causal,
+            debug_capture=debug_capture,
+            capture_attn_scores=capture_attn_scores,
+        )
         h = h.transpose(1, 2).contiguous().view(B, S, E)
-        x = self._ln1(x + self._out_proj(h))
-        
-        x = x + self._mlp(x)
-        return self._ln2(x)
+        attn_out = _apply_layerscale(self._out_proj(h), self._ls_attn)
+        x = self._ln1(x + attn_out)
+
+        mlp_out = _apply_layerscale(self._mlp(x), self._ls_mlp)
+        return self._ln2(x + mlp_out)
 
 
 class TransformerDecoderBlock(nn.Module):
@@ -212,6 +397,17 @@ class TransformerDecoderBlock(nn.Module):
         self._head_dim = E // config.num_heads
         self._attn_impl = config.attn_impl
         self._sdp_backend = config.sdp_backend
+        self._cosine_attn = bool(getattr(config, "cosine_attn", False))
+        self._qk_norm_eps = 1e-6
+        self._layerscale = bool(getattr(config, "layerscale", False))
+        self._layerscale_init = float(getattr(config, "layerscale_init", 1e-5))
+        self._ls_self_attn = None
+        self._ls_cross_attn = None
+        self._ls_mlp = None
+        if self._layerscale:
+            self._ls_self_attn = nn.Parameter(torch.full((E,), self._layerscale_init))
+            self._ls_cross_attn = nn.Parameter(torch.full((E,), self._layerscale_init))
+            self._ls_mlp = nn.Parameter(torch.full((E,), self._layerscale_init))
 
         # CSA sublayer
         self._self_in_proj = nn.Linear(E, 3 * E)
@@ -234,18 +430,87 @@ class TransformerDecoderBlock(nn.Module):
         )
         self._ln3 = nn.LayerNorm(E)
 
-    def _attn(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, pad_mask=None, is_causal=False):
-        attn_mask = None
+    def _attn(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        pad_mask=None,
+        q_pad_mask=None,
+        is_causal=False,
+        debug_capture: Optional[Dict[str, Any]] = None,
+        capture_attn_scores: bool = False,
+    ):
         q_len = q.size(-2)
         k_len = k.size(-2)
-        if pad_mask is not None:
-            attn_mask = pad_mask[:, None, None, :].expand(-1, 1, q_len, -1)
-        if is_causal:
-            causal = torch.triu(
-                torch.ones(q_len, k_len, device=q.device, dtype=torch.bool),
-                diagonal=1,
-            )[None, None, :, :]
-            attn_mask = causal if attn_mask is None else (attn_mask | causal)
+        key_pad_mask, sdpa_causal, sdpa_mask, blocked = _build_attn_masks(
+            pad_mask=pad_mask,
+            q_len=q_len,
+            k_len=k_len,
+            device=q.device,
+            is_causal=is_causal,
+        )
+        q_attn, k_attn = q, k
+        score_scale = self._scalar
+        if self._cosine_attn:
+            q_attn = F.normalize(q_attn, p=2.0, dim=-1, eps=self._qk_norm_eps)
+            k_attn = F.normalize(k_attn, p=2.0, dim=-1, eps=self._qk_norm_eps)
+            score_scale = 1.0
+
+        if debug_capture is not None:
+            q_norm = q.float().norm(dim=-1)
+            k_norm = k.float().norm(dim=-1)
+            v_norm = v.float().norm(dim=-1)
+            q_keep = None if q_pad_mask is None else ~q_pad_mask
+            k_keep = None if pad_mask is None else ~pad_mask
+            q_mean, q_std = _masked_mean_std(q_norm, q_keep)
+            k_mean, k_std = _masked_mean_std(k_norm, k_keep)
+            v_mean, v_std = _masked_mean_std(v_norm, k_keep)
+            debug_capture["q_mag_mean"] = q_mean
+            debug_capture["q_mag_std"] = q_std
+            debug_capture["k_mag_mean"] = k_mean
+            debug_capture["k_mag_std"] = k_std
+            debug_capture["v_mag_mean"] = v_mean
+            debug_capture["v_mag_std"] = v_std
+
+            if capture_attn_scores:
+                raw_scores = torch.matmul(q_attn.float(), k_attn.float().transpose(-2, -1)) * score_scale
+                if blocked is not None:
+                    blocked_for_scores = blocked
+                    if blocked_for_scores.size(0) == 1 and raw_scores.size(0) > 1:
+                        blocked_for_scores = blocked_for_scores.expand(raw_scores.size(0), -1, -1, -1)
+                    valid = ~blocked_for_scores
+                    masked_scores = raw_scores.masked_fill(blocked_for_scores, torch.finfo(raw_scores.dtype).min)
+                else:
+                    valid = torch.ones(
+                        raw_scores.size(0), 1, q_len, k_len, device=raw_scores.device, dtype=torch.bool
+                    )
+                    masked_scores = raw_scores
+
+                valid_scores = raw_scores[valid.expand_as(raw_scores)]
+                if valid_scores.numel() > 0:
+                    debug_capture["attn_score_mean"] = float(valid_scores.mean().item())
+                    debug_capture["attn_score_std"] = float(valid_scores.std(unbiased=False).item())
+                    debug_capture["attn_score_min"] = float(valid_scores.min().item())
+                    debug_capture["attn_score_max"] = float(valid_scores.max().item())
+                else:
+                    debug_capture["attn_score_mean"] = float("nan")
+                    debug_capture["attn_score_std"] = float("nan")
+                    debug_capture["attn_score_min"] = float("nan")
+                    debug_capture["attn_score_max"] = float("nan")
+
+                probs = torch.softmax(masked_scores, dim=-1)
+                valid_row = valid.any(dim=-1, keepdim=True)
+                probs = torch.where(valid_row, probs, torch.zeros_like(probs))
+                if probs.size(0) > 0:
+                    debug_capture["attn_prob_grid"] = probs[0].mean(dim=0).detach().cpu()
+                score0 = raw_scores[0]
+                valid0 = valid[0].expand_as(score0)
+                score0 = score0.masked_fill(~valid0, float("nan"))
+                score_grid = torch.nanmean(score0, dim=0)
+                score_grid = torch.nan_to_num(score_grid, nan=0.0, posinf=0.0, neginf=0.0)
+                debug_capture["attn_score_grid"] = score_grid.detach().cpu()
+
         if self._attn_impl == "sdpa":
             if q.device.type == "cuda" and self._sdp_backend != "auto":
                 with torch.backends.cuda.sdp_kernel(
@@ -253,14 +518,36 @@ class TransformerDecoderBlock(nn.Module):
                     enable_mem_efficient=(self._sdp_backend == "mem_efficient"),
                     enable_math=(self._sdp_backend == "math"),
                 ):
-                    return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
-            return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self._scalar
-        if attn_mask is not None:
-            scores = scores.masked_fill(attn_mask, torch.finfo(scores.dtype).min)
+                    return F.scaled_dot_product_attention(
+                        q_attn, k_attn, v, attn_mask=sdpa_mask, is_causal=sdpa_causal, scale=score_scale
+                    )
+            return F.scaled_dot_product_attention(
+                q_attn, k_attn, v, attn_mask=sdpa_mask, is_causal=sdpa_causal, scale=score_scale
+            )
+        scores = torch.matmul(q_attn, k_attn.transpose(-2, -1)) * score_scale
+        if key_pad_mask is not None:
+            scores = scores.masked_fill(key_pad_mask, torch.finfo(scores.dtype).min)
+        if is_causal:
+            causal = torch.triu(
+                torch.ones(q_len, k_len, device=q.device, dtype=torch.bool),
+                diagonal=1,
+            )[None, None, :, :]
+            scores = scores.masked_fill(causal, torch.finfo(scores.dtype).min)
         return torch.matmul(F.softmax(scores, dim=-1), v)
 
-    def forward(self, x: torch.Tensor, kv: torch.Tensor, self_pad_mask=None, enc_pad_mask=None, rope=None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        kv: torch.Tensor,
+        self_pad_mask=None,
+        enc_pad_mask=None,
+        rope=None,
+        cross_is_causal: bool = False,
+        self_debug_capture: Optional[Dict[str, Any]] = None,
+        cross_debug_capture: Optional[Dict[str, Any]] = None,
+        capture_self_attn_scores: bool = False,
+        capture_cross_attn_scores: bool = False,
+    ):
         """
             x: [B, S, E] tensor
             kv: [B, S, E] (cache for that layer only)
@@ -276,9 +563,19 @@ class TransformerDecoderBlock(nn.Module):
         wq = wq.transpose(1, 2)
         wk = wk.transpose(1, 2)
         wv = wv.transpose(1, 2)
-        h1 = self._attn(wq, wk, wv, pad_mask=self_pad_mask, is_causal=True)
+        h1 = self._attn(
+            wq,
+            wk,
+            wv,
+            pad_mask=self_pad_mask,
+            q_pad_mask=self_pad_mask,
+            is_causal=True,
+            debug_capture=self_debug_capture,
+            capture_attn_scores=capture_self_attn_scores,
+        )
         h1 = h1.transpose(1, 2).contiguous().view(B, S, E)
-        x = self._ln1(x + self._self_out_proj(h1))
+        self_attn_out = _apply_layerscale(self._self_out_proj(h1), self._ls_self_attn)
+        x = self._ln1(x + self_attn_out)
         
         wq2 = self._cross_q(x)
         wk2, wv2 = self._cross_kv(kv).chunk(2, dim=-1)
@@ -290,11 +587,22 @@ class TransformerDecoderBlock(nn.Module):
         wq2 = wq2.transpose(1, 2)
         wk2 = wk2.transpose(1, 2)
         wv2 = wv2.transpose(1, 2)
-        h2 = self._attn(wq2, wk2, wv2, pad_mask=enc_pad_mask, is_causal=False)
+        h2 = self._attn(
+            wq2,
+            wk2,
+            wv2,
+            pad_mask=enc_pad_mask,
+            q_pad_mask=self_pad_mask,
+            is_causal=cross_is_causal,
+            debug_capture=cross_debug_capture,
+            capture_attn_scores=capture_cross_attn_scores,
+        )
         h2 = h2.transpose(1, 2).contiguous().view(B, S, E)
-        x = self._ln2(x + self._cross_out_proj(h2))
+        cross_attn_out = _apply_layerscale(self._cross_out_proj(h2), self._ls_cross_attn)
+        x = self._ln2(x + cross_attn_out)
 
-        return self._ln3(x + self._mlp(x))
+        mlp_out = _apply_layerscale(self._mlp(x), self._ls_mlp)
+        return self._ln3(x + mlp_out)
 
 
 class TransformerV1(nn.Module):
@@ -318,19 +626,64 @@ class TransformerV1(nn.Module):
         """
         return self._unembed(h)
 
-    def _encode(self, x: torch.Tensor, pad_mask=None) -> torch.Tensor:
+    def _encode(
+        self,
+        x: torch.Tensor,
+        pad_mask=None,
+        is_causal: bool = False,
+        debug_state: Optional[Dict[str, Any]] = None,
+        debug_score_layers: Optional[set] = None,
+    ) -> torch.Tensor:
         """
             x: [B, S, E] tensor
 
             returns kv: [B, L, S, E] tensor  
         """
         kv = list()
-        for block in self._enc_blocks:
-            x = block(x, pad_mask=pad_mask, rope=self._rope)
+        for i, block in enumerate(self._enc_blocks):
+            layer_debug = None
+            capture_scores = bool(debug_score_layers is not None and i in debug_score_layers)
+            if debug_state is not None:
+                layer_debug = {"layer": i}
+                debug_state["encoder_layers"].append(layer_debug)
+            if (
+                self.training
+                and getattr(self._config, "activation_checkpointing", False)
+                and x.requires_grad
+                and debug_state is None
+            ):
+                x = checkpoint(
+                    lambda x_in: block(x_in, pad_mask=pad_mask, rope=self._rope, is_causal=is_causal),
+                    x,
+                    use_reentrant=False,
+                )
+            else:
+                x = block(
+                    x,
+                    pad_mask=pad_mask,
+                    rope=self._rope,
+                    is_causal=is_causal,
+                    debug_capture=layer_debug,
+                    capture_attn_scores=capture_scores,
+                )
+            if debug_state is not None:
+                if i == 0:
+                    debug_state["hidden"]["enc_l0"] = x.detach()
+                if i == len(self._enc_blocks) - 1:
+                    debug_state["hidden"]["enc_last"] = x.detach()
             kv.append(x)
         return torch.stack(kv, dim=1)
         
-    def _decode(self, x: torch.Tensor, kv: torch.Tensor, self_pad_mask=None, enc_pad_mask=None) -> torch.Tensor:
+    def _decode(
+        self,
+        x: torch.Tensor,
+        kv: torch.Tensor,
+        self_pad_mask=None,
+        enc_pad_mask=None,
+        cross_is_causal: bool = False,
+        debug_state: Optional[Dict[str, Any]] = None,
+        debug_score_layers: Optional[set] = None,
+    ) -> torch.Tensor:
         """
             x: [B, S, E] tensor
             kv: [B, L, S, S] tensor
@@ -339,20 +692,102 @@ class TransformerV1(nn.Module):
             returns: [B, S, E] tensor
         """
         for i, block in enumerate(self._dec_blocks):
-            x = block(x, kv[:, i], self_pad_mask=self_pad_mask, enc_pad_mask=enc_pad_mask, rope=self._rope)
+            kv_i = kv[:, i]
+            self_layer_debug = None
+            cross_layer_debug = None
+            capture_scores = bool(debug_score_layers is not None and i in debug_score_layers)
+            if debug_state is not None:
+                self_layer_debug = {"layer": i}
+                cross_layer_debug = {"layer": i}
+                debug_state["decoder_self_layers"].append(self_layer_debug)
+                debug_state["decoder_cross_layers"].append(cross_layer_debug)
+            if (
+                self.training
+                and getattr(self._config, "activation_checkpointing", False)
+                and x.requires_grad
+                and debug_state is None
+            ):
+                x = checkpoint(
+                    lambda x_in, kv_in: block(
+                        x_in,
+                        kv_in,
+                        self_pad_mask=self_pad_mask,
+                        enc_pad_mask=enc_pad_mask,
+                        rope=self._rope,
+                        cross_is_causal=cross_is_causal,
+                    ),
+                    x,
+                    kv_i,
+                    use_reentrant=False,
+                )
+            else:
+                x = block(
+                    x,
+                    kv_i,
+                    self_pad_mask=self_pad_mask,
+                    enc_pad_mask=enc_pad_mask,
+                    rope=self._rope,
+                    cross_is_causal=cross_is_causal,
+                    self_debug_capture=self_layer_debug,
+                    cross_debug_capture=cross_layer_debug,
+                    capture_self_attn_scores=capture_scores,
+                    capture_cross_attn_scores=capture_scores,
+                )
+            if debug_state is not None:
+                if i == 0:
+                    debug_state["hidden"]["dec_l0"] = x.detach()
+                if i == len(self._dec_blocks) - 1:
+                    debug_state["hidden"]["dec_last"] = x.detach()
         return x
 
-    def forward(self, seq: torch.Tensor, pad_mask=None):
+    def forward(
+        self,
+        seq: torch.Tensor,
+        pad_mask=None,
+        return_debug: bool = False,
+    ):
         """
             seq: [B, S] tensor
         """
         (B, S) = seq.shape
         if pad_mask is not None:
             pad_mask = pad_mask.to(device=seq.device, dtype=torch.bool)
+        causal_lm = bool(getattr(self._config, "causal_lm", True))
         embeds = self._embed(seq)
-        kv_cache = self._encode(embeds, pad_mask=pad_mask)
-        out = self._decode(embeds, kv_cache, self_pad_mask=pad_mask, enc_pad_mask=pad_mask)
-        return self._lm_head(out)
+        debug_state = None
+        debug_score_layers = None
+        if return_debug:
+            last_layer = max(0, len(self._enc_blocks) - 1)
+            debug_score_layers = {0, last_layer}
+            debug_state = {
+                "encoder_layers": [],
+                "decoder_self_layers": [],
+                "decoder_cross_layers": [],
+                "hidden": {
+                    "embed": embeds.detach(),
+                },
+            }
+
+        kv_cache = self._encode(
+            embeds,
+            pad_mask=pad_mask,
+            is_causal=causal_lm,
+            debug_state=debug_state,
+            debug_score_layers=debug_score_layers,
+        )
+        out = self._decode(
+            embeds,
+            kv_cache,
+            self_pad_mask=pad_mask,
+            enc_pad_mask=pad_mask,
+            cross_is_causal=causal_lm,
+            debug_state=debug_state,
+            debug_score_layers=debug_score_layers,
+        )
+        logits = self._lm_head(out)
+        if return_debug:
+            return logits, debug_state
+        return logits
 
 
 if __name__=="__main__":

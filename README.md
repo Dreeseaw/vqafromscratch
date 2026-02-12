@@ -118,3 +118,46 @@ python3 -m train.train_tokenizer \
     --wiki_workers 8 \
     --wiki_chunk_lines 2000
 ```
+
+Build pre-tokenized train/val/test shards (paragraph-aware, `max_seq_len=256`, `stride=64`):
+```bash
+python3 scripts/pretokenize_corpus.py \
+    --input ./data/wiki_coco/articles.jsonl \
+    --out-dir ./data/wiki_tok_256 \
+    --tokenizer ./logs/mix_bpe_16k/tokenizer.pt \
+    --max_seq_len 256 \
+    --stride 64 \
+    --split_train 0.95 \
+    --split_val 0.04 \
+    --split_test 0.01
+```
+This writes split datasets under `./data/wiki_tok_256/train`, `./data/wiki_tok_256/val`, and `./data/wiki_tok_256/test`, each with shard files + `manifest.jsonl` + `manifest.json`.
+
+Train LM with periodic validation and final test:
+```bash
+python3 -m train.train_transformer lm_256_run \
+    --train_data ./data/wiki_tok_256 \
+    --tokenizer ./logs/mix_bpe_16k/tokenizer.pt \
+    --max_seq_len 256 \
+    --eval_every_steps 1000 \
+    --val_max_tokens 200000
+```
+
+Enable scale-invariant cosine attention (fast path keeps SDPA):
+```bash
+python3 -m train.train_transformer lm_256_run \
+    --train_data ./data/wiki_tok_256 \
+    --tokenizer ./logs/mix_bpe_16k/tokenizer.pt \
+    --attn_impl sdpa \
+    --sdp_backend flash \
+    --cosine_attn
+```
+
+Enable LayerScale on residual branches:
+```bash
+python3 -m train.train_transformer lm_256_run \
+    --train_data ./data/wiki_tok_256 \
+    --tokenizer ./logs/mix_bpe_16k/tokenizer.pt \
+    --layerscale \
+    --layerscale_init 1e-5
+```
