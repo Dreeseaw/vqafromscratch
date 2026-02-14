@@ -4,3 +4,8 @@
 Images/*
 logs/*
 __pycache__/*
+images/*
+annotations/*
+docs/*.pdf
+data/wiki_coco/*
+data/pretraining/*
