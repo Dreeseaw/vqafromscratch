@@ -342,6 +342,24 @@
       font-size: 0.8rem;
     }
 
+    .grad-list {
+      margin-top: 8px;
+      display: grid;
+      gap: 6px;
+    }
+
+    .grad-item {
+      border: 1px solid #5cb8ff56;
+      border-radius: 8px;
+      padding: 6px 8px;
+      background: #0a273777;
+      color: #d7f0ff;
+      font-size: 0.76rem;
+      line-height: 1.35;
+      font-family: "SF Mono", Menlo, monospace;
+      word-break: break-word;
+    }
+
     .mini-controls {
       display: flex;
       flex-wrap: wrap;
@@ -459,6 +477,12 @@
 
     <section class="stats" id="stats"></section>
 
+    <section class="panel meta">
+      <h3>Top Grad Norm Layers</h3>
+      <div class="attn-meta" id="topGradMeta">No gradient layer ranking logged yet.</div>
+      <div class="grad-list" id="topGradList"></div>
+    </section>
+
     <section class="grid" id="chartGrid"></section>
 
     <section class="panel chart">
@@ -565,6 +589,7 @@
       compareOptions: [],
       generationRecords: [],
       generationProbes: [],
+      topGrad: { step: null, entries: [] },
     };
 
     const els = {
@@ -573,6 +598,8 @@
       liveText: document.getElementById("liveText"),
       chartGrid: document.getElementById("chartGrid"),
       stats: document.getElementById("stats"),
+      topGradMeta: document.getElementById("topGradMeta"),
+      topGradList: document.getElementById("topGradList"),
       ckptList: document.getElementById("ckptList"),
       genProbeSelect: document.getElementById("genProbeSelect"),
       genList: document.getElementById("genList"),
@@ -616,6 +643,7 @@
         rafQueued = false;
         drawAllCharts();
         drawStats();
+        drawTopGrad();
         refreshCompareOptions();
         drawCompareChart();
         drawAttentionHeatmap();
@@ -761,6 +789,30 @@
       return { group, series };
     }
 
+    function parseTopGradSegment(segment, step) {
+      const topMatch = segment.match(/TopGradNorms\s*[:=]\s*\[([^\]]*)\]/i);
+      if (!topMatch) return false;
+      const raw = String(topMatch[1] || "").trim();
+      const entries = [];
+      if (raw.length > 0) {
+        const items = raw.split(";").map((x) => x.trim()).filter(Boolean);
+        for (const item of items) {
+          const m = item.match(/^(.+?)@([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)$/);
+          if (!m) continue;
+          const name = String(m[1] || "").trim();
+          const norm = parseNumber(m[2]);
+          if (!name || norm === null) continue;
+          entries.push({ name, norm });
+        }
+      }
+      entries.sort((a, b) => b.norm - a.norm);
+      state.topGrad = {
+        step: Number.isFinite(step) ? step : null,
+        entries: entries.slice(0, 5),
+      };
+      return true;
+    }
+
     function parseSegment(segment) {
       if (!segment || segment.length < 4) return;
 
@@ -776,6 +828,7 @@
       }
       if (!stepMatch && phase === "other") return;
 
+      const topGradUpdated = parseTopGradSegment(segment, step);
       const pairRe = /([A-Za-z][A-Za-z0-9_\-\/\s]*?)\s*[:=]\s*([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)/g;
       let found = 0;
       let m;
@@ -795,7 +848,7 @@
         found += 1;
       }
 
-      if (found === 0) return;
+      if (found === 0 && !topGradUpdated) return;
 
       state.eventCount += 1;
       state.lastActivityMs = Date.now();
@@ -1210,9 +1263,10 @@
     }
 
     function drawStats() {
+      const GLOBAL_CE_MIN = 5.950318;
       const stats = [
         ["step", Number.isFinite(state.maxStep) ? String(state.maxStep) : "-"],
-        ["train ce", latestValue("ce", "train")],
+        ["train ce "+"("+GLOBAL_CE_MIN+")", latestValue("ce", "train")],
         ["val ce", latestValue("ce", "val")],
         ["train ppl", latestValue("ppl", "train")],
         ["val ppl", latestValue("ppl", "val")],
@@ -1227,6 +1281,30 @@
         el.className = "panel stat";
         el.innerHTML = `<div class="k">${k}</div><div class="v">${v}</div>`;
         els.stats.appendChild(el);
+      }
+    }
+
+    function drawTopGrad() {
+      const root = els.topGradList;
+      const meta = els.topGradMeta;
+      if (!root || !meta) return;
+      const snapshot = state.topGrad || { step: null, entries: [] };
+      const entries = Array.isArray(snapshot.entries) ? snapshot.entries : [];
+      root.textContent = "";
+      if (entries.length === 0) {
+        meta.textContent = "No gradient layer ranking logged yet.";
+        return;
+      }
+      meta.textContent = Number.isFinite(snapshot.step)
+        ? `latest snapshot @ step ${snapshot.step}`
+        : "latest snapshot";
+      for (let i = 0; i < entries.length; i++) {
+        const row = entries[i];
+        const item = document.createElement("div");
+        item.className = "grad-item";
+        const val = Number.isFinite(row.norm) ? Number(row.norm).toExponential(3) : "nan";
+        item.textContent = `#${i + 1}  ${val}  ${row.name}`;
+        root.appendChild(item);
       }
     }
 

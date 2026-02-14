@@ -571,14 +571,64 @@ def _safe_exp(x: float) -> float:
         return float("inf")
 
 
-def _global_grad_norm(model: nn.Module) -> float:
+def global_grad_norm(parameters) -> float:
     total = 0.0
-    for p in model.parameters():
-        if p.grad is None:
+    for param in parameters:
+        if param.grad is None:
             continue
-        g = p.grad.detach()
-        total += float(torch.sum(g * g).item())
+        grad = param.grad.detach()
+        total += float(torch.sum(grad * grad).item())
     return float(math.sqrt(max(total, 0.0)))
+
+
+def topk_grad_norms(named_parameters, k: int = 5):
+    rows = []
+    for name, param in named_parameters:
+        if param.grad is None:
+            continue
+        grad_norm = float(torch.linalg.vector_norm(param.grad.detach()).item())
+        if not math.isfinite(grad_norm):
+            continue
+        rows.append((str(name), grad_norm))
+    rows.sort(key=lambda x: x[1], reverse=True)
+    return rows[: max(0, int(k))]
+
+
+def format_top_grad_norms(entries) -> str:
+    if not entries:
+        return "TopGradNorms=[]"
+    pairs = []
+    for name, grad_norm in entries:
+        safe_name = str(name).replace("@", "_").replace(";", "_").replace("[", "_").replace("]", "_")
+        pairs.append(f"{safe_name}@{grad_norm:.6e}")
+    return "TopGradNorms=[" + ";".join(pairs) + "]"
+
+
+def adaptive_clip_grad_(parameters, clip_factor=0.01, eps=1e-3, grad_eps=1e-6):
+    """
+    Parameter-norm-relative adaptive clipping.
+    For each parameter tensor p with gradient g:
+        ||g||_2 <= clip_factor * max(||p||_2, eps)
+    """
+    if clip_factor <= 0:
+        return (0, 0)
+
+    clipped = 0
+    total = 0
+    for param in parameters:
+        if param.grad is None:
+            continue
+
+        total += 1
+        p_norm = float(torch.linalg.vector_norm(param.detach()).item())
+        g_norm = float(torch.linalg.vector_norm(param.grad.detach()).item())
+        max_norm = clip_factor * max(p_norm, eps)
+        clip_coef = min(1.0, max_norm / (g_norm + grad_eps))
+        if clip_coef < 1.0:
+            param.grad.detach().mul_(clip_coef)
+            clipped += 1
+
+    return (clipped, total)
 
 
 def _collate_shift_sanity(collate_fn: CollatePad, pad_id: int) -> None:
@@ -719,7 +769,31 @@ def main():
     parser.add_argument("--warmup_ratio", type=float, default=0.02)
     parser.add_argument("--schedule", type=str, default="cosine", choices=["cosine", "flat"])
     parser.add_argument("--max_steps", type=int, default=None)
-    parser.add_argument("--clip_grad", type=float, default=1.0)
+    parser.add_argument(
+        "--grad_clip_mode",
+        type=str,
+        default="global",
+        choices=["global", "agc", "none"],
+        help="Gradient clipping mode: global-norm, adaptive (parameter-relative), or disabled.",
+    )
+    parser.add_argument(
+        "--clip_grad",
+        type=float,
+        default=1.0,
+        help="Global gradient clip norm (used when --grad_clip_mode=global).",
+    )
+    parser.add_argument(
+        "--agc_clip_factor",
+        type=float,
+        default=0.01,
+        help="AGC clip factor for ||g|| <= factor * max(||p||, eps).",
+    )
+    parser.add_argument(
+        "--agc_eps",
+        type=float,
+        default=1e-3,
+        help="AGC minimum parameter norm epsilon.",
+    )
     parser.add_argument("--eval_every_steps", type=int, default=1000)
     parser.add_argument("--val_max_tokens", type=int, default=200000)
     parser.add_argument("--val_steps", type=int, default=0)
@@ -893,6 +967,12 @@ def main():
 
     if args.enc_layers != args.dec_layers:
         raise SystemExit("--enc_layers must equal --dec_layers for TransformerV1.")
+    if args.grad_clip_mode == "global" and args.clip_grad <= 0:
+        raise SystemExit("--clip_grad must be > 0 when --grad_clip_mode=global.")
+    if args.grad_clip_mode == "agc" and args.agc_clip_factor <= 0:
+        raise SystemExit("--agc_clip_factor must be > 0 when --grad_clip_mode=agc.")
+    if args.grad_clip_mode == "agc" and args.agc_eps <= 0:
+        raise SystemExit("--agc_eps must be > 0 when --grad_clip_mode=agc.")
 
     cfg = LMConfig(
         vocab_size=args.vocab_size,
@@ -984,6 +1064,12 @@ def main():
             )
     logger.log(f"bucket width: {args.bucket_width} ({'auto' if args.bucket_width > 0 else 'legacy ranges'})")
     logger.log(f"activation checkpointing: {'on' if args.activation_checkpointing else 'off'}")
+    if args.grad_clip_mode == "global":
+        logger.log(f"grad clipping: global (max_norm={args.clip_grad})")
+    elif args.grad_clip_mode == "agc":
+        logger.log(f"grad clipping: adaptive (clip_factor={args.agc_clip_factor}, eps={args.agc_eps})")
+    else:
+        logger.log("grad clipping: none")
     logger.log(
         f"sanity: special tokens pad={args.pad_id}, eos={args.eos_id}, "
         f"bos={args.bos_id}, vocab={args.vocab_size}"
@@ -1000,10 +1086,12 @@ def main():
     tokens_since_log = 0
     loss_sum_since_log = 0.0
     entropy_sum_since_log = 0.0
-    grad_norm_sum_since_log = 0.0
-    grad_norm_steps_since_log = 0
-    pre_clip_sum_since_log = 0.0
-    pre_clip_steps_since_log = 0
+    pre_grad_norm_sum_since_log = 0.0
+    pre_grad_norm_steps_since_log = 0
+    post_grad_norm_sum_since_log = 0.0
+    post_grad_norm_steps_since_log = 0
+    agc_clipped_params_since_log = 0
+    agc_total_params_since_log = 0
     running_ce_window = deque()
     running_ce_tokens = 0
     running_ce_loss_sum = 0.0
@@ -1046,13 +1134,24 @@ def main():
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            if args.clip_grad is not None and args.clip_grad > 0:
-                # HACK: pre_clip actually tracks the post clipped value. oopsies!
-                grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad).item())
-                pre_clip  = _global_grad_norm(model)
+            pre_grad_norm = global_grad_norm(model.parameters())
+            if args.grad_clip_mode == "global":
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+                post_grad_norm = global_grad_norm(model.parameters())
+            elif args.grad_clip_mode == "agc":
+                clipped_count, total_count = adaptive_clip_grad_(
+                    model.parameters(),
+                    clip_factor=args.agc_clip_factor,
+                    eps=args.agc_eps,
+                )
+                agc_clipped_params_since_log += clipped_count
+                agc_total_params_since_log += total_count
+                post_grad_norm = global_grad_norm(model.parameters())
             else:
-                grad_norm = _global_grad_norm(model)
-                pre_clip  = grad_norm
+                post_grad_norm = pre_grad_norm
+            top_grad_norms_for_log = []
+            if (global_step + 1) % args.log_every == 0:
+                top_grad_norms_for_log = topk_grad_norms(model.named_parameters(), k=5)
             opt.step()
             lr = scheduler.step()
 
@@ -1067,10 +1166,10 @@ def main():
             loss_sum_since_log += loss_sum_value
             tokens_since_log += token_count
             entropy_sum_since_log += entropy_sum
-            grad_norm_sum_since_log += grad_norm
-            grad_norm_steps_since_log += 1
-            pre_clip_sum_since_log += pre_clip
-            pre_clip_steps_since_log += 1
+            pre_grad_norm_sum_since_log += pre_grad_norm
+            pre_grad_norm_steps_since_log += 1
+            post_grad_norm_sum_since_log += post_grad_norm
+            post_grad_norm_steps_since_log += 1
             running_ce_window.append([token_count, loss_sum_value])
             running_ce_tokens += token_count
             running_ce_loss_sum += loss_sum_value
@@ -1102,8 +1201,8 @@ def main():
                 avg_ce = float(loss_sum_since_log) / float(max(1, tokens_since_log))
                 avg_ppl = _safe_exp(avg_ce)
                 avg_entropy = float(entropy_sum_since_log) / float(max(1, tokens_since_log))
-                avg_grad_norm = float(grad_norm_sum_since_log) / float(max(1, grad_norm_steps_since_log))
-                avg_pre_clip = float(pre_clip_sum_since_log) / float(max(1, pre_clip_steps_since_log))
+                avg_pre_grad_norm = float(pre_grad_norm_sum_since_log) / float(max(1, pre_grad_norm_steps_since_log))
+                avg_post_grad_norm = float(post_grad_norm_sum_since_log) / float(max(1, post_grad_norm_steps_since_log))
                 train_running_ce = float(running_ce_loss_sum) / float(max(1, running_ce_tokens))
 
                 log_msg = (
@@ -1111,18 +1210,25 @@ def main():
                     f"Step: {global_step}, Train CE: {avg_ce:.6f} nats/token, "
                     f"train_running_ce: {train_running_ce:.6f} nats/token ({running_ce_tokens} tok), "
                     f"Train PPL: {avg_ppl:.4f}, Train Entropy: {avg_entropy:.6f}, "
-                    f"GradNorm: {avg_pre_clip:.4f} (Pre: {avg_grad_norm:.4f}), Tokens/s: {toks_per_sec:.2f}, LR: {lr:.6e}"
+                    f"GradNorm(pre={avg_pre_grad_norm:.4f}, post={avg_post_grad_norm:.4f}), "
+                    f"Tokens/s: {toks_per_sec:.2f}, LR: {lr:.6e}"
                 )
+                if args.grad_clip_mode == "agc":
+                    frac = float(agc_clipped_params_since_log) / float(max(1, agc_total_params_since_log))
+                    log_msg += f", AGC clipped params: {agc_clipped_params_since_log}/{agc_total_params_since_log} ({frac:.1%})"
+                log_msg += f", {format_top_grad_norms(top_grad_norms_for_log)}"
                 logger.log(log_msg)
 
                 log_start = time.perf_counter()
                 tokens_since_log = 0
                 loss_sum_since_log = 0.0
                 entropy_sum_since_log = 0.0
-                grad_norm_sum_since_log = 0.0
-                grad_norm_steps_since_log = 0
-                pre_clip_sum_since_log = 0.0
-                pre_clip_steps_since_log = 0
+                pre_grad_norm_sum_since_log = 0.0
+                pre_grad_norm_steps_since_log = 0
+                post_grad_norm_sum_since_log = 0.0
+                post_grad_norm_steps_since_log = 0
+                agc_clipped_params_since_log = 0
+                agc_total_params_since_log = 0
 
             if args.eval_every_steps > 0 and global_step % args.eval_every_steps == 0:
                 val_metrics = evaluate_model(

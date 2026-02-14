@@ -240,9 +240,8 @@ class TransformerEncoderBlock(nn.Module):
         # MLP sublayer
         self._mlp = nn.Sequential(
             nn.Linear(config.embed_size, config.embed_size*config.mlp_ratio),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Linear(config.embed_size*config.mlp_ratio, config.embed_size),
-            nn.ReLU(inplace=True),
         )
         self._ln2 = nn.LayerNorm(E)
 
@@ -375,6 +374,8 @@ class TransformerEncoderBlock(nn.Module):
         wv = wv.view(B, S, self._num_heads, self._head_dim)
         if self._v_rmsnorm:
             wv = _rms_norm_last_dim(wv, eps=self._v_rmsnorm_eps)
+            wk = _rms_norm_last_dim(wk, eps=self._v_rmsnorm_eps)
+            wq = _rms_norm_last_dim(wq, eps=self._v_rmsnorm_eps)
         if rope is not None:
             wq, wk = rope.apply(wq, wk)
         wq = wq.transpose(1, 2)
@@ -438,9 +439,8 @@ class TransformerDecoderBlock(nn.Module):
         # MLP sublayer
         self._mlp = nn.Sequential(
             nn.Linear(config.embed_size, config.embed_size*config.mlp_ratio),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Linear(config.embed_size*config.mlp_ratio, config.embed_size),
-            nn.ReLU(inplace=True),
         )
         self._ln3 = nn.LayerNorm(E)
 
@@ -574,6 +574,8 @@ class TransformerDecoderBlock(nn.Module):
         wv = wv.view(B, S, self._num_heads, self._head_dim)
         if self._v_rmsnorm:
             wv = _rms_norm_last_dim(wv, eps=self._v_rmsnorm_eps)
+            wk = _rms_norm_last_dim(wk, eps=self._v_rmsnorm_eps)
+            wq = _rms_norm_last_dim(wq, eps=self._v_rmsnorm_eps)
         if rope is not None:
             wq, wk = rope.apply(wq, wk)
         wq = wq.transpose(1, 2)
@@ -600,6 +602,8 @@ class TransformerDecoderBlock(nn.Module):
         wv2 = wv2.view(B, kv.size(1), self._num_heads, self._head_dim)
         if self._v_rmsnorm:
             wv2 = _rms_norm_last_dim(wv2, eps=self._v_rmsnorm_eps)
+            wk2 = _rms_norm_last_dim(wk2, eps=self._v_rmsnorm_eps)
+            wq2 = _rms_norm_last_dim(wq2, eps=self._v_rmsnorm_eps)
         if rope is not None:
             wq2, wk2 = rope.apply(wq2, wk2)
         wq2 = wq2.transpose(1, 2)

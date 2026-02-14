@@ -143,16 +143,6 @@ python3 -m train.train_transformer lm_256_run \
     --val_max_tokens 200000
 ```
 
-Enable scale-invariant cosine attention (fast path keeps SDPA):
-```bash
-python3 -m train.train_transformer lm_256_run \
-    --train_data ./data/wiki_tok_256 \
-    --tokenizer ./logs/mix_bpe_16k/tokenizer.pt \
-    --attn_impl sdpa \
-    --sdp_backend flash \
-    --cosine_attn
-```
-
 Enable LayerScale on residual branches:
 ```bash
 python3 -m train.train_transformer lm_256_run \
