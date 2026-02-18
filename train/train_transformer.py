@@ -729,10 +729,12 @@ def build_optimizer_param_groups(
     base_lr: float,
     weight_decay: float,
     tie_embeddings: bool,
+    half_lr_lm_head: bool,
 ):
     tied_embed_param_id = id(model._embed.weight) if tie_embeddings else None
     grouped_params: Dict[str, List[nn.Parameter]] = {
         "main_decay": [],
+        "lm_head_no_decay": [],
         "embed_decay": [],
         "main_no_decay": [],
         "embed_no_decay": [],
@@ -741,8 +743,13 @@ def build_optimizer_param_groups(
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        is_embed = str(name).startswith("_embed.")
-        is_bias = str(name).endswith(".bias")
+        param_name = str(name)
+        is_embed = param_name.startswith("_embed.")
+        is_lm_head = param_name.startswith("_unembed.")
+        is_bias = param_name.endswith(".bias")
+        if is_lm_head:
+            grouped_params["lm_head_no_decay"].append(param)
+            continue
         no_decay = is_bias or (tied_embed_param_id is not None and id(param) == tied_embed_param_id)
         if is_embed:
             key = "embed_no_decay" if no_decay else "embed_decay"
@@ -751,12 +758,17 @@ def build_optimizer_param_groups(
         grouped_params[key].append(param)
 
     out = []
-    for key in ("main_decay", "embed_decay", "main_no_decay", "embed_no_decay"):
+    for key in ("main_decay", "lm_head_no_decay", "embed_decay", "main_no_decay", "embed_no_decay"):
         params = grouped_params[key]
         if len(params) == 0:
             continue
-        lr_scale = 0.5 if key.startswith("embed_") else 1.0
-        group_weight_decay = 0.0 if key.endswith("_no_decay") else float(weight_decay)
+        if key.startswith("embed_"):
+            lr_scale = 0.5
+        elif key == "lm_head_no_decay":
+            lr_scale = 0.5 if half_lr_lm_head else 1.0
+        else:
+            lr_scale = 1.0
+        group_weight_decay = 0.0 if key.endswith("_no_decay") or key == "embed_decay" else float(weight_decay)
         out.append(
             {
                 "params": params,
@@ -1027,6 +1039,11 @@ def main():
     )
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument(
+        "--half_lr_lm_head",
+        action="store_true",
+        help="Use 0.5x base LR for _unembed (LM head) parameters.",
+    )
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["adam", "adamw"])
     parser.add_argument("--warmup_ratio", type=float, default=0.02)
     parser.add_argument("--schedule", type=str, default="cosine", choices=["cosine", "flat", "stair"])
@@ -1291,6 +1308,7 @@ def main():
         base_lr=float(args.lr),
         weight_decay=float(args.weight_decay),
         tie_embeddings=bool(args.tie_embeddings),
+        half_lr_lm_head=bool(args.half_lr_lm_head),
     )
 
     if args.optimizer == "adam":
@@ -1389,9 +1407,10 @@ def main():
     else:
         logger.log("grad clipping: none")
     logger.log("weight decay: all bias parameters excluded from decay.")
-    if args.tie_embeddings:
-        logger.log("weight decay: tied embedding weight excluded from decay.")
+    logger.log("weight decay: all _embed and _unembed parameters excluded from decay.")
     logger.log("optimizer lr scaling: _embed parameters use 0.5x base LR.")
+    if args.half_lr_lm_head:
+        logger.log("optimizer lr scaling: _unembed parameters use 0.5x base LR.")
     logger.log(
         "lr anneal (EWMA plateau): "
         f"alpha={LR_ANNEAL_ALPHA}, ratio_up={LR_ANNEAL_RATIO_UP}, hold={LR_ANNEAL_HOLD}, "
