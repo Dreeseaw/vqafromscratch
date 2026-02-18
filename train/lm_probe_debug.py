@@ -15,6 +15,34 @@ def parse_probe_prompts(path: str) -> List[str]:
     return prompts
 
 
+def parse_probe_layers(raw: Optional[str], total_layers: Optional[int] = None) -> Optional[List[int]]:
+    if raw is None:
+        return None
+    txt = str(raw).strip()
+    if txt == "":
+        return None
+
+    parts = [x.strip() for x in txt.split(",") if x.strip() != ""]
+    if not parts:
+        raise ValueError("--probe_layers was provided but no valid layer indices were found.")
+
+    out: List[int] = []
+    seen = set()
+    for part in parts:
+        idx = int(part)
+        if idx in seen:
+            continue
+        seen.add(idx)
+        out.append(idx)
+
+    if total_layers is not None:
+        max_idx = int(total_layers) - 1
+        for idx in out:
+            if idx < 0 or idx > max_idx:
+                raise ValueError(f"probe layer index {idx} out of range [0, {max_idx}]")
+    return out
+
+
 def resolve_probe_file_path(
     train_data_arg: str,
     resolved_train_path: Optional[str],
@@ -234,6 +262,8 @@ def run_debug_probes(
     step: int,
     topk_eigs: int = 5,
     generate_max_new_tokens: int = 48,
+    probe_layers: Optional[List[int]] = None,
+    capture_attn_entropy: bool = True,
     log_fn: Optional[Callable[[str], None]] = None,
     log_detailed_metrics: bool = False,
 ) -> Dict[str, Any]:
@@ -245,7 +275,13 @@ def run_debug_probes(
     model_was_training = bool(model.training)
     model.eval()
 
-    summary: Dict[str, Any] = {"step": int(step), "num_probes": len(prompts), "probes": []}
+    summary: Dict[str, Any] = {
+        "step": int(step),
+        "num_probes": len(prompts),
+        "probe_layers": [int(x) for x in probe_layers] if probe_layers is not None else None,
+        "capture_attn_entropy": bool(capture_attn_entropy),
+        "probes": [],
+    }
     latest_attention: Optional[Dict[str, Any]] = None
     attention_entries_for_step: List[Dict[str, Any]] = []
     attention_index_path = os.path.join(probe_root, "attention_index.json")
@@ -259,7 +295,51 @@ def run_debug_probes(
         prompt_token_ids = [int(x) for x in ids.detach().cpu().tolist()]
         pad_mask = input_ids.eq(int(pad_id))
 
-        _, debug = model(input_ids, pad_mask=pad_mask, return_debug=True)
+        debug_layers = None
+        if probe_layers is not None:
+            debug_layers = {int(x) for x in probe_layers}
+        attn_state = None
+        if capture_attn_entropy:
+            _, debug, attn_state = model(
+                input_ids,
+                pad_mask=pad_mask,
+                return_debug=True,
+                return_attn_entropy=True,
+                debug_layers=debug_layers,
+                debug_score_layers=debug_layers,
+            )
+        else:
+            _, debug = model(
+                input_ids,
+                pad_mask=pad_mask,
+                return_debug=True,
+                debug_layers=debug_layers,
+                debug_score_layers=debug_layers,
+            )
+
+        if capture_attn_entropy and isinstance(attn_state, dict):
+            for debug_key, metric_key in (
+                ("encoder_layers", "encoder_layers"),
+                ("decoder_self_layers", "decoder_self_layers"),
+                ("decoder_cross_layers", "decoder_cross_layers"),
+            ):
+                dbg_rows = debug.get(debug_key, [])
+                met_rows = attn_state.get(metric_key, [])
+                met_by_layer = {}
+                for row in met_rows:
+                    if not isinstance(row, dict):
+                        continue
+                    layer = row.get("layer")
+                    value = row.get("attn_entropy")
+                    if isinstance(layer, int) and isinstance(value, (float, int)):
+                        met_by_layer[int(layer)] = float(value)
+                for row in dbg_rows:
+                    if not isinstance(row, dict):
+                        continue
+                    layer = row.get("layer")
+                    if isinstance(layer, int) and int(layer) in met_by_layer:
+                        row["attn_entropy"] = float(met_by_layer[int(layer)])
+
         probe_metrics: Dict[str, float] = {}
         generation = _autoregressive_generate(
             model=model,
@@ -296,6 +376,7 @@ def run_debug_probes(
                     "k_mag_std",
                     "v_mag_mean",
                     "v_mag_std",
+                    "attn_entropy",
                 ):
                     if metric_name in entry:
                         metric_val = _to_float(entry[metric_name])

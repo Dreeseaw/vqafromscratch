@@ -15,7 +15,7 @@ import torch
 
 from models.bpe_tokenizer import ByteBPETokenizer
 from models.lm import LMConfig, TransformerV1
-from train.lm_probe_debug import parse_probe_prompts, run_debug_probes
+from train.lm_probe_debug import parse_probe_layers, parse_probe_prompts, run_debug_probes
 
 
 def _infer_run_dir(ckpt_path: str, out_dir: str) -> str:
@@ -39,6 +39,7 @@ def _load_model_from_ckpt(ckpt_path: str, device: str):
         embed_size=int(cfg_raw["embed_size"]),
         num_heads=int(cfg_raw["num_heads"]),
         mlp_ratio=int(cfg_raw["mlp_ratio"]),
+        dropout=float(cfg_raw.get("dropout", 0.1)),
         layers=int(cfg_raw["layers"]),
         max_seq_len=int(cfg_raw["max_seq_len"]),
         tie_embeds=bool(cfg_raw.get("tie_embeds", False)),
@@ -67,6 +68,25 @@ def main():
     ap.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
     ap.add_argument("--topk_eigs", type=int, default=5)
     ap.add_argument("--gen_tokens", type=int, default=48)
+    ap.add_argument(
+        "--probe_attn_entropy",
+        dest="probe_attn_entropy",
+        action="store_true",
+        help="Capture attention entropy metrics during probe runs.",
+    )
+    ap.add_argument(
+        "--no_probe_attn_entropy",
+        dest="probe_attn_entropy",
+        action="store_false",
+        help="Disable attention entropy capture during probe runs.",
+    )
+    ap.set_defaults(probe_attn_entropy=True)
+    ap.add_argument(
+        "--probe_layers",
+        type=str,
+        default="",
+        help="Comma-separated layer indices to probe (e.g. 0,1,5). Default uses probe-debug defaults.",
+    )
     ap.add_argument("--step", type=int, default=-1, help="Optional override for output step label.")
     ap.add_argument("--log_detailed", action="store_true", help="Also print full per-probe metric lines.")
     args = ap.parse_args()
@@ -89,6 +109,7 @@ def main():
     model, cfg, ckpt_step = _load_model_from_ckpt(args.ckpt, device=device)
     tokenizer = ByteBPETokenizer.load(args.tokenizer)
     prompts = parse_probe_prompts(args.probes)
+    probe_layers = parse_probe_layers(args.probe_layers, total_layers=int(cfg.layers))
 
     step = int(args.step) if int(args.step) >= 0 else ckpt_step
     run_dir = _infer_run_dir(args.ckpt, args.out_dir)
@@ -103,6 +124,8 @@ def main():
         step=step,
         topk_eigs=max(1, int(args.topk_eigs)),
         generate_max_new_tokens=max(0, int(args.gen_tokens)),
+        probe_layers=probe_layers,
+        capture_attn_entropy=bool(args.probe_attn_entropy),
         log_fn=print,
         log_detailed_metrics=bool(args.log_detailed),
     )

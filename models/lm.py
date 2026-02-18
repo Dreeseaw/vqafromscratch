@@ -56,6 +56,22 @@ def _masked_mean_std(values: torch.Tensor, keep_mask: Optional[torch.Tensor] = N
     return mean, std
 
 
+def _mean_attn_entropy(
+    masked_scores: torch.Tensor,
+    valid: torch.Tensor,
+) -> Tuple[float, torch.Tensor]:
+    probs = torch.softmax(masked_scores, dim=-1)
+    probs = torch.where(valid, probs, torch.zeros_like(probs))
+    row_valid = valid.any(dim=-1)  # [B,H,Q]
+    probs_safe = probs.clamp_min(1e-12)
+    row_entropy = -(probs_safe * probs_safe.log()).sum(dim=-1)
+    if row_valid.shape != row_entropy.shape:
+        row_valid = row_valid.expand_as(row_entropy)
+    if not bool(row_valid.any().item()):
+        return float("nan"), probs
+    return float(row_entropy[row_valid].mean().item()), probs
+
+
 def _build_attn_masks(
     pad_mask: Optional[torch.Tensor],
     q_len: int,
@@ -129,6 +145,7 @@ class LMConfig:
         v_rmsnorm: bool = False,
         layerscale: bool = False,
         layerscale_init: float = 1e-5,
+        dropout: float = 0.1,
         config_file: str = None, 
     ):
         # load defaults/ params first
@@ -147,6 +164,7 @@ class LMConfig:
         self.v_rmsnorm = v_rmsnorm
         self.layerscale = layerscale
         self.layerscale_init = layerscale_init
+        self.dropout = dropout
         self._config_file = config_file
 
         # if given, overwrite loaded params from yaml
@@ -171,6 +189,9 @@ class LMConfig:
             raise ValueError("sdp_backend must be one of: auto, flash, mem_efficient, math.")
         if float(self.layerscale_init) < 0.0:
             raise ValueError("layerscale_init must be >= 0.")
+        self.dropout = float(self.dropout)
+        if self.dropout < 0.0 or self.dropout >= 1.0:
+            raise ValueError("dropout must be in [0.0, 1.0).")
 
 
 class RotaryEmbedding(nn.Module):
@@ -225,17 +246,18 @@ class TransformerEncoderBlock(nn.Module):
         self._attn_impl = config.attn_impl
         self._sdp_backend = config.sdp_backend
         self._cosine_attn = bool(getattr(config, "cosine_attn", False))
-        self._v_rmsnorm = bool(getattr(config, "v_rmsnorm", False))
-        self._v_rmsnorm_eps = 1e-6
         self._qk_norm_eps = 1e-6
+        self._rmsnorm_eps = 1e-6
         self._layerscale = bool(getattr(config, "layerscale", False))
         self._layerscale_init = float(getattr(config, "layerscale_init", 1e-5))
+        self._dropout_p = float(getattr(config, "dropout", 0.1))
         self._ls_attn = None
         self._ls_mlp = None
         if self._layerscale:
             self._ls_attn = nn.Parameter(torch.full((E,), self._layerscale_init))
             self._ls_mlp = nn.Parameter(torch.full((E,), self._layerscale_init))
-        self._ln1 = nn.LayerNorm(E)
+        self._resid_dropout = nn.Dropout(self._dropout_p)
+        self._mlp_dropout = nn.Dropout(self._dropout_p)
 
         # MLP sublayer
         self._mlp = nn.Sequential(
@@ -243,7 +265,6 @@ class TransformerEncoderBlock(nn.Module):
             nn.GELU(),
             nn.Linear(config.embed_size*config.mlp_ratio, config.embed_size),
         )
-        self._ln2 = nn.LayerNorm(E)
 
     def _attn(
         self,
@@ -255,6 +276,7 @@ class TransformerEncoderBlock(nn.Module):
         is_causal=False,
         debug_capture: Optional[Dict[str, Any]] = None,
         capture_attn_scores: bool = False,
+        entropy_capture: Optional[Dict[str, Any]] = None,
     ):
         """
             q, k, v: [B, H, S, D]
@@ -276,6 +298,21 @@ class TransformerEncoderBlock(nn.Module):
             k_attn = F.normalize(k_attn, p=2.0, dim=-1, eps=self._qk_norm_eps)
             score_scale = 1.0
 
+        raw_scores = None
+        valid = None
+        masked_scores = None
+        if capture_attn_scores or entropy_capture is not None:
+            raw_scores = torch.matmul(q_attn.float(), k_attn.float().transpose(-2, -1)) * score_scale
+            if blocked is not None:
+                blocked_for_scores = blocked
+                if blocked_for_scores.size(0) == 1 and raw_scores.size(0) > 1:
+                    blocked_for_scores = blocked_for_scores.expand(raw_scores.size(0), -1, -1, -1)
+                valid = ~blocked_for_scores
+                masked_scores = raw_scores.masked_fill(blocked_for_scores, torch.finfo(raw_scores.dtype).min)
+            else:
+                valid = torch.ones_like(raw_scores, dtype=torch.bool)
+                masked_scores = raw_scores
+
         if debug_capture is not None:
             q_norm = q.float().norm(dim=-1)
             k_norm = k.float().norm(dim=-1)
@@ -293,20 +330,8 @@ class TransformerEncoderBlock(nn.Module):
             debug_capture["v_mag_std"] = v_std
 
             if capture_attn_scores:
-                raw_scores = torch.matmul(q_attn.float(), k_attn.float().transpose(-2, -1)) * score_scale
-                if blocked is not None:
-                    blocked_for_scores = blocked
-                    if blocked_for_scores.size(0) == 1 and raw_scores.size(0) > 1:
-                        blocked_for_scores = blocked_for_scores.expand(raw_scores.size(0), -1, -1, -1)
-                    valid = ~blocked_for_scores
-                    masked_scores = raw_scores.masked_fill(blocked_for_scores, torch.finfo(raw_scores.dtype).min)
-                else:
-                    valid = torch.ones(
-                        raw_scores.size(0), 1, q_len, k_len, device=raw_scores.device, dtype=torch.bool
-                    )
-                    masked_scores = raw_scores
-
-                valid_scores = raw_scores[valid.expand_as(raw_scores)]
+                valid_for_scores = valid if valid.shape == raw_scores.shape else valid.expand_as(raw_scores)
+                valid_scores = raw_scores[valid_for_scores]
                 if valid_scores.numel() > 0:
                     debug_capture["attn_score_mean"] = float(valid_scores.mean().item())
                     debug_capture["attn_score_std"] = float(valid_scores.std(unbiased=False).item())
@@ -318,7 +343,7 @@ class TransformerEncoderBlock(nn.Module):
                     debug_capture["attn_score_min"] = float("nan")
                     debug_capture["attn_score_max"] = float("nan")
 
-                probs = torch.softmax(masked_scores, dim=-1)
+                _, probs = _mean_attn_entropy(masked_scores=masked_scores, valid=valid)
                 valid_row = valid.any(dim=-1, keepdim=True)
                 probs = torch.where(valid_row, probs, torch.zeros_like(probs))
                 if probs.size(0) > 0:
@@ -330,6 +355,10 @@ class TransformerEncoderBlock(nn.Module):
                 score_grid = torch.nan_to_num(score_grid, nan=0.0, posinf=0.0, neginf=0.0)
                 debug_capture["attn_score_grid"] = score_grid.detach().cpu()
 
+        if entropy_capture is not None:
+            attn_entropy, _ = _mean_attn_entropy(masked_scores=masked_scores, valid=valid)
+            entropy_capture["attn_entropy"] = attn_entropy
+
         if self._attn_impl == "sdpa":
             if q.device.type == "cuda" and self._sdp_backend != "auto":
                 with torch.backends.cuda.sdp_kernel(
@@ -338,10 +367,22 @@ class TransformerEncoderBlock(nn.Module):
                     enable_math=(self._sdp_backend == "math"),
                 ):
                     return F.scaled_dot_product_attention(
-                        q_attn, k_attn, v, attn_mask=sdpa_mask, is_causal=sdpa_causal, scale=score_scale
+                        q_attn,
+                        k_attn,
+                        v,
+                        attn_mask=sdpa_mask,
+                        is_causal=sdpa_causal,
+                        scale=score_scale,
+                        dropout_p=(self._dropout_p if self.training else 0.0),
                     )
             return F.scaled_dot_product_attention(
-                q_attn, k_attn, v, attn_mask=sdpa_mask, is_causal=sdpa_causal, scale=score_scale
+                q_attn,
+                k_attn,
+                v,
+                attn_mask=sdpa_mask,
+                is_causal=sdpa_causal,
+                scale=score_scale,
+                dropout_p=(self._dropout_p if self.training else 0.0),
             )
         scores = torch.matmul(q_attn, k_attn.transpose(-2, -1)) * score_scale
         if key_pad_mask is not None:
@@ -352,7 +393,9 @@ class TransformerEncoderBlock(nn.Module):
                 diagonal=1,
             )[None, None, :, :]
             scores = scores.masked_fill(causal, torch.finfo(scores.dtype).min)
-        return torch.matmul(F.softmax(scores, dim=-1), v)
+        probs = F.softmax(scores, dim=-1)
+        probs = F.dropout(probs, p=self._dropout_p, training=self.training)
+        return torch.matmul(probs, v)
 
     def forward(
         self,
@@ -362,20 +405,19 @@ class TransformerEncoderBlock(nn.Module):
         is_causal: bool = False,
         debug_capture: Optional[Dict[str, Any]] = None,
         capture_attn_scores: bool = False,
+        entropy_capture: Optional[Dict[str, Any]] = None,
     ):
         """
             x: [B, S, E] tensor
         """
         B, S, E = x.shape
+        x_residual = x
+        x = _rms_norm_last_dim(x, eps=self._rmsnorm_eps)
         qkv = self._in_proj(x)
         wq, wk, wv = qkv.chunk(3, dim=-1)
         wq = wq.view(B, S, self._num_heads, self._head_dim)
         wk = wk.view(B, S, self._num_heads, self._head_dim)
         wv = wv.view(B, S, self._num_heads, self._head_dim)
-        if self._v_rmsnorm:
-            wv = _rms_norm_last_dim(wv, eps=self._v_rmsnorm_eps)
-            # wk = _rms_norm_last_dim(wk, eps=self._v_rmsnorm_eps)
-            # wq = _rms_norm_last_dim(wq, eps=self._v_rmsnorm_eps)
         if rope is not None:
             wq, wk = rope.apply(wq, wk)
         wq = wq.transpose(1, 2)
@@ -390,13 +432,16 @@ class TransformerEncoderBlock(nn.Module):
             is_causal=is_causal,
             debug_capture=debug_capture,
             capture_attn_scores=capture_attn_scores,
+            entropy_capture=entropy_capture,
         )
         h = h.transpose(1, 2).contiguous().view(B, S, E)
         attn_out = _apply_layerscale(self._out_proj(h), self._ls_attn)
-        x = self._ln1(x + attn_out)
+        x = x_residual + self._resid_dropout(attn_out)
 
+        x_residual = x
+        x = _rms_norm_last_dim(x, eps=self._rmsnorm_eps)
         mlp_out = _apply_layerscale(self._mlp(x), self._ls_mlp)
-        return self._ln2(x + mlp_out)
+        return x_residual + self._mlp_dropout(mlp_out)
 
 
 class TransformerDecoderBlock(nn.Module):
@@ -411,11 +456,11 @@ class TransformerDecoderBlock(nn.Module):
         self._attn_impl = config.attn_impl
         self._sdp_backend = config.sdp_backend
         self._cosine_attn = bool(getattr(config, "cosine_attn", False))
-        self._v_rmsnorm = bool(getattr(config, "v_rmsnorm", False))
-        self._v_rmsnorm_eps = 1e-6
         self._qk_norm_eps = 1e-6
+        self._rmsnorm_eps = 1e-6
         self._layerscale = bool(getattr(config, "layerscale", False))
         self._layerscale_init = float(getattr(config, "layerscale_init", 1e-5))
+        self._dropout_p = float(getattr(config, "dropout", 0.1))
         self._ls_self_attn = None
         self._ls_cross_attn = None
         self._ls_mlp = None
@@ -423,18 +468,18 @@ class TransformerDecoderBlock(nn.Module):
             self._ls_self_attn = nn.Parameter(torch.full((E,), self._layerscale_init))
             self._ls_cross_attn = nn.Parameter(torch.full((E,), self._layerscale_init))
             self._ls_mlp = nn.Parameter(torch.full((E,), self._layerscale_init))
+        self._resid_dropout = nn.Dropout(self._dropout_p)
+        self._mlp_dropout = nn.Dropout(self._dropout_p)
 
         # CSA sublayer
         self._self_in_proj = nn.Linear(E, 3 * E)
         self._self_out_proj = nn.Linear(E, E)
         self._scalar = 1.0 / math.sqrt(self._head_dim)
-        self._ln1 = nn.LayerNorm(E)
 
         # Enc-MHA sublayer
         self._cross_q = nn.Linear(E, E)
         self._cross_kv = nn.Linear(E, 2 * E)
         self._cross_out_proj = nn.Linear(E, E)
-        self._ln2 = nn.LayerNorm(E)
 
         # MLP sublayer
         self._mlp = nn.Sequential(
@@ -442,7 +487,6 @@ class TransformerDecoderBlock(nn.Module):
             nn.GELU(),
             nn.Linear(config.embed_size*config.mlp_ratio, config.embed_size),
         )
-        self._ln3 = nn.LayerNorm(E)
 
     def _attn(
         self,
@@ -454,6 +498,7 @@ class TransformerDecoderBlock(nn.Module):
         is_causal=False,
         debug_capture: Optional[Dict[str, Any]] = None,
         capture_attn_scores: bool = False,
+        entropy_capture: Optional[Dict[str, Any]] = None,
     ):
         q_len = q.size(-2)
         k_len = k.size(-2)
@@ -471,6 +516,21 @@ class TransformerDecoderBlock(nn.Module):
             k_attn = F.normalize(k_attn, p=2.0, dim=-1, eps=self._qk_norm_eps)
             score_scale = 1.0
 
+        raw_scores = None
+        valid = None
+        masked_scores = None
+        if capture_attn_scores or entropy_capture is not None:
+            raw_scores = torch.matmul(q_attn.float(), k_attn.float().transpose(-2, -1)) * score_scale
+            if blocked is not None:
+                blocked_for_scores = blocked
+                if blocked_for_scores.size(0) == 1 and raw_scores.size(0) > 1:
+                    blocked_for_scores = blocked_for_scores.expand(raw_scores.size(0), -1, -1, -1)
+                valid = ~blocked_for_scores
+                masked_scores = raw_scores.masked_fill(blocked_for_scores, torch.finfo(raw_scores.dtype).min)
+            else:
+                valid = torch.ones_like(raw_scores, dtype=torch.bool)
+                masked_scores = raw_scores
+
         if debug_capture is not None:
             q_norm = q.float().norm(dim=-1)
             k_norm = k.float().norm(dim=-1)
@@ -488,20 +548,8 @@ class TransformerDecoderBlock(nn.Module):
             debug_capture["v_mag_std"] = v_std
 
             if capture_attn_scores:
-                raw_scores = torch.matmul(q_attn.float(), k_attn.float().transpose(-2, -1)) * score_scale
-                if blocked is not None:
-                    blocked_for_scores = blocked
-                    if blocked_for_scores.size(0) == 1 and raw_scores.size(0) > 1:
-                        blocked_for_scores = blocked_for_scores.expand(raw_scores.size(0), -1, -1, -1)
-                    valid = ~blocked_for_scores
-                    masked_scores = raw_scores.masked_fill(blocked_for_scores, torch.finfo(raw_scores.dtype).min)
-                else:
-                    valid = torch.ones(
-                        raw_scores.size(0), 1, q_len, k_len, device=raw_scores.device, dtype=torch.bool
-                    )
-                    masked_scores = raw_scores
-
-                valid_scores = raw_scores[valid.expand_as(raw_scores)]
+                valid_for_scores = valid if valid.shape == raw_scores.shape else valid.expand_as(raw_scores)
+                valid_scores = raw_scores[valid_for_scores]
                 if valid_scores.numel() > 0:
                     debug_capture["attn_score_mean"] = float(valid_scores.mean().item())
                     debug_capture["attn_score_std"] = float(valid_scores.std(unbiased=False).item())
@@ -513,7 +561,7 @@ class TransformerDecoderBlock(nn.Module):
                     debug_capture["attn_score_min"] = float("nan")
                     debug_capture["attn_score_max"] = float("nan")
 
-                probs = torch.softmax(masked_scores, dim=-1)
+                _, probs = _mean_attn_entropy(masked_scores=masked_scores, valid=valid)
                 valid_row = valid.any(dim=-1, keepdim=True)
                 probs = torch.where(valid_row, probs, torch.zeros_like(probs))
                 if probs.size(0) > 0:
@@ -525,6 +573,10 @@ class TransformerDecoderBlock(nn.Module):
                 score_grid = torch.nan_to_num(score_grid, nan=0.0, posinf=0.0, neginf=0.0)
                 debug_capture["attn_score_grid"] = score_grid.detach().cpu()
 
+        if entropy_capture is not None:
+            attn_entropy, _ = _mean_attn_entropy(masked_scores=masked_scores, valid=valid)
+            entropy_capture["attn_entropy"] = attn_entropy
+
         if self._attn_impl == "sdpa":
             if q.device.type == "cuda" and self._sdp_backend != "auto":
                 with torch.backends.cuda.sdp_kernel(
@@ -533,10 +585,22 @@ class TransformerDecoderBlock(nn.Module):
                     enable_math=(self._sdp_backend == "math"),
                 ):
                     return F.scaled_dot_product_attention(
-                        q_attn, k_attn, v, attn_mask=sdpa_mask, is_causal=sdpa_causal, scale=score_scale
+                        q_attn,
+                        k_attn,
+                        v,
+                        attn_mask=sdpa_mask,
+                        is_causal=sdpa_causal,
+                        scale=score_scale,
+                        dropout_p=(self._dropout_p if self.training else 0.0),
                     )
             return F.scaled_dot_product_attention(
-                q_attn, k_attn, v, attn_mask=sdpa_mask, is_causal=sdpa_causal, scale=score_scale
+                q_attn,
+                k_attn,
+                v,
+                attn_mask=sdpa_mask,
+                is_causal=sdpa_causal,
+                scale=score_scale,
+                dropout_p=(self._dropout_p if self.training else 0.0),
             )
         scores = torch.matmul(q_attn, k_attn.transpose(-2, -1)) * score_scale
         if key_pad_mask is not None:
@@ -547,7 +611,9 @@ class TransformerDecoderBlock(nn.Module):
                 diagonal=1,
             )[None, None, :, :]
             scores = scores.masked_fill(causal, torch.finfo(scores.dtype).min)
-        return torch.matmul(F.softmax(scores, dim=-1), v)
+        probs = F.softmax(scores, dim=-1)
+        probs = F.dropout(probs, p=self._dropout_p, training=self.training)
+        return torch.matmul(probs, v)
 
     def forward(
         self,
@@ -561,21 +627,21 @@ class TransformerDecoderBlock(nn.Module):
         cross_debug_capture: Optional[Dict[str, Any]] = None,
         capture_self_attn_scores: bool = False,
         capture_cross_attn_scores: bool = False,
+        self_entropy_capture: Optional[Dict[str, Any]] = None,
+        cross_entropy_capture: Optional[Dict[str, Any]] = None,
     ):
         """
             x: [B, S, E] tensor
             kv: [B, S, E] (cache for that layer only)
         """
         (B, S, E) = x.shape
+        x_residual = x
+        x = _rms_norm_last_dim(x, eps=self._rmsnorm_eps)
         qkv = self._self_in_proj(x)
         wq, wk, wv = qkv.chunk(3, dim=-1)
         wq = wq.view(B, S, self._num_heads, self._head_dim)
         wk = wk.view(B, S, self._num_heads, self._head_dim)
         wv = wv.view(B, S, self._num_heads, self._head_dim)
-        if self._v_rmsnorm:
-            wv = _rms_norm_last_dim(wv, eps=self._v_rmsnorm_eps)
-            # wk = _rms_norm_last_dim(wk, eps=self._v_rmsnorm_eps)
-            # wq = _rms_norm_last_dim(wq, eps=self._v_rmsnorm_eps)
         if rope is not None:
             wq, wk = rope.apply(wq, wk)
         wq = wq.transpose(1, 2)
@@ -590,20 +656,22 @@ class TransformerDecoderBlock(nn.Module):
             is_causal=True,
             debug_capture=self_debug_capture,
             capture_attn_scores=capture_self_attn_scores,
+            entropy_capture=self_entropy_capture,
         )
         h1 = h1.transpose(1, 2).contiguous().view(B, S, E)
         self_attn_out = _apply_layerscale(self._self_out_proj(h1), self._ls_self_attn)
-        x = self._ln1(x + self_attn_out)
-        
+        x = x_residual + self._resid_dropout(self_attn_out)
+
+        # Cross attention third
+        x_residual = x
+        x = _rms_norm_last_dim(x, eps=self._rmsnorm_eps)
+        kv = _rms_norm_last_dim(kv, eps=self._rmsnorm_eps)
+
         wq2 = self._cross_q(x)
         wk2, wv2 = self._cross_kv(kv).chunk(2, dim=-1)
         wq2 = wq2.view(B, S, self._num_heads, self._head_dim)
         wk2 = wk2.view(B, kv.size(1), self._num_heads, self._head_dim)
         wv2 = wv2.view(B, kv.size(1), self._num_heads, self._head_dim)
-        if self._v_rmsnorm:
-            wv2 = _rms_norm_last_dim(wv2, eps=self._v_rmsnorm_eps)
-            # wk2 = _rms_norm_last_dim(wk2, eps=self._v_rmsnorm_eps)
-            # wq2 = _rms_norm_last_dim(wq2, eps=self._v_rmsnorm_eps)
         if rope is not None:
             wq2, wk2 = rope.apply(wq2, wk2)
         wq2 = wq2.transpose(1, 2)
@@ -618,13 +686,16 @@ class TransformerDecoderBlock(nn.Module):
             is_causal=cross_is_causal,
             debug_capture=cross_debug_capture,
             capture_attn_scores=capture_cross_attn_scores,
+            entropy_capture=cross_entropy_capture,
         )
         h2 = h2.transpose(1, 2).contiguous().view(B, S, E)
         cross_attn_out = _apply_layerscale(self._cross_out_proj(h2), self._ls_cross_attn)
-        x = self._ln2(x + cross_attn_out)
+        x = x_residual + self._resid_dropout(cross_attn_out)
 
+        x_residual = x
+        x = _rms_norm_last_dim(x, eps=self._rmsnorm_eps)
         mlp_out = _apply_layerscale(self._mlp(x), self._ls_mlp)
-        return self._ln3(x + mlp_out)
+        return x_residual + self._mlp_dropout(mlp_out)
 
 
 class TransformerV1(nn.Module):
@@ -633,11 +704,15 @@ class TransformerV1(nn.Module):
         self._config = config
         # self._embed = nn.Linear(config.vocab_size, config.embed_size, bias=False)
         self._embed = nn.Embedding(config.vocab_size, config.embed_size)
+        self._embed_dropout = nn.Dropout(float(getattr(config, "dropout", 0.1)))
         self._rope = RotaryEmbedding(config.embed_size // config.num_heads, max_len=config.max_seq_len)
         self._enc_blocks = nn.ModuleList([TransformerEncoderBlock(config, i) for i in range(config.layers)])
         self._dec_blocks = nn.ModuleList([TransformerDecoderBlock(config, i) for i in range(config.layers)])
         self._unembed = nn.Linear(config.embed_size, config.vocab_size, bias=False)
         if config.tie_embeds:
+            # nn.Embedding defaults to N(0, 1); tied LM heads need much smaller scale.
+            with torch.no_grad():
+                self._embed.weight.mul_(config.embed_size ** -0.5)
             self._unembed.weight = self._embed.weight
 
     def _lm_head(self, h: torch.Tensor) -> torch.Tensor:
@@ -654,6 +729,8 @@ class TransformerV1(nn.Module):
         pad_mask=None,
         is_causal: bool = False,
         debug_state: Optional[Dict[str, Any]] = None,
+        metric_state: Optional[Dict[str, Any]] = None,
+        debug_layers: Optional[set] = None,
         debug_score_layers: Optional[set] = None,
     ) -> torch.Tensor:
         """
@@ -664,15 +741,22 @@ class TransformerV1(nn.Module):
         kv = list()
         for i, block in enumerate(self._enc_blocks):
             layer_debug = None
+            layer_metrics = None
             capture_scores = bool(debug_score_layers is not None and i in debug_score_layers)
             if debug_state is not None:
-                layer_debug = {"layer": i}
-                debug_state["encoder_layers"].append(layer_debug)
+                include_debug = debug_layers is None or i in debug_layers
+                if include_debug:
+                    layer_debug = {"layer": i}
+                    debug_state["encoder_layers"].append(layer_debug)
+            if metric_state is not None:
+                layer_metrics = {"layer": i}
+                metric_state["encoder_layers"].append(layer_metrics)
             if (
                 self.training
                 and getattr(self._config, "activation_checkpointing", False)
                 and x.requires_grad
                 and debug_state is None
+                and metric_state is None
             ):
                 x = checkpoint(
                     lambda x_in: block(x_in, pad_mask=pad_mask, rope=self._rope, is_causal=is_causal),
@@ -687,6 +771,7 @@ class TransformerV1(nn.Module):
                     is_causal=is_causal,
                     debug_capture=layer_debug,
                     capture_attn_scores=capture_scores,
+                    entropy_capture=layer_metrics,
                 )
             if debug_state is not None:
                 if i == 0:
@@ -704,6 +789,8 @@ class TransformerV1(nn.Module):
         enc_pad_mask=None,
         cross_is_causal: bool = False,
         debug_state: Optional[Dict[str, Any]] = None,
+        metric_state: Optional[Dict[str, Any]] = None,
+        debug_layers: Optional[set] = None,
         debug_score_layers: Optional[set] = None,
     ) -> torch.Tensor:
         """
@@ -717,17 +804,27 @@ class TransformerV1(nn.Module):
             kv_i = kv[:, i]
             self_layer_debug = None
             cross_layer_debug = None
+            self_layer_metrics = None
+            cross_layer_metrics = None
             capture_scores = bool(debug_score_layers is not None and i in debug_score_layers)
             if debug_state is not None:
-                self_layer_debug = {"layer": i}
-                cross_layer_debug = {"layer": i}
-                debug_state["decoder_self_layers"].append(self_layer_debug)
-                debug_state["decoder_cross_layers"].append(cross_layer_debug)
+                include_debug = debug_layers is None or i in debug_layers
+                if include_debug:
+                    self_layer_debug = {"layer": i}
+                    cross_layer_debug = {"layer": i}
+                    debug_state["decoder_self_layers"].append(self_layer_debug)
+                    debug_state["decoder_cross_layers"].append(cross_layer_debug)
+            if metric_state is not None:
+                self_layer_metrics = {"layer": i}
+                cross_layer_metrics = {"layer": i}
+                metric_state["decoder_self_layers"].append(self_layer_metrics)
+                metric_state["decoder_cross_layers"].append(cross_layer_metrics)
             if (
                 self.training
                 and getattr(self._config, "activation_checkpointing", False)
                 and x.requires_grad
                 and debug_state is None
+                and metric_state is None
             ):
                 x = checkpoint(
                     lambda x_in, kv_in: block(
@@ -754,6 +851,8 @@ class TransformerV1(nn.Module):
                     cross_debug_capture=cross_layer_debug,
                     capture_self_attn_scores=capture_scores,
                     capture_cross_attn_scores=capture_scores,
+                    self_entropy_capture=self_layer_metrics,
+                    cross_entropy_capture=cross_layer_metrics,
                 )
             if debug_state is not None:
                 if i == 0:
@@ -767,6 +866,9 @@ class TransformerV1(nn.Module):
         seq: torch.Tensor,
         pad_mask=None,
         return_debug: bool = False,
+        return_attn_entropy: bool = False,
+        debug_layers: Optional[set] = None,
+        debug_score_layers: Optional[set] = None,
     ):
         """
             seq: [B, S] tensor
@@ -775,12 +877,17 @@ class TransformerV1(nn.Module):
         if pad_mask is not None:
             pad_mask = pad_mask.to(device=seq.device, dtype=torch.bool)
         causal_lm = bool(getattr(self._config, "causal_lm", True))
-        embeds = self._embed(seq)
+        embeds = self._embed_dropout(self._embed(seq))
         debug_state = None
-        debug_score_layers = None
+        metric_state = None
+        debug_layers_set = None if debug_layers is None else {int(x) for x in debug_layers}
+        debug_score_layers_set = None if debug_score_layers is None else {int(x) for x in debug_score_layers}
         if return_debug:
-            last_layer = max(0, len(self._enc_blocks) - 1)
-            debug_score_layers = {0, last_layer}
+            if debug_layers_set is None:
+                debug_layers_set = set(range(len(self._enc_blocks)))
+            if debug_score_layers_set is None:
+                last_layer = max(0, len(self._enc_blocks) - 1)
+                debug_score_layers_set = {0, last_layer}
             debug_state = {
                 "encoder_layers": [],
                 "decoder_self_layers": [],
@@ -789,13 +896,21 @@ class TransformerV1(nn.Module):
                     "embed": embeds.detach(),
                 },
             }
+        if return_attn_entropy:
+            metric_state = {
+                "encoder_layers": [],
+                "decoder_self_layers": [],
+                "decoder_cross_layers": [],
+            }
 
         kv_cache = self._encode(
             embeds,
             pad_mask=pad_mask,
             is_causal=causal_lm,
             debug_state=debug_state,
-            debug_score_layers=debug_score_layers,
+            metric_state=metric_state,
+            debug_layers=debug_layers_set,
+            debug_score_layers=debug_score_layers_set,
         )
         out = self._decode(
             embeds,
@@ -804,11 +919,17 @@ class TransformerV1(nn.Module):
             enc_pad_mask=pad_mask,
             cross_is_causal=causal_lm,
             debug_state=debug_state,
-            debug_score_layers=debug_score_layers,
+            metric_state=metric_state,
+            debug_layers=debug_layers_set,
+            debug_score_layers=debug_score_layers_set,
         )
         logits = self._lm_head(out)
+        if return_debug and return_attn_entropy:
+            return logits, debug_state, metric_state
         if return_debug:
             return logits, debug_state
+        if return_attn_entropy:
+            return logits, metric_state
         return logits
 
 

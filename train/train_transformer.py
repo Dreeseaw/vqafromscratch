@@ -19,8 +19,8 @@ import json
 import random
 import argparse
 import datetime
-from collections import deque
-from typing import List, Optional
+from collections import defaultdict, deque
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -29,13 +29,26 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 
 from models.lm import TransformerV1, LMConfig
-from train.lm_probe_debug import parse_probe_prompts, resolve_probe_file_path, run_debug_probes
+from train.lm_probe_debug import (
+    parse_probe_layers,
+    parse_probe_prompts,
+    resolve_probe_file_path,
+    run_debug_probes,
+)
 
 
 LOGDIR = "logs/"
 LOGFILE = "logfile.txt"
 SEED = 35
 RUNNING_CE_WINDOW_TOKENS = 200_000
+R_METRIC_GROUP_KEYS = ("embed", "atten", "mlp", "lm_head")
+LR_ANNEAL_ALPHA = 0.02
+LR_ANNEAL_RATIO_UP = 1.01
+LR_ANNEAL_HOLD = 8
+LR_ANNEAL_COOLDOWN = 8
+LR_ANNEAL_FACTOR = 0.5
+LR_ANNEAL_MIN_LR = 1e-6
+LR_ANNEAL_CHECK_INTERVAL = 500
 
 # Length buckets (inclusive ranges) for bucketed batching
 BUCKET_RANGES = [
@@ -434,6 +447,9 @@ class WarmupScheduler:
     def get_lr(self) -> float:
         if self.step_num < self.warmup_steps:
             return self.base_lr * float(self.step_num + 1) / float(self.warmup_steps)
+        if self.schedule == "stair":
+            if self.step_num >= 14000:
+                return self.base_lr / 2.0
         if self.schedule == "flat":
             return self.base_lr
         # cosine decay
@@ -444,7 +460,7 @@ class WarmupScheduler:
     def step(self) -> float:
         lr = self.get_lr()
         for group in self.optimizer.param_groups:
-            group["lr"] = lr
+            group["lr"] = lr * float(group.get("lr_scale", 1.0))
         self.step_num += 1
         return lr
 
@@ -476,6 +492,34 @@ def seed_worker(worker_id: int) -> None:
     worker_seed = SEED + worker_id
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+
+
+def capture_rng_state() -> dict:
+    out = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        out["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return out
+
+
+def restore_rng_state(state: Optional[dict]) -> None:
+    if not isinstance(state, dict):
+        return
+    py_state = state.get("python")
+    np_state = state.get("numpy")
+    torch_cpu = state.get("torch_cpu")
+    torch_cuda = state.get("torch_cuda")
+    if py_state is not None:
+        random.setstate(py_state)
+    if np_state is not None:
+        np.random.set_state(np_state)
+    if torch_cpu is not None:
+        torch.set_rng_state(torch_cpu)
+    if torch_cuda is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(torch_cuda)
 
 
 def _resolve_data_paths(train_data: str, val_data: Optional[str], test_data: Optional[str]):
@@ -581,6 +625,192 @@ def global_grad_norm(parameters) -> float:
     return float(math.sqrt(max(total, 0.0)))
 
 
+def grad_weight_stats(parameters, eps: float = 1e-12, optimizer: Optional[torch.optim.Optimizer] = None):
+    grad_sq = 0.0
+    weight_sq = 0.0
+    m1_sq = 0.0
+    have_m1 = False
+    for param in parameters:
+        if param.grad is None:
+            continue
+        grad = param.grad.detach()
+        weight = param.detach()
+        grad_sq += float(torch.sum(grad * grad).item())
+        weight_sq += float(torch.sum(weight * weight).item())
+        if optimizer is not None:
+            state = optimizer.state.get(param, None)
+            if isinstance(state, dict):
+                exp_avg = state.get("exp_avg", None)
+                if torch.is_tensor(exp_avg):
+                    m1 = exp_avg.detach()
+                    m1_sq += float(torch.sum(m1 * m1).item())
+                    have_m1 = True
+    grad_norm = float(math.sqrt(max(grad_sq, 0.0)))
+    weight_norm = float(math.sqrt(max(weight_sq, 0.0)))
+    r_grad = grad_norm / float(max(weight_norm, eps))
+    r_m1 = float("nan")
+    if have_m1:
+        m1_norm = float(math.sqrt(max(m1_sq, 0.0)))
+        r_m1 = m1_norm / float(max(weight_norm, eps))
+    return grad_norm, weight_norm, r_grad, r_m1
+
+
+def compute_r_value(parameters: Sequence[nn.Parameter], optimizer: Optional[torch.optim.Optimizer] = None) -> float:
+    has_grad = False
+    for param in parameters:
+        if param.grad is not None:
+            has_grad = True
+            break
+    if not has_grad:
+        return float("nan")
+    _grad_norm, _weight_norm, r_grad, r_m1 = grad_weight_stats(parameters, optimizer=optimizer)
+    return float(r_m1 if math.isfinite(r_m1) else r_grad)
+
+
+def _is_attention_param_name(name: str) -> bool:
+    attn_markers = (
+        "._in_proj.",
+        "._out_proj.",
+        "._self_in_proj.",
+        "._self_out_proj.",
+        "._cross_q.",
+        "._cross_kv.",
+        "._cross_out_proj.",
+        "._ls_attn",
+        "._ls_self_attn",
+        "._ls_cross_attn",
+    )
+    return any(marker in name for marker in attn_markers)
+
+
+def _is_mlp_param_name(name: str) -> bool:
+    return "._mlp." in name or "._ls_mlp" in name
+
+
+def _metric_group_for_param(name: str) -> Optional[str]:
+    if name.startswith("_embed."):
+        return "embed"
+    if name.startswith("_unembed."):
+        return "lm_head"
+    if _is_mlp_param_name(name):
+        return "mlp"
+    if _is_attention_param_name(name):
+        return "atten"
+    return None
+
+
+def build_r_metric_param_groups(model: nn.Module, tie_embeddings: bool) -> Dict[str, List[nn.Parameter]]:
+    out: Dict[str, List[nn.Parameter]] = {k: [] for k in R_METRIC_GROUP_KEYS}
+    seen_ids: Dict[str, set] = {k: set() for k in R_METRIC_GROUP_KEYS}
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        group_name = _metric_group_for_param(str(name))
+        if group_name is None:
+            continue
+        pid = id(param)
+        if pid in seen_ids[group_name]:
+            continue
+        out[group_name].append(param)
+        seen_ids[group_name].add(pid)
+
+    # Keep lm_head metrics available under tied embeddings (shared with _embed.weight).
+    if tie_embeddings:
+        shared_param = model._unembed.weight
+        shared_id = id(shared_param)
+        if shared_id not in seen_ids["lm_head"]:
+            out["lm_head"].append(shared_param)
+            seen_ids["lm_head"].add(shared_id)
+    return out
+
+
+def build_optimizer_param_groups(
+    model: nn.Module,
+    base_lr: float,
+    weight_decay: float,
+    tie_embeddings: bool,
+):
+    tied_embed_param_id = id(model._embed.weight) if tie_embeddings else None
+    grouped_params: Dict[str, List[nn.Parameter]] = {
+        "main_decay": [],
+        "embed_decay": [],
+        "main_no_decay": [],
+        "embed_no_decay": [],
+    }
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        is_embed = str(name).startswith("_embed.")
+        is_bias = str(name).endswith(".bias")
+        no_decay = is_bias or (tied_embed_param_id is not None and id(param) == tied_embed_param_id)
+        if is_embed:
+            key = "embed_no_decay" if no_decay else "embed_decay"
+        else:
+            key = "main_no_decay" if no_decay else "main_decay"
+        grouped_params[key].append(param)
+
+    out = []
+    for key in ("main_decay", "embed_decay", "main_no_decay", "embed_no_decay"):
+        params = grouped_params[key]
+        if len(params) == 0:
+            continue
+        lr_scale = 0.5 if key.startswith("embed_") else 1.0
+        group_weight_decay = 0.0 if key.endswith("_no_decay") else float(weight_decay)
+        out.append(
+            {
+                "params": params,
+                "weight_decay": group_weight_decay,
+                "lr_scale": lr_scale,
+                "lr": float(base_lr) * lr_scale,
+            }
+        )
+    return out
+
+
+def load_optimizer_state_compat(optimizer: torch.optim.Optimizer, state_dict: dict) -> str:
+    try:
+        optimizer.load_state_dict(state_dict)
+        return "loaded"
+    except ValueError:
+        pass
+
+    if not isinstance(state_dict, dict):
+        return "failed"
+    saved_groups = state_dict.get("param_groups")
+    saved_state = state_dict.get("state")
+    if not isinstance(saved_groups, list) or not isinstance(saved_state, dict):
+        return "failed"
+
+    saved_flat_ids = []
+    for group in saved_groups:
+        params = group.get("params", [])
+        if not isinstance(params, list):
+            return "failed"
+        saved_flat_ids.extend(params)
+
+    current_state = optimizer.state_dict()
+    current_flat_ids = []
+    for group in current_state.get("param_groups", []):
+        params = group.get("params", [])
+        if not isinstance(params, list):
+            return "failed"
+        current_flat_ids.extend(params)
+
+    if len(saved_flat_ids) != len(current_flat_ids):
+        return "failed"
+
+    migrated_state = {}
+    for new_id, old_id in zip(current_flat_ids, saved_flat_ids):
+        old_entry = saved_state.get(old_id)
+        if old_entry is not None:
+            migrated_state[new_id] = old_entry
+
+    current_state["state"] = migrated_state
+    optimizer.load_state_dict(current_state)
+    return "migrated"
+
+
 def topk_grad_norms(named_parameters, k: int = 5):
     rows = []
     for name, param in named_parameters:
@@ -629,6 +859,31 @@ def adaptive_clip_grad_(parameters, clip_factor=0.01, eps=1e-3, grad_eps=1e-6):
             clipped += 1
 
     return (clipped, total)
+
+
+def extract_attn_entropy_metrics(attn_state: Optional[dict]) -> dict:
+    out = {}
+    if not isinstance(attn_state, dict):
+        return out
+    for scope_name, scope_key in (
+        ("encoder_layers", "enc"),
+        ("decoder_self_layers", "dec_self"),
+        ("decoder_cross_layers", "dec_cross"),
+    ):
+        entries = attn_state.get(scope_name, [])
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            layer = entry.get("layer")
+            if not isinstance(layer, int):
+                continue
+            value = entry.get("attn_entropy")
+            if not isinstance(value, (float, int)):
+                continue
+            out[f"attn_entropy_{scope_key}_l{layer}"] = float(value)
+    return out
 
 
 def _collate_shift_sanity(collate_fn: CollatePad, pad_id: int) -> None:
@@ -730,6 +985,7 @@ def main():
     parser.add_argument("--enc_layers", type=int, default=6)  # must match dec_layers
     parser.add_argument("--dec_layers", type=int, default=6)  # must match enc_layers
     parser.add_argument("--ff_mult", type=int, default=4)
+    parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--tie_embeddings", action="store_true")
     parser.add_argument("--attn_impl", type=str, default="sdpa", choices=["sdpa", "eager"])
     parser.add_argument(
@@ -763,11 +1019,17 @@ def main():
     # training
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument(
+        "--grad_accum_steps",
+        type=int,
+        default=1,
+        help="Number of micro-batches to accumulate before optimizer step.",
+    )
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["adam", "adamw"])
     parser.add_argument("--warmup_ratio", type=float, default=0.02)
-    parser.add_argument("--schedule", type=str, default="cosine", choices=["cosine", "flat"])
+    parser.add_argument("--schedule", type=str, default="cosine", choices=["cosine", "flat", "stair"])
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument(
         "--grad_clip_mode",
@@ -801,8 +1063,32 @@ def main():
     parser.add_argument("--test_steps", type=int, default=0)
     parser.add_argument("--run_probes", type=int, default=0)
     parser.add_argument("--probe_file", type=str, default=None)
+    parser.add_argument(
+        "--probe_layers",
+        type=str,
+        default="",
+        help="Comma-separated layer indices to probe (e.g. 0,1,5). Default uses probe-debug defaults.",
+    )
     parser.add_argument("--probe_topk_eigs", type=int, default=5)
     parser.add_argument("--probe_gen_tokens", type=int, default=48)
+    parser.add_argument(
+        "--probe_attn_entropy",
+        dest="probe_attn_entropy",
+        action="store_true",
+        help="Capture attention entropy metrics during probe runs.",
+    )
+    parser.add_argument(
+        "--no_probe_attn_entropy",
+        dest="probe_attn_entropy",
+        action="store_false",
+        help="Disable attention entropy capture during probe runs.",
+    )
+    parser.set_defaults(probe_attn_entropy=True)
+    parser.add_argument(
+        "--track_attn_entropy",
+        action="store_true",
+        help="Track mean attention entropy for encoder/self-cross decoder attention on training batches.",
+    )
 
     # performance
     parser.add_argument("--num_workers", type=int, default=4)
@@ -887,6 +1173,7 @@ def main():
     probe_tokenizer = None
     probe_prompts = []
     probe_file_path = None
+    probe_layers = None
     if int(args.run_probes) > 0:
         if not args.tokenizer:
             raise SystemExit("--run_probes requires --tokenizer so probes can be encoded.")
@@ -901,6 +1188,7 @@ def main():
             override_probe_file=args.probe_file,
         )
         probe_prompts = parse_probe_prompts(probe_file_path)
+        probe_layers = parse_probe_layers(args.probe_layers, total_layers=int(args.enc_layers))
 
     fixed_len = getattr(train_dataset, "fixed_len", False)
     collate_fn = CollatePad(args.max_seq_len, args.pad_id, fixed_len)
@@ -967,18 +1255,23 @@ def main():
 
     if args.enc_layers != args.dec_layers:
         raise SystemExit("--enc_layers must equal --dec_layers for TransformerV1.")
+    if int(args.grad_accum_steps) <= 0:
+        raise SystemExit("--grad_accum_steps must be > 0.")
     if args.grad_clip_mode == "global" and args.clip_grad <= 0:
         raise SystemExit("--clip_grad must be > 0 when --grad_clip_mode=global.")
     if args.grad_clip_mode == "agc" and args.agc_clip_factor <= 0:
         raise SystemExit("--agc_clip_factor must be > 0 when --grad_clip_mode=agc.")
     if args.grad_clip_mode == "agc" and args.agc_eps <= 0:
         raise SystemExit("--agc_eps must be > 0 when --grad_clip_mode=agc.")
+    if args.dropout < 0.0 or args.dropout >= 1.0:
+        raise SystemExit("--dropout must be in [0.0, 1.0).")
 
     cfg = LMConfig(
         vocab_size=args.vocab_size,
         embed_size=args.d_model,
         num_heads=args.n_heads,
         mlp_ratio=args.ff_mult,
+        dropout=args.dropout,
         layers=args.enc_layers,
         max_seq_len=args.max_seq_len,
         tie_embeds=args.tie_embeddings,
@@ -991,34 +1284,59 @@ def main():
         layerscale_init=args.layerscale_init,
     )
     model = TransformerV1(cfg).to(device)
+    r_metric_param_groups = build_r_metric_param_groups(model, tie_embeddings=bool(args.tie_embeddings))
+
+    param_groups = build_optimizer_param_groups(
+        model=model,
+        base_lr=float(args.lr),
+        weight_decay=float(args.weight_decay),
+        tie_embeddings=bool(args.tie_embeddings),
+    )
 
     if args.optimizer == "adam":
-        opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        opt = torch.optim.Adam(param_groups, lr=args.lr, weight_decay=0.0)
     else:
         opt = torch.optim.AdamW(
-            model.parameters(), 
+            param_groups,
             lr=args.lr,
             betas=(0.9, 0.95),
             eps=1e-5,
-            weight_decay=args.weight_decay,
+            weight_decay=0.0,
         )
 
-    total_steps = args.max_steps if args.max_steps is not None else args.epochs * len(train_loader)
+    updates_per_epoch = max(1, math.ceil(len(train_loader) / float(max(1, int(args.grad_accum_steps)))))
+    total_steps = args.max_steps if args.max_steps is not None else args.epochs * updates_per_epoch
     warmup_steps = max(1, int(total_steps * args.warmup_ratio))
     scheduler = WarmupScheduler(opt, args.lr, warmup_steps, total_steps, schedule=args.schedule)
 
     global_step = 0
+    resume_epoch = 0
+    resume_batch_in_epoch = 0
+    restored_log_accum_state = None
+    restored_lr_anneal_state = None
+    optimizer_resume_status = "none"
     if args.checkpoint is not None:
         ckpt_file = os.path.join(LOGDIR, args.run_id, f"step_{args.checkpoint}.tar")
         checkpoint = torch.load(ckpt_file, map_location="cpu")
         model.load_state_dict(checkpoint["model_state_dict"])
-        opt.load_state_dict(checkpoint["optimizer_state_dict"])
+        optimizer_resume_status = load_optimizer_state_compat(opt, checkpoint["optimizer_state_dict"])
+        if optimizer_resume_status == "failed":
+            raise RuntimeError("Unable to load optimizer checkpoint with current parameter-group layout.")
         global_step = int(checkpoint.get("global_step", 0))
-        scheduler.step_num = global_step
+        scheduler.step_num = int(checkpoint.get("scheduler_step_num", global_step))
+        resume_epoch = int(checkpoint.get("epoch", 0))
+        resume_batch_in_epoch = int(checkpoint.get("batch_in_epoch", 0))
+        restored_log_accum_state = checkpoint.get("log_accum_state")
+        restored_lr_anneal_state = checkpoint.get("lr_anneal_state")
+        restore_rng_state(checkpoint.get("rng_state"))
 
     logger = Logger(args.run_id, args.checkpoint)
     log_params(model, logger)
     logger.log(f"batch size: {args.batch_size}")
+    logger.log(
+        f"grad accumulation: {int(args.grad_accum_steps)} "
+        f"(effective batch size: {int(args.batch_size) * int(args.grad_accum_steps)})"
+    )
     logger.log(f"Run start time: {str(datetime.datetime.now())}")
     logger.log(f"Running on {device}\n")
     logger.log(f"Config: {vars(cfg)}\n")
@@ -1070,19 +1388,54 @@ def main():
         logger.log(f"grad clipping: adaptive (clip_factor={args.agc_clip_factor}, eps={args.agc_eps})")
     else:
         logger.log("grad clipping: none")
+    logger.log("weight decay: all bias parameters excluded from decay.")
+    if args.tie_embeddings:
+        logger.log("weight decay: tied embedding weight excluded from decay.")
+    logger.log("optimizer lr scaling: _embed parameters use 0.5x base LR.")
+    logger.log(
+        "lr anneal (EWMA plateau): "
+        f"alpha={LR_ANNEAL_ALPHA}, ratio_up={LR_ANNEAL_RATIO_UP}, hold={LR_ANNEAL_HOLD}, "
+        f"cooldown={LR_ANNEAL_COOLDOWN}, factor={LR_ANNEAL_FACTOR}, min_lr={LR_ANNEAL_MIN_LR}, "
+        f"check_interval={LR_ANNEAL_CHECK_INTERVAL}"
+    )
+    if args.optimizer in ("adam", "adamw"):
+        logger.log("R metric: Adam first-moment norm / weight norm (fallback to raw grad ratio before state init).")
+    else:
+        logger.log("R metric: raw grad norm / weight norm.")
+    r_group_counts = {k: len(v) for k, v in r_metric_param_groups.items()}
+    logger.log(
+        "R metric groups (trainable tensors): "
+        f"embed={r_group_counts['embed']}, "
+        f"atten={r_group_counts['atten']}, "
+        f"mlp={r_group_counts['mlp']}, "
+        f"lm_head={r_group_counts['lm_head']}"
+    )
     logger.log(
         f"sanity: special tokens pad={args.pad_id}, eos={args.eos_id}, "
         f"bos={args.bos_id}, vocab={args.vocab_size}"
     )
     if int(args.run_probes) > 0:
+        probe_layers_label = "default(first,last)" if probe_layers is None else ",".join(str(x) for x in probe_layers)
         logger.log(
             f"probe debug cadence: every {args.run_probes} steps | prompts={len(probe_prompts)} | "
-            f"probe_file={probe_file_path}"
+            f"probe_file={probe_file_path} | probe_layers={probe_layers_label}"
         )
         if len(probe_prompts) != 5:
             logger.log(f"warning: expected 5 probes, found {len(probe_prompts)} in {probe_file_path}")
+    logger.log(f"attention entropy (train batches): {'on' if args.track_attn_entropy else 'off'}")
+    logger.log(f"attention entropy (probe runs): {'on' if args.probe_attn_entropy else 'off'}")
+    if args.track_attn_entropy and args.activation_checkpointing:
+        logger.log("note: attention entropy capture bypasses activation checkpointing on training forwards.")
+    if args.checkpoint is not None:
+        logger.log(
+            f"resume checkpoint: step={global_step}, epoch={resume_epoch}, "
+            f"batch_in_epoch={resume_batch_in_epoch}"
+        )
+        if optimizer_resume_status == "migrated":
+            logger.log("resume checkpoint: optimizer state migrated across parameter-group layout.")
 
     model.train()
+    opt.zero_grad(set_to_none=True)
     tokens_since_log = 0
     loss_sum_since_log = 0.0
     entropy_sum_since_log = 0.0
@@ -1090,20 +1443,101 @@ def main():
     pre_grad_norm_steps_since_log = 0
     post_grad_norm_sum_since_log = 0.0
     post_grad_norm_steps_since_log = 0
+    r_sum_since_log = 0.0
+    r_steps_since_log = 0
+    r_group_sum_since_log = {k: 0.0 for k in R_METRIC_GROUP_KEYS}
+    r_group_steps_since_log = {k: 0 for k in R_METRIC_GROUP_KEYS}
+    attn_entropy_sum_since_log = defaultdict(float)
+    attn_entropy_count_since_log = defaultdict(int)
     agc_clipped_params_since_log = 0
     agc_total_params_since_log = 0
     running_ce_window = deque()
     running_ce_tokens = 0
     running_ce_loss_sum = 0.0
+    ema_loss = None
+    best_ema = float("inf")
+    bad_count = 0
+    cooldown_count = 0
+    accum_micro_count = 0
+    accum_tokens_for_backward = 0
+    accum_has_grad = False
     log_start = time.perf_counter()
     did_sanity = False
 
     batches_per_epoch = max(1, len(train_loader))
-    for epoch in range(args.epochs):
+    if resume_batch_in_epoch >= batches_per_epoch:
+        resume_epoch += int(resume_batch_in_epoch // batches_per_epoch)
+        resume_batch_in_epoch = int(resume_batch_in_epoch % batches_per_epoch)
+
+    if isinstance(restored_log_accum_state, dict):
+        tokens_since_log = int(restored_log_accum_state.get("tokens_since_log", 0))
+        loss_sum_since_log = float(restored_log_accum_state.get("loss_sum_since_log", 0.0))
+        entropy_sum_since_log = float(restored_log_accum_state.get("entropy_sum_since_log", 0.0))
+        pre_grad_norm_sum_since_log = float(restored_log_accum_state.get("pre_grad_norm_sum_since_log", 0.0))
+        pre_grad_norm_steps_since_log = int(restored_log_accum_state.get("pre_grad_norm_steps_since_log", 0))
+        post_grad_norm_sum_since_log = float(restored_log_accum_state.get("post_grad_norm_sum_since_log", 0.0))
+        post_grad_norm_steps_since_log = int(restored_log_accum_state.get("post_grad_norm_steps_since_log", 0))
+        r_sum_since_log = float(restored_log_accum_state.get("r_sum_since_log", 0.0))
+        r_steps_since_log = int(restored_log_accum_state.get("r_steps_since_log", 0))
+        restored_r_group_sum = restored_log_accum_state.get("r_group_sum_since_log", {})
+        restored_r_group_steps = restored_log_accum_state.get("r_group_steps_since_log", {})
+        if isinstance(restored_r_group_sum, dict):
+            for k in R_METRIC_GROUP_KEYS:
+                v = restored_r_group_sum.get(k)
+                if isinstance(v, (int, float)):
+                    r_group_sum_since_log[k] = float(v)
+        if isinstance(restored_r_group_steps, dict):
+            for k in R_METRIC_GROUP_KEYS:
+                v = restored_r_group_steps.get(k)
+                if isinstance(v, (int, float)):
+                    r_group_steps_since_log[k] = int(v)
+        agc_clipped_params_since_log = int(restored_log_accum_state.get("agc_clipped_params_since_log", 0))
+        agc_total_params_since_log = int(restored_log_accum_state.get("agc_total_params_since_log", 0))
+        running_ce_tokens = int(restored_log_accum_state.get("running_ce_tokens", 0))
+        running_ce_loss_sum = float(restored_log_accum_state.get("running_ce_loss_sum", 0.0))
+        running_ce_list = restored_log_accum_state.get("running_ce_window", [])
+        if isinstance(running_ce_list, list):
+            running_ce_window = deque()
+            for row in running_ce_list:
+                if not isinstance(row, (list, tuple)) or len(row) != 2:
+                    continue
+                tok_count = int(row[0])
+                loss_sum_val = float(row[1])
+                if tok_count <= 0:
+                    continue
+                running_ce_window.append([tok_count, loss_sum_val])
+        attn_sum_map = restored_log_accum_state.get("attn_entropy_sum_since_log", {})
+        attn_count_map = restored_log_accum_state.get("attn_entropy_count_since_log", {})
+        if isinstance(attn_sum_map, dict):
+            for k, v in attn_sum_map.items():
+                if isinstance(k, str) and isinstance(v, (float, int)):
+                    attn_entropy_sum_since_log[k] = float(v)
+        if isinstance(attn_count_map, dict):
+            for k, v in attn_count_map.items():
+                if isinstance(k, str) and isinstance(v, (float, int)):
+                    attn_entropy_count_since_log[k] = int(v)
+    if isinstance(restored_lr_anneal_state, dict):
+        restored_ema = restored_lr_anneal_state.get("ema_loss")
+        if isinstance(restored_ema, (float, int)) and math.isfinite(float(restored_ema)):
+            ema_loss = float(restored_ema)
+        restored_best = restored_lr_anneal_state.get("best_ema")
+        if isinstance(restored_best, (float, int)) and math.isfinite(float(restored_best)):
+            best_ema = float(restored_best)
+        bad_count = int(restored_lr_anneal_state.get("bad_count", 0))
+        cooldown_count = int(restored_lr_anneal_state.get("cooldown_count", 0))
+
+    # Checkpoints are emitted only at optimizer-step boundaries, so resume starts with a clean accumulation window.
+    accum_micro_count = 0
+    accum_tokens_for_backward = 0
+    accum_has_grad = False
+
+    for epoch in range(resume_epoch, args.epochs):
         sampler.set_epoch(epoch)
         for batch_idx, batch in enumerate(train_loader, start=1):
             if args.max_steps is not None and global_step >= args.max_steps:
                 break
+            if epoch == resume_epoch and batch_idx <= resume_batch_in_epoch:
+                continue
 
             input_ids, target_ids, loss_mask = batch
             input_ids = input_ids.to(device, non_blocking=pin_memory)
@@ -1120,21 +1554,97 @@ def main():
                 logger.log("sanity: target shift and loss-mask checks passed on first batch")
                 did_sanity = True
 
-            logits = model(input_ids, pad_mask=attn_pad_mask)
+            step_attn_entropy = {}
+            if args.track_attn_entropy:
+                logits, attn_state = model(input_ids, pad_mask=attn_pad_mask, return_attn_entropy=True)
+                step_attn_entropy = extract_attn_entropy_metrics(attn_state)
+            else:
+                logits = model(input_ids, pad_mask=attn_pad_mask)
             flat_mask = loss_mask.reshape(-1)
             token_count = int(flat_mask.sum().item())
-            if token_count <= 0:
-                continue
-            flat_logits = logits.reshape(-1, args.vocab_size)[flat_mask]
-            flat_targets = target_ids.reshape(-1)[flat_mask]
-            loss_sum = F.cross_entropy(flat_logits, flat_targets, reduction="sum")
-            loss = loss_sum / float(token_count)
-            if not torch.isfinite(loss):
-                raise FloatingPointError(f"Non-finite training loss at step {global_step + 1}.")
+            loss_sum_value = 0.0
+            if token_count > 0:
+                flat_logits = logits.reshape(-1, args.vocab_size)[flat_mask]
+                flat_targets = target_ids.reshape(-1)[flat_mask]
+                loss_sum = F.cross_entropy(flat_logits, flat_targets, reduction="sum")
+                loss = loss_sum / float(token_count)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(f"Non-finite training loss at step {global_step + 1}.")
+                loss_sum.backward()
+                accum_tokens_for_backward += token_count
+                accum_has_grad = True
 
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            pre_grad_norm = global_grad_norm(model.parameters())
+                with torch.no_grad():
+                    log_probs = F.log_softmax(logits, dim=-1)
+                    probs = log_probs.exp()
+                    entropy = -(probs * log_probs).sum(dim=-1)
+                    entropy_sum = float(entropy[loss_mask].sum().item())
+
+                loss_sum_value = float(loss_sum.item())
+                loss_item = float(loss.item())
+                if ema_loss is None:
+                    ema_loss = loss_item
+                else:
+                    ema_loss = (LR_ANNEAL_ALPHA * loss_item) + ((1.0 - LR_ANNEAL_ALPHA) * ema_loss)
+                loss_sum_since_log += loss_sum_value
+                tokens_since_log += token_count
+                entropy_sum_since_log += entropy_sum
+                for attn_key, attn_value in step_attn_entropy.items():
+                    if not math.isfinite(float(attn_value)):
+                        continue
+                    attn_entropy_sum_since_log[attn_key] += float(attn_value)
+                    attn_entropy_count_since_log[attn_key] += 1
+                running_ce_window.append([token_count, loss_sum_value])
+                running_ce_tokens += token_count
+                running_ce_loss_sum += loss_sum_value
+
+            while running_ce_tokens > RUNNING_CE_WINDOW_TOKENS and len(running_ce_window) > 0:
+                overflow = running_ce_tokens - RUNNING_CE_WINDOW_TOKENS
+                oldest_tokens, oldest_loss_sum = running_ce_window[0]
+                if oldest_tokens <= overflow:
+                    running_ce_tokens -= oldest_tokens
+                    running_ce_loss_sum -= oldest_loss_sum
+                    running_ce_window.popleft()
+                    continue
+
+                trim_ratio = float(overflow) / float(max(1, oldest_tokens))
+                trimmed_loss = oldest_loss_sum * trim_ratio
+                keep_tokens = oldest_tokens - overflow
+                keep_loss = oldest_loss_sum - trimmed_loss
+                running_ce_window[0] = [keep_tokens, keep_loss]
+                running_ce_tokens -= overflow
+                running_ce_loss_sum -= trimmed_loss
+
+            accum_micro_count += 1
+            do_optimizer_step = (
+                accum_micro_count >= int(args.grad_accum_steps)
+                or batch_idx >= batches_per_epoch
+            )
+            if not do_optimizer_step:
+                continue
+
+            if not accum_has_grad:
+                opt.zero_grad(set_to_none=True)
+                accum_micro_count = 0
+                accum_tokens_for_backward = 0
+                accum_has_grad = False
+                continue
+
+            grad_scale = 1.0 / float(max(1, accum_tokens_for_backward))
+            for param in model.parameters():
+                if param.grad is not None:
+                    param.grad.detach().mul_(grad_scale)
+
+            pre_grad_norm, _pre_weight_norm, r_grad, r_m1 = grad_weight_stats(
+                model.parameters(), optimizer=opt
+            )
+            r_value = r_m1 if math.isfinite(r_m1) else r_grad
+            r_values_by_group = {}
+            for group_name in R_METRIC_GROUP_KEYS:
+                r_values_by_group[group_name] = compute_r_value(
+                    r_metric_param_groups.get(group_name, []),
+                    optimizer=opt,
+                )
             if args.grad_clip_mode == "global":
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
                 post_grad_norm = global_grad_norm(model.parameters())
@@ -1154,42 +1664,55 @@ def main():
                 top_grad_norms_for_log = topk_grad_norms(model.named_parameters(), k=5)
             opt.step()
             lr = scheduler.step()
-
-            with torch.no_grad():
-                log_probs = F.log_softmax(logits, dim=-1)
-                probs = log_probs.exp()
-                entropy = -(probs * log_probs).sum(dim=-1)
-                entropy_sum = float(entropy[loss_mask].sum().item())
-
+            opt.zero_grad(set_to_none=True)
             global_step += 1
-            loss_sum_value = float(loss_sum.item())
-            loss_sum_since_log += loss_sum_value
-            tokens_since_log += token_count
-            entropy_sum_since_log += entropy_sum
+
+            if (
+                LR_ANNEAL_CHECK_INTERVAL > 0
+                and global_step % LR_ANNEAL_CHECK_INTERVAL == 0
+                and ema_loss is not None
+            ):
+                best_ema = min(best_ema, ema_loss)
+                if cooldown_count > 0:
+                    cooldown_count -= 1
+                else:
+                    if ema_loss > (LR_ANNEAL_RATIO_UP * best_ema):
+                        bad_count += 1
+                    else:
+                        bad_count = 0
+
+                    if bad_count >= LR_ANNEAL_HOLD:
+                        base_lr_now = max(float(lr), 1e-12)
+                        updated_lrs = []
+                        for group in opt.param_groups:
+                            current_lr = float(group.get("lr", 0.0))
+                            new_lr = max(current_lr * LR_ANNEAL_FACTOR, LR_ANNEAL_MIN_LR)
+                            group["lr"] = new_lr
+                            group["lr_scale"] = new_lr / base_lr_now
+                            updated_lrs.append(new_lr)
+                        bad_count = 0
+                        cooldown_count = LR_ANNEAL_COOLDOWN
+                        logger.log(
+                            "LR anneal "
+                            f"step={global_step} ema_loss={ema_loss:.6f} "
+                            f"best_ema={best_ema:.6f} "
+                            f"new_lrs={[f'{x:.6e}' for x in updated_lrs]}"
+                        )
+
             pre_grad_norm_sum_since_log += pre_grad_norm
             pre_grad_norm_steps_since_log += 1
             post_grad_norm_sum_since_log += post_grad_norm
             post_grad_norm_steps_since_log += 1
-            running_ce_window.append([token_count, loss_sum_value])
-            running_ce_tokens += token_count
-            running_ce_loss_sum += loss_sum_value
-
-            while running_ce_tokens > RUNNING_CE_WINDOW_TOKENS and len(running_ce_window) > 0:
-                overflow = running_ce_tokens - RUNNING_CE_WINDOW_TOKENS
-                oldest_tokens, oldest_loss_sum = running_ce_window[0]
-                if oldest_tokens <= overflow:
-                    running_ce_tokens -= oldest_tokens
-                    running_ce_loss_sum -= oldest_loss_sum
-                    running_ce_window.popleft()
+            r_sum_since_log += r_value
+            r_steps_since_log += 1
+            for group_name, group_r in r_values_by_group.items():
+                if not math.isfinite(group_r):
                     continue
-
-                trim_ratio = float(overflow) / float(max(1, oldest_tokens))
-                trimmed_loss = oldest_loss_sum * trim_ratio
-                keep_tokens = oldest_tokens - overflow
-                keep_loss = oldest_loss_sum - trimmed_loss
-                running_ce_window[0] = [keep_tokens, keep_loss]
-                running_ce_tokens -= overflow
-                running_ce_loss_sum -= trimmed_loss
+                r_group_sum_since_log[group_name] += float(group_r)
+                r_group_steps_since_log[group_name] += 1
+            accum_micro_count = 0
+            accum_tokens_for_backward = 0
+            accum_has_grad = False
 
             if global_step % args.log_every == 0:
                 if device == "mps":
@@ -1203,6 +1726,14 @@ def main():
                 avg_entropy = float(entropy_sum_since_log) / float(max(1, tokens_since_log))
                 avg_pre_grad_norm = float(pre_grad_norm_sum_since_log) / float(max(1, pre_grad_norm_steps_since_log))
                 avg_post_grad_norm = float(post_grad_norm_sum_since_log) / float(max(1, post_grad_norm_steps_since_log))
+                avg_r = float(r_sum_since_log) / float(max(1, r_steps_since_log))
+                avg_r_by_group = {}
+                for group_name in R_METRIC_GROUP_KEYS:
+                    steps = int(r_group_steps_since_log.get(group_name, 0))
+                    if steps <= 0:
+                        avg_r_by_group[group_name] = float("nan")
+                    else:
+                        avg_r_by_group[group_name] = float(r_group_sum_since_log[group_name]) / float(steps)
                 train_running_ce = float(running_ce_loss_sum) / float(max(1, running_ce_tokens))
 
                 log_msg = (
@@ -1211,11 +1742,26 @@ def main():
                     f"train_running_ce: {train_running_ce:.6f} nats/token ({running_ce_tokens} tok), "
                     f"Train PPL: {avg_ppl:.4f}, Train Entropy: {avg_entropy:.6f}, "
                     f"GradNorm(pre={avg_pre_grad_norm:.4f}, post={avg_post_grad_norm:.4f}), "
+                    f"R: {avg_r:.6e}, "
+                    f"R_embed: {avg_r_by_group['embed']:.6e}, "
+                    f"R_atten: {avg_r_by_group['atten']:.6e}, "
+                    f"R_mlp: {avg_r_by_group['mlp']:.6e}, "
+                    f"R_lm_head: {avg_r_by_group['lm_head']:.6e}, "
                     f"Tokens/s: {toks_per_sec:.2f}, LR: {lr:.6e}"
                 )
                 if args.grad_clip_mode == "agc":
                     frac = float(agc_clipped_params_since_log) / float(max(1, agc_total_params_since_log))
                     log_msg += f", AGC clipped params: {agc_clipped_params_since_log}/{agc_total_params_since_log} ({frac:.1%})"
+                if args.track_attn_entropy and len(attn_entropy_count_since_log) > 0:
+                    ent_parts = []
+                    for k in sorted(attn_entropy_count_since_log.keys()):
+                        count = int(attn_entropy_count_since_log.get(k, 0))
+                        if count <= 0:
+                            continue
+                        avg_v = float(attn_entropy_sum_since_log.get(k, 0.0)) / float(count)
+                        ent_parts.append(f"{k}={avg_v:.6f}")
+                    if ent_parts:
+                        log_msg += ", " + ", ".join(ent_parts)
                 log_msg += f", {format_top_grad_norms(top_grad_norms_for_log)}"
                 logger.log(log_msg)
 
@@ -1227,6 +1773,12 @@ def main():
                 pre_grad_norm_steps_since_log = 0
                 post_grad_norm_sum_since_log = 0.0
                 post_grad_norm_steps_since_log = 0
+                r_sum_since_log = 0.0
+                r_steps_since_log = 0
+                r_group_sum_since_log = {k: 0.0 for k in R_METRIC_GROUP_KEYS}
+                r_group_steps_since_log = {k: 0 for k in R_METRIC_GROUP_KEYS}
+                attn_entropy_sum_since_log = defaultdict(float)
+                attn_entropy_count_since_log = defaultdict(int)
                 agc_clipped_params_since_log = 0
                 agc_total_params_since_log = 0
 
@@ -1260,6 +1812,8 @@ def main():
                     step=int(global_step),
                     topk_eigs=max(1, int(args.probe_topk_eigs)),
                     generate_max_new_tokens=max(0, int(args.probe_gen_tokens)),
+                    probe_layers=probe_layers,
+                    capture_attn_entropy=bool(args.probe_attn_entropy),
                     log_fn=logger.log,
                     log_detailed_metrics=False,
                 )
@@ -1283,13 +1837,46 @@ def main():
 
             if global_step % args.ckpt_every == 0:
                 ckpt_path = os.path.join(LOGDIR, args.run_id, f"step_{global_step}.tar")
-                if args.checkpoint is not None:
-                    ckpt_path = os.path.join(LOGDIR, args.run_id, f"step_{global_step}_from_{args.checkpoint}.tar")
+                next_epoch = int(epoch)
+                next_batch_in_epoch = int(batch_idx)
+                if next_batch_in_epoch >= batches_per_epoch:
+                    next_epoch += 1
+                    next_batch_in_epoch = 0
                 torch.save(
                     {
                         "global_step": global_step,
+                        "epoch": next_epoch,
+                        "batch_in_epoch": next_batch_in_epoch,
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": opt.state_dict(),
+                        "scheduler_step_num": int(scheduler.step_num),
+                        "rng_state": capture_rng_state(),
+                        "lr_anneal_state": {
+                            "ema_loss": None if ema_loss is None else float(ema_loss),
+                            "best_ema": float(best_ema),
+                            "bad_count": int(bad_count),
+                            "cooldown_count": int(cooldown_count),
+                        },
+                        "log_accum_state": {
+                            "tokens_since_log": int(tokens_since_log),
+                            "loss_sum_since_log": float(loss_sum_since_log),
+                            "entropy_sum_since_log": float(entropy_sum_since_log),
+                            "pre_grad_norm_sum_since_log": float(pre_grad_norm_sum_since_log),
+                            "pre_grad_norm_steps_since_log": int(pre_grad_norm_steps_since_log),
+                            "post_grad_norm_sum_since_log": float(post_grad_norm_sum_since_log),
+                            "post_grad_norm_steps_since_log": int(post_grad_norm_steps_since_log),
+                            "r_sum_since_log": float(r_sum_since_log),
+                            "r_steps_since_log": int(r_steps_since_log),
+                            "r_group_sum_since_log": {k: float(v) for k, v in r_group_sum_since_log.items()},
+                            "r_group_steps_since_log": {k: int(v) for k, v in r_group_steps_since_log.items()},
+                            "agc_clipped_params_since_log": int(agc_clipped_params_since_log),
+                            "agc_total_params_since_log": int(agc_total_params_since_log),
+                            "running_ce_tokens": int(running_ce_tokens),
+                            "running_ce_loss_sum": float(running_ce_loss_sum),
+                            "running_ce_window": [list(x) for x in running_ce_window],
+                            "attn_entropy_sum_since_log": dict(attn_entropy_sum_since_log),
+                            "attn_entropy_count_since_log": dict(attn_entropy_count_since_log),
+                        },
                         "config": cfg.__dict__,
                     },
                     ckpt_path,
