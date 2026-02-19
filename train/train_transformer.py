@@ -765,7 +765,7 @@ def build_optimizer_param_groups(
         if key.startswith("embed_"):
             lr_scale = 0.5
         elif key == "lm_head_no_decay":
-            lr_scale = 0.5 if half_lr_lm_head else 1.0
+            lr_scale = 0.125 if half_lr_lm_head else 1.0
         else:
             lr_scale = 1.0
         group_weight_decay = 0.0 if key.endswith("_no_decay") or key == "embed_decay" else float(weight_decay)
@@ -1336,7 +1336,7 @@ def main():
     if args.checkpoint is not None:
         ckpt_file = os.path.join(LOGDIR, args.run_id, f"step_{args.checkpoint}.tar")
         checkpoint = torch.load(ckpt_file, map_location="cpu")
-        model.load_state_dict(checkpoint["model_state_dict"])
+        model.load_state_dict(checkpoint["model_state_dict"], weights_only=False)
         optimizer_resume_status = load_optimizer_state_compat(opt, checkpoint["optimizer_state_dict"])
         if optimizer_resume_status == "failed":
             raise RuntimeError("Unable to load optimizer checkpoint with current parameter-group layout.")
