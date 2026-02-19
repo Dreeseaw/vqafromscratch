@@ -918,13 +918,15 @@ def evaluate_model(
     device: str,
     pad_id: int,
     vocab_size: int,
+    z_loss_coef: float = 0.0,
     max_tokens: int = 0,
     max_steps: int = 0,
     pin_memory: bool = False,
 ):
     model_was_training = model.training
     model.eval()
-    total_loss_sum = 0.0
+    total_ce_loss_sum = 0.0
+    total_z_loss_sum = 0.0
     total_tokens = 0
     total_entropy_sum = 0.0
     total_steps = 0
@@ -943,14 +945,17 @@ def evaluate_model(
             continue
         flat_logits = logits.reshape(-1, vocab_size)[flat_mask]
         flat_targets = target_ids.reshape(-1)[flat_mask]
-        loss_sum = F.cross_entropy(flat_logits, flat_targets, reduction="sum")
+        ce_loss_sum = F.cross_entropy(flat_logits, flat_targets, reduction="sum")
+        log_z = torch.logsumexp(flat_logits, dim=-1)
+        z_loss_sum = log_z.square().sum()
 
         log_probs = F.log_softmax(logits, dim=-1)
         probs = log_probs.exp()
         entropy = -(probs * log_probs).sum(dim=-1)
         entropy_sum = float(entropy[loss_mask].sum().item())
 
-        total_loss_sum += float(loss_sum.item())
+        total_ce_loss_sum += float(ce_loss_sum.item())
+        total_z_loss_sum += float(z_loss_sum.item())
         total_tokens += token_count
         total_entropy_sum += entropy_sum
         total_steps += 1
@@ -960,7 +965,9 @@ def evaluate_model(
         if max_tokens > 0 and total_tokens >= max_tokens:
             break
 
-    ce = total_loss_sum / float(max(1, total_tokens))
+    ce = total_ce_loss_sum / float(max(1, total_tokens))
+    z_loss = total_z_loss_sum / float(max(1, total_tokens))
+    objective = ce + (float(z_loss_coef) * z_loss)
     ppl = _safe_exp(ce)
     mean_entropy = total_entropy_sum / float(max(1, total_tokens))
 
@@ -968,6 +975,8 @@ def evaluate_model(
         model.train()
     return {
         "ce": ce,
+        "z_loss": z_loss,
+        "objective": objective,
         "ppl": ppl,
         "entropy": mean_entropy,
         "tokens": total_tokens,
@@ -1048,6 +1057,12 @@ def main():
     parser.add_argument("--warmup_ratio", type=float, default=0.02)
     parser.add_argument("--schedule", type=str, default="cosine", choices=["cosine", "flat", "stair"])
     parser.add_argument("--max_steps", type=int, default=None)
+    parser.add_argument(
+        "--z_loss_coef",
+        type=float,
+        default=0.0,
+        help="Coefficient for z-loss regularization: lambda * mean(logsumexp(logits)^2).",
+    )
     parser.add_argument(
         "--grad_clip_mode",
         type=str,
@@ -1282,6 +1297,8 @@ def main():
         raise SystemExit("--agc_eps must be > 0 when --grad_clip_mode=agc.")
     if args.dropout < 0.0 or args.dropout >= 1.0:
         raise SystemExit("--dropout must be in [0.0, 1.0).")
+    if args.z_loss_coef < 0.0:
+        raise SystemExit("--z_loss_coef must be >= 0.")
 
     cfg = LMConfig(
         vocab_size=args.vocab_size,
@@ -1411,6 +1428,7 @@ def main():
     logger.log("optimizer lr scaling: _embed parameters use 0.5x base LR.")
     if args.half_lr_lm_head:
         logger.log("optimizer lr scaling: _unembed parameters use 0.5x base LR.")
+    logger.log(f"z-loss regularization coef: {args.z_loss_coef}")
     logger.log(
         "lr anneal (EWMA plateau): "
         f"alpha={LR_ANNEAL_ALPHA}, ratio_up={LR_ANNEAL_RATIO_UP}, hold={LR_ANNEAL_HOLD}, "
@@ -1457,6 +1475,7 @@ def main():
     opt.zero_grad(set_to_none=True)
     tokens_since_log = 0
     loss_sum_since_log = 0.0
+    z_loss_sum_since_log = 0.0
     entropy_sum_since_log = 0.0
     pre_grad_norm_sum_since_log = 0.0
     pre_grad_norm_steps_since_log = 0
@@ -1491,6 +1510,7 @@ def main():
     if isinstance(restored_log_accum_state, dict):
         tokens_since_log = int(restored_log_accum_state.get("tokens_since_log", 0))
         loss_sum_since_log = float(restored_log_accum_state.get("loss_sum_since_log", 0.0))
+        z_loss_sum_since_log = float(restored_log_accum_state.get("z_loss_sum_since_log", 0.0))
         entropy_sum_since_log = float(restored_log_accum_state.get("entropy_sum_since_log", 0.0))
         pre_grad_norm_sum_since_log = float(restored_log_accum_state.get("pre_grad_norm_sum_since_log", 0.0))
         pre_grad_norm_steps_since_log = int(restored_log_accum_state.get("pre_grad_norm_steps_since_log", 0))
@@ -1585,11 +1605,14 @@ def main():
             if token_count > 0:
                 flat_logits = logits.reshape(-1, args.vocab_size)[flat_mask]
                 flat_targets = target_ids.reshape(-1)[flat_mask]
-                loss_sum = F.cross_entropy(flat_logits, flat_targets, reduction="sum")
-                loss = loss_sum / float(token_count)
-                if not torch.isfinite(loss):
+                ce_loss_sum = F.cross_entropy(flat_logits, flat_targets, reduction="sum")
+                log_z = torch.logsumexp(flat_logits, dim=-1)
+                z_loss_sum = log_z.square().sum()
+                total_loss_sum = ce_loss_sum + (float(args.z_loss_coef) * z_loss_sum)
+                total_loss = total_loss_sum / float(token_count)
+                if not torch.isfinite(total_loss):
                     raise FloatingPointError(f"Non-finite training loss at step {global_step + 1}.")
-                loss_sum.backward()
+                total_loss_sum.backward()
                 accum_tokens_for_backward += token_count
                 accum_has_grad = True
 
@@ -1599,13 +1622,15 @@ def main():
                     entropy = -(probs * log_probs).sum(dim=-1)
                     entropy_sum = float(entropy[loss_mask].sum().item())
 
-                loss_sum_value = float(loss_sum.item())
-                loss_item = float(loss.item())
+                loss_sum_value = float(ce_loss_sum.item())
+                z_loss_sum_value = float(z_loss_sum.item())
+                objective_item = (loss_sum_value + (float(args.z_loss_coef) * z_loss_sum_value)) / float(token_count)
                 if ema_loss is None:
-                    ema_loss = loss_item
+                    ema_loss = objective_item
                 else:
-                    ema_loss = (LR_ANNEAL_ALPHA * loss_item) + ((1.0 - LR_ANNEAL_ALPHA) * ema_loss)
+                    ema_loss = (LR_ANNEAL_ALPHA * objective_item) + ((1.0 - LR_ANNEAL_ALPHA) * ema_loss)
                 loss_sum_since_log += loss_sum_value
+                z_loss_sum_since_log += z_loss_sum_value
                 tokens_since_log += token_count
                 entropy_sum_since_log += entropy_sum
                 for attn_key, attn_value in step_attn_entropy.items():
@@ -1741,6 +1766,8 @@ def main():
                 toks_per_sec = float(tokens_since_log) / elapsed
                 epoch_pct = min(100.0, 100.0 * float(batch_idx) / float(batches_per_epoch))
                 avg_ce = float(loss_sum_since_log) / float(max(1, tokens_since_log))
+                avg_z_loss = float(z_loss_sum_since_log) / float(max(1, tokens_since_log))
+                avg_objective = avg_ce + (float(args.z_loss_coef) * avg_z_loss)
                 avg_ppl = _safe_exp(avg_ce)
                 avg_entropy = float(entropy_sum_since_log) / float(max(1, tokens_since_log))
                 avg_pre_grad_norm = float(pre_grad_norm_sum_since_log) / float(max(1, pre_grad_norm_steps_since_log))
@@ -1758,6 +1785,8 @@ def main():
                 log_msg = (
                     f"\nEpoch: {epoch + 1}/{args.epochs} ({epoch_pct:.2f}%), "
                     f"Step: {global_step}, Train CE: {avg_ce:.6f} nats/token, "
+                    f"Train Z: {avg_z_loss:.6f}, "
+                    f"Train Obj: {avg_objective:.6f}, "
                     f"train_running_ce: {train_running_ce:.6f} nats/token ({running_ce_tokens} tok), "
                     f"Train PPL: {avg_ppl:.4f}, Train Entropy: {avg_entropy:.6f}, "
                     f"GradNorm(pre={avg_pre_grad_norm:.4f}, post={avg_post_grad_norm:.4f}), "
@@ -1787,6 +1816,7 @@ def main():
                 log_start = time.perf_counter()
                 tokens_since_log = 0
                 loss_sum_since_log = 0.0
+                z_loss_sum_since_log = 0.0
                 entropy_sum_since_log = 0.0
                 pre_grad_norm_sum_since_log = 0.0
                 pre_grad_norm_steps_since_log = 0
@@ -1808,6 +1838,7 @@ def main():
                     device=device,
                     pad_id=args.pad_id,
                     vocab_size=args.vocab_size,
+                    z_loss_coef=args.z_loss_coef,
                     max_tokens=0,
                     max_steps=0,
                     pin_memory=pin_memory,
@@ -1815,6 +1846,7 @@ def main():
                 logger.log(
                     "Validation "
                     f"Step={global_step} CE={val_metrics['ce']:.6f} nats/token "
+                    f"Z={val_metrics['z_loss']:.6f} Obj={val_metrics['objective']:.6f} "
                     f"PPL={val_metrics['ppl']:.4f} Entropy={val_metrics['entropy']:.6f} "
                     f"tokens={val_metrics['tokens']} steps={val_metrics['steps']}"
                 )
@@ -1879,6 +1911,7 @@ def main():
                         "log_accum_state": {
                             "tokens_since_log": int(tokens_since_log),
                             "loss_sum_since_log": float(loss_sum_since_log),
+                            "z_loss_sum_since_log": float(z_loss_sum_since_log),
                             "entropy_sum_since_log": float(entropy_sum_since_log),
                             "pre_grad_norm_sum_since_log": float(pre_grad_norm_sum_since_log),
                             "pre_grad_norm_steps_since_log": int(pre_grad_norm_steps_since_log),
@@ -1910,6 +1943,7 @@ def main():
         device=device,
         pad_id=args.pad_id,
         vocab_size=args.vocab_size,
+        z_loss_coef=args.z_loss_coef,
         max_tokens=max(0, int(args.test_max_tokens)),
         max_steps=max(0, int(args.test_steps)),
         pin_memory=pin_memory,
@@ -1917,6 +1951,7 @@ def main():
     logger.log(
         "Test "
         f"CE={test_metrics['ce']:.6f} nats/token "
+        f"Z={test_metrics['z_loss']:.6f} Obj={test_metrics['objective']:.6f} "
         f"PPL={test_metrics['ppl']:.4f} Entropy={test_metrics['entropy']:.6f} "
         f"tokens={test_metrics['tokens']} steps={test_metrics['steps']}"
     )
