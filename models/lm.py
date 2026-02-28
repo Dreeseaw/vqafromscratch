@@ -56,6 +56,34 @@ def _masked_mean_std(values: torch.Tensor, keep_mask: Optional[torch.Tensor] = N
     return mean, std
 
 
+def _masked_rms(values: torch.Tensor, keep_mask: Optional[torch.Tensor] = None) -> float:
+    vals = values.detach().float()
+    if keep_mask is not None:
+        mask = keep_mask.to(device=vals.device, dtype=torch.bool)
+        while mask.dim() < vals.dim():
+            mask = mask.unsqueeze(-1)
+        mask = mask.expand_as(vals)
+        selected = vals[mask]
+    else:
+        selected = vals.reshape(-1)
+    if selected.numel() == 0:
+        return float("nan")
+    return float(torch.sqrt(torch.mean(selected * selected)).item())
+
+
+def _capture_norm_rms(
+    debug_capture: Optional[Dict[str, Any]],
+    prefix: str,
+    pre: torch.Tensor,
+    post: torch.Tensor,
+    keep_mask: Optional[torch.Tensor],
+) -> None:
+    if debug_capture is None:
+        return
+    debug_capture[f"{prefix}_pre_rms"] = _masked_rms(pre, keep_mask)
+    debug_capture[f"{prefix}_post_rms"] = _masked_rms(post, keep_mask)
+
+
 def _mean_attn_entropy(
     masked_scores: torch.Tensor,
     valid: torch.Tensor,
@@ -124,6 +152,60 @@ def _rms_norm_last_dim(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return x * inv_rms.to(dtype=x.dtype)
 
 
+def clamp_residual(x: torch.Tensor, max_norm: float) -> torch.Tensor:
+    with torch.no_grad():
+        norms = x.norm(dim=-1, keepdim=True)
+        scale = (max_norm / (norms + 1e-8)).clamp(max=1.0)
+    return x.mul_(scale)
+
+
+def cap_vector_norm(
+    x: torch.Tensor,
+    max_norm: float,
+    *,
+    keep_mask: Optional[torch.Tensor] = None,
+    eps: float = 1e-8,
+    mode: str = "token",
+) -> torch.Tensor:
+    """
+    Project vectors onto an L2 ball with radius max_norm.
+
+    x: [B,S,E] or [B,S,H,D]
+    keep_mask: optional [B,S] bool; when provided, only kept rows are capped.
+    mode:
+      - token: norm over last dim
+      - token_head: norm over head dim vectors (same as token for [B,S,H,D], fallback to token for [B,S,E])
+      - token_global: for [B,S,H,D], norm over H and D jointly; for [B,S,E], same as token
+    """
+    if float(max_norm) <= 0.0:
+        return x
+    if mode not in ("token", "token_head", "token_global"):
+        raise ValueError(f"Unsupported cap mode: {mode}")
+    if x.ndim not in (3, 4):
+        raise ValueError(f"cap_vector_norm expects rank 3 or 4 tensor, got shape={tuple(x.shape)}")
+
+    if mode == "token_global" and x.ndim == 4:
+        reduce_dims = (-2, -1)
+    else:
+        reduce_dims = (-1,)
+
+    x_f = x.float()
+    norms = torch.linalg.vector_norm(x_f, ord=2, dim=reduce_dims, keepdim=True)
+    scales = (float(max_norm) / (norms + float(eps))).clamp(max=1.0)
+
+    if keep_mask is not None:
+        if keep_mask.ndim != 2 or keep_mask.shape[0] != x.shape[0] or keep_mask.shape[1] != x.shape[1]:
+            raise ValueError(
+                f"keep_mask must be [B,S] matching x[:2]; got mask={tuple(keep_mask.shape)} x={tuple(x.shape)}"
+            )
+        mask = keep_mask.to(device=x.device, dtype=torch.bool)
+        while mask.dim() < x.dim():
+            mask = mask.unsqueeze(-1)
+        scales = torch.where(mask, scales, torch.ones_like(scales))
+
+    return x * scales.to(dtype=x.dtype)
+
+
 class LMConfig:
     """
     Store all LM configurables - including arch & training params, all in one place
@@ -146,6 +228,12 @@ class LMConfig:
         layerscale: bool = False,
         layerscale_init: float = 1e-5,
         dropout: float = 0.1,
+        resid_max_norm: Optional[float] = None,
+        cap_attn_out_norm: float = 0.0,
+        cap_mlp_out_norm: float = 0.0,
+        cap_out_mode: str = "token",
+        cap_keep_masked: bool = True,
+        logit_softcap: float = 0.0,
         config_file: str = None, 
     ):
         # load defaults/ params first
@@ -165,6 +253,12 @@ class LMConfig:
         self.layerscale = layerscale
         self.layerscale_init = layerscale_init
         self.dropout = dropout
+        self.resid_max_norm = resid_max_norm
+        self.cap_attn_out_norm = cap_attn_out_norm
+        self.cap_mlp_out_norm = cap_mlp_out_norm
+        self.cap_out_mode = cap_out_mode
+        self.cap_keep_masked = cap_keep_masked
+        self.logit_softcap = logit_softcap
         self._config_file = config_file
 
         # if given, overwrite loaded params from yaml
@@ -192,6 +286,21 @@ class LMConfig:
         self.dropout = float(self.dropout)
         if self.dropout < 0.0 or self.dropout >= 1.0:
             raise ValueError("dropout must be in [0.0, 1.0).")
+        if self.resid_max_norm is not None:
+            self.resid_max_norm = float(self.resid_max_norm)
+        self.cap_attn_out_norm = float(self.cap_attn_out_norm)
+        self.cap_mlp_out_norm = float(self.cap_mlp_out_norm)
+        if self.cap_attn_out_norm < 0.0:
+            raise ValueError("cap_attn_out_norm must be >= 0.0.")
+        if self.cap_mlp_out_norm < 0.0:
+            raise ValueError("cap_mlp_out_norm must be >= 0.0.")
+        self.cap_out_mode = str(self.cap_out_mode)
+        if self.cap_out_mode not in ("token", "token_head", "token_global"):
+            raise ValueError("cap_out_mode must be one of: token, token_head, token_global.")
+        self.cap_keep_masked = bool(self.cap_keep_masked)
+        self.logit_softcap = float(self.logit_softcap)
+        if self.logit_softcap < 0.0:
+            raise ValueError("logit_softcap must be >= 0.0.")
 
 
 class RotaryEmbedding(nn.Module):
@@ -251,6 +360,12 @@ class TransformerEncoderBlock(nn.Module):
         self._layerscale = bool(getattr(config, "layerscale", False))
         self._layerscale_init = float(getattr(config, "layerscale_init", 1e-5))
         self._dropout_p = float(getattr(config, "dropout", 0.1))
+        resid_max_norm = getattr(config, "resid_max_norm", None)
+        self._resid_max_norm = math.sqrt(E) if resid_max_norm is None else float(resid_max_norm)
+        self._cap_attn_out_norm = float(getattr(config, "cap_attn_out_norm", 0.0))
+        self._cap_mlp_out_norm = float(getattr(config, "cap_mlp_out_norm", 0.0))
+        self._cap_out_mode = str(getattr(config, "cap_out_mode", "token"))
+        self._cap_keep_masked = bool(getattr(config, "cap_keep_masked", True))
         self._ls_attn = None
         self._ls_mlp = None
         if self._layerscale:
@@ -329,7 +444,7 @@ class TransformerEncoderBlock(nn.Module):
             debug_capture["v_mag_mean"] = v_mean
             debug_capture["v_mag_std"] = v_std
 
-            if capture_attn_scores:
+            if raw_scores is not None and valid is not None:
                 valid_for_scores = valid if valid.shape == raw_scores.shape else valid.expand_as(raw_scores)
                 valid_scores = raw_scores[valid_for_scores]
                 if valid_scores.numel() > 0:
@@ -337,12 +452,19 @@ class TransformerEncoderBlock(nn.Module):
                     debug_capture["attn_score_std"] = float(valid_scores.std(unbiased=False).item())
                     debug_capture["attn_score_min"] = float(valid_scores.min().item())
                     debug_capture["attn_score_max"] = float(valid_scores.max().item())
+                    debug_capture["attn_presoftmax_std"] = float(valid_scores.std(unbiased=False).item())
+                    debug_capture["attn_presoftmax_max"] = float(valid_scores.max().item())
+                    debug_capture["attn_presoftmax_p99"] = float(torch.quantile(valid_scores, 0.99).item())
                 else:
                     debug_capture["attn_score_mean"] = float("nan")
                     debug_capture["attn_score_std"] = float("nan")
                     debug_capture["attn_score_min"] = float("nan")
                     debug_capture["attn_score_max"] = float("nan")
+                    debug_capture["attn_presoftmax_std"] = float("nan")
+                    debug_capture["attn_presoftmax_max"] = float("nan")
+                    debug_capture["attn_presoftmax_p99"] = float("nan")
 
+            if capture_attn_scores:
                 _, probs = _mean_attn_entropy(masked_scores=masked_scores, valid=valid)
                 valid_row = valid.any(dim=-1, keepdim=True)
                 probs = torch.where(valid_row, probs, torch.zeros_like(probs))
@@ -412,7 +534,15 @@ class TransformerEncoderBlock(nn.Module):
         """
         B, S, E = x.shape
         x_residual = x
+        x_pre_norm = x
         x = _rms_norm_last_dim(x, eps=self._rmsnorm_eps)
+        _capture_norm_rms(
+            debug_capture=debug_capture,
+            prefix="norm_attn",
+            pre=x_pre_norm,
+            post=x,
+            keep_mask=(None if pad_mask is None else ~pad_mask),
+        )
         qkv = self._in_proj(x)
         wq, wk, wv = qkv.chunk(3, dim=-1)
         wq = wq.view(B, S, self._num_heads, self._head_dim)
@@ -436,12 +566,39 @@ class TransformerEncoderBlock(nn.Module):
         )
         h = h.transpose(1, 2).contiguous().view(B, S, E)
         attn_out = _apply_layerscale(self._out_proj(h), self._ls_attn)
+        attn_keep_mask = (~pad_mask) if (pad_mask is not None and self._cap_keep_masked) else None
+        attn_out = cap_vector_norm(
+            attn_out,
+            self._cap_attn_out_norm,
+            keep_mask=attn_keep_mask,
+            mode=self._cap_out_mode,
+        )
         x = x_residual + self._resid_dropout(attn_out)
+        if self._resid_max_norm > 0.0:
+            x = clamp_residual(x, self._resid_max_norm)
 
         x_residual = x
+        x_pre_norm = x
         x = _rms_norm_last_dim(x, eps=self._rmsnorm_eps)
+        _capture_norm_rms(
+            debug_capture=debug_capture,
+            prefix="norm_mlp",
+            pre=x_pre_norm,
+            post=x,
+            keep_mask=(None if pad_mask is None else ~pad_mask),
+        )
         mlp_out = _apply_layerscale(self._mlp(x), self._ls_mlp)
-        return x_residual + self._mlp_dropout(mlp_out)
+        mlp_keep_mask = (~pad_mask) if (pad_mask is not None and self._cap_keep_masked) else None
+        mlp_out = cap_vector_norm(
+            mlp_out,
+            self._cap_mlp_out_norm,
+            keep_mask=mlp_keep_mask,
+            mode=self._cap_out_mode,
+        )
+        x = x_residual + self._mlp_dropout(mlp_out)
+        if self._resid_max_norm > 0.0:
+            x = clamp_residual(x, self._resid_max_norm)
+        return x
 
 
 class TransformerDecoderBlock(nn.Module):
@@ -461,6 +618,12 @@ class TransformerDecoderBlock(nn.Module):
         self._layerscale = bool(getattr(config, "layerscale", False))
         self._layerscale_init = float(getattr(config, "layerscale_init", 1e-5))
         self._dropout_p = float(getattr(config, "dropout", 0.1))
+        resid_max_norm = getattr(config, "resid_max_norm", None)
+        self._resid_max_norm = math.sqrt(E) if resid_max_norm is None else float(resid_max_norm)
+        self._cap_attn_out_norm = float(getattr(config, "cap_attn_out_norm", 0.0))
+        self._cap_mlp_out_norm = float(getattr(config, "cap_mlp_out_norm", 0.0))
+        self._cap_out_mode = str(getattr(config, "cap_out_mode", "token"))
+        self._cap_keep_masked = bool(getattr(config, "cap_keep_masked", True))
         self._ls_self_attn = None
         self._ls_cross_attn = None
         self._ls_mlp = None
@@ -547,7 +710,7 @@ class TransformerDecoderBlock(nn.Module):
             debug_capture["v_mag_mean"] = v_mean
             debug_capture["v_mag_std"] = v_std
 
-            if capture_attn_scores:
+            if raw_scores is not None and valid is not None:
                 valid_for_scores = valid if valid.shape == raw_scores.shape else valid.expand_as(raw_scores)
                 valid_scores = raw_scores[valid_for_scores]
                 if valid_scores.numel() > 0:
@@ -555,12 +718,19 @@ class TransformerDecoderBlock(nn.Module):
                     debug_capture["attn_score_std"] = float(valid_scores.std(unbiased=False).item())
                     debug_capture["attn_score_min"] = float(valid_scores.min().item())
                     debug_capture["attn_score_max"] = float(valid_scores.max().item())
+                    debug_capture["attn_presoftmax_std"] = float(valid_scores.std(unbiased=False).item())
+                    debug_capture["attn_presoftmax_max"] = float(valid_scores.max().item())
+                    debug_capture["attn_presoftmax_p99"] = float(torch.quantile(valid_scores, 0.99).item())
                 else:
                     debug_capture["attn_score_mean"] = float("nan")
                     debug_capture["attn_score_std"] = float("nan")
                     debug_capture["attn_score_min"] = float("nan")
                     debug_capture["attn_score_max"] = float("nan")
+                    debug_capture["attn_presoftmax_std"] = float("nan")
+                    debug_capture["attn_presoftmax_max"] = float("nan")
+                    debug_capture["attn_presoftmax_p99"] = float("nan")
 
+            if capture_attn_scores:
                 _, probs = _mean_attn_entropy(masked_scores=masked_scores, valid=valid)
                 valid_row = valid.any(dim=-1, keepdim=True)
                 probs = torch.where(valid_row, probs, torch.zeros_like(probs))
@@ -636,7 +806,15 @@ class TransformerDecoderBlock(nn.Module):
         """
         (B, S, E) = x.shape
         x_residual = x
+        x_pre_norm = x
         x = _rms_norm_last_dim(x, eps=self._rmsnorm_eps)
+        _capture_norm_rms(
+            debug_capture=self_debug_capture,
+            prefix="norm_self_attn",
+            pre=x_pre_norm,
+            post=x,
+            keep_mask=(None if self_pad_mask is None else ~self_pad_mask),
+        )
         qkv = self._self_in_proj(x)
         wq, wk, wv = qkv.chunk(3, dim=-1)
         wq = wq.view(B, S, self._num_heads, self._head_dim)
@@ -660,12 +838,37 @@ class TransformerDecoderBlock(nn.Module):
         )
         h1 = h1.transpose(1, 2).contiguous().view(B, S, E)
         self_attn_out = _apply_layerscale(self._self_out_proj(h1), self._ls_self_attn)
+        self_keep_mask = (~self_pad_mask) if (self_pad_mask is not None and self._cap_keep_masked) else None
+        self_attn_out = cap_vector_norm(
+            self_attn_out,
+            self._cap_attn_out_norm,
+            keep_mask=self_keep_mask,
+            mode=self._cap_out_mode,
+        )
         x = x_residual + self._resid_dropout(self_attn_out)
+        if self._resid_max_norm > 0.0:
+            x = clamp_residual(x, self._resid_max_norm)
 
         # Cross attention third
         x_residual = x
+        x_pre_norm = x
+        kv_pre_norm = kv
         x = _rms_norm_last_dim(x, eps=self._rmsnorm_eps)
         kv = _rms_norm_last_dim(kv, eps=self._rmsnorm_eps)
+        _capture_norm_rms(
+            debug_capture=cross_debug_capture,
+            prefix="norm_cross_x",
+            pre=x_pre_norm,
+            post=x,
+            keep_mask=(None if self_pad_mask is None else ~self_pad_mask),
+        )
+        _capture_norm_rms(
+            debug_capture=cross_debug_capture,
+            prefix="norm_cross_kv",
+            pre=kv_pre_norm,
+            post=kv,
+            keep_mask=(None if enc_pad_mask is None else ~enc_pad_mask),
+        )
 
         wq2 = self._cross_q(x)
         wk2, wv2 = self._cross_kv(kv).chunk(2, dim=-1)
@@ -690,18 +893,44 @@ class TransformerDecoderBlock(nn.Module):
         )
         h2 = h2.transpose(1, 2).contiguous().view(B, S, E)
         cross_attn_out = _apply_layerscale(self._cross_out_proj(h2), self._ls_cross_attn)
+        cross_attn_out = cap_vector_norm(
+            cross_attn_out,
+            self._cap_attn_out_norm,
+            keep_mask=self_keep_mask,
+            mode=self._cap_out_mode,
+        )
         x = x_residual + self._resid_dropout(cross_attn_out)
+        if self._resid_max_norm > 0.0:
+            x = clamp_residual(x, self._resid_max_norm)
 
         x_residual = x
+        x_pre_norm = x
         x = _rms_norm_last_dim(x, eps=self._rmsnorm_eps)
+        _capture_norm_rms(
+            debug_capture=cross_debug_capture,
+            prefix="norm_mlp",
+            pre=x_pre_norm,
+            post=x,
+            keep_mask=(None if self_pad_mask is None else ~self_pad_mask),
+        )
         mlp_out = _apply_layerscale(self._mlp(x), self._ls_mlp)
-        return x_residual + self._mlp_dropout(mlp_out)
+        mlp_out = cap_vector_norm(
+            mlp_out,
+            self._cap_mlp_out_norm,
+            keep_mask=self_keep_mask,
+            mode=self._cap_out_mode,
+        )
+        x = x_residual + self._mlp_dropout(mlp_out)
+        if self._resid_max_norm > 0.0:
+            x = clamp_residual(x, self._resid_max_norm)
+        return x
 
 
 class TransformerV1(nn.Module):
     def __init__(self, config: LMConfig):
         super().__init__()
         self._config = config
+        self._logit_softcap = float(getattr(config, "logit_softcap", 0.0))
         # self._embed = nn.Linear(config.vocab_size, config.embed_size, bias=False)
         self._embed = nn.Embedding(config.vocab_size, config.embed_size)
         self._embed_dropout = nn.Dropout(float(getattr(config, "dropout", 0.1)))
@@ -721,7 +950,11 @@ class TransformerV1(nn.Module):
 
             out: [B, E] tensor (logits)
         """
-        return self._unembed(h)
+        logits = self._unembed(h)
+        if self._logit_softcap > 0.0:
+            cap = self._logit_softcap
+            logits = cap * torch.tanh(logits / cap)
+        return logits
 
     def _encode(
         self,

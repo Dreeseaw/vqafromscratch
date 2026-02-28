@@ -377,16 +377,36 @@ def run_debug_probes(
                     "v_mag_mean",
                     "v_mag_std",
                     "attn_entropy",
+                    "norm_attn_pre_rms",
+                    "norm_attn_post_rms",
+                    "norm_self_attn_pre_rms",
+                    "norm_self_attn_post_rms",
+                    "norm_cross_x_pre_rms",
+                    "norm_cross_x_post_rms",
+                    "norm_cross_kv_pre_rms",
+                    "norm_cross_kv_post_rms",
+                    "norm_mlp_pre_rms",
+                    "norm_mlp_post_rms",
                 ):
                     if metric_name in entry:
                         metric_val = _to_float(entry[metric_name])
                         probe_metrics[f"{prefix}_{metric_name}"] = metric_val
                         agg_values.setdefault(metric_name, []).append(metric_val)
-                for score_name in ("attn_score_mean", "attn_score_std", "attn_score_min", "attn_score_max"):
+                for score_name in (
+                    "attn_score_mean",
+                    "attn_score_std",
+                    "attn_score_min",
+                    "attn_score_max",
+                    "attn_presoftmax_std",
+                    "attn_presoftmax_max",
+                    "attn_presoftmax_p99",
+                ):
                     if score_name in entry:
                         score_val = _to_float(entry[score_name])
                         probe_metrics[f"{prefix}_{score_name}"] = score_val
                         agg_values.setdefault(score_name, []).append(score_val)
+                        if score_name.startswith("attn_presoftmax_"):
+                            agg_values.setdefault(f"{scope_key}_{score_name}", []).append(score_val)
 
                 if latest_attention is None and "attn_prob_grid" in entry:
                     grid_shape = entry["attn_prob_grid"].shape if torch.is_tensor(entry["attn_prob_grid"]) else ()
@@ -521,6 +541,28 @@ def run_debug_probes(
         "v_mag_mean": _mean_finite(agg_values.get("v_mag_mean", [])),
         "v_mag_std": _mean_finite(agg_values.get("v_mag_std", [])),
         "attn_score_mean": _mean_finite(agg_values.get("attn_score_mean", [])),
+        "attn_presoftmax_std": _mean_finite(agg_values.get("attn_presoftmax_std", [])),
+        "attn_presoftmax_max": _mean_finite(agg_values.get("attn_presoftmax_max", [])),
+        "attn_presoftmax_p99": _mean_finite(agg_values.get("attn_presoftmax_p99", [])),
+        "enc_self_attn_presoftmax_std": _mean_finite(agg_values.get("enc_attn_presoftmax_std", [])),
+        "enc_self_attn_presoftmax_max": _mean_finite(agg_values.get("enc_attn_presoftmax_max", [])),
+        "enc_self_attn_presoftmax_p99": _mean_finite(agg_values.get("enc_attn_presoftmax_p99", [])),
+        "dec_self_attn_presoftmax_std": _mean_finite(agg_values.get("dec_self_attn_presoftmax_std", [])),
+        "dec_self_attn_presoftmax_max": _mean_finite(agg_values.get("dec_self_attn_presoftmax_max", [])),
+        "dec_self_attn_presoftmax_p99": _mean_finite(agg_values.get("dec_self_attn_presoftmax_p99", [])),
+        "cross_attn_presoftmax_std": _mean_finite(agg_values.get("dec_cross_attn_presoftmax_std", [])),
+        "cross_attn_presoftmax_max": _mean_finite(agg_values.get("dec_cross_attn_presoftmax_max", [])),
+        "cross_attn_presoftmax_p99": _mean_finite(agg_values.get("dec_cross_attn_presoftmax_p99", [])),
+        "norm_attn_pre_rms": _mean_finite(agg_values.get("norm_attn_pre_rms", [])),
+        "norm_attn_post_rms": _mean_finite(agg_values.get("norm_attn_post_rms", [])),
+        "norm_self_attn_pre_rms": _mean_finite(agg_values.get("norm_self_attn_pre_rms", [])),
+        "norm_self_attn_post_rms": _mean_finite(agg_values.get("norm_self_attn_post_rms", [])),
+        "norm_cross_x_pre_rms": _mean_finite(agg_values.get("norm_cross_x_pre_rms", [])),
+        "norm_cross_x_post_rms": _mean_finite(agg_values.get("norm_cross_x_post_rms", [])),
+        "norm_cross_kv_pre_rms": _mean_finite(agg_values.get("norm_cross_kv_pre_rms", [])),
+        "norm_cross_kv_post_rms": _mean_finite(agg_values.get("norm_cross_kv_post_rms", [])),
+        "norm_mlp_pre_rms": _mean_finite(agg_values.get("norm_mlp_pre_rms", [])),
+        "norm_mlp_post_rms": _mean_finite(agg_values.get("norm_mlp_post_rms", [])),
         "embed_pair_cos_mean": _mean_finite(agg_values.get("embed_pair_cos_mean", [])),
         "enc_l0_pair_cos_mean": _mean_finite(agg_values.get("enc_l0_pair_cos_mean", [])),
         "enc_last_pair_cos_mean": _mean_finite(agg_values.get("enc_last_pair_cos_mean", [])),

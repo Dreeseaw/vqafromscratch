@@ -7,6 +7,9 @@ new run
 continue from weights (in this case, from step 4000)
 > python3 -m train.train_transformer my_run_id --train_data /path/to/tokens.npy --checkpoint 4000
 
+branch-output capping example (disable residual clamp)
+> python3 -m train.train_transformer my_run_id --train_data /path/to/tokens.npy --resid_max_norm 0 --cap_attn_out_norm 1.0 --cap_mlp_out_norm 1.0 --cap_out_mode token
+
 results saved in
 - /logs/<run_id>/logfile.txt
 - /logs/<run_id>/step_N.tar
@@ -20,7 +23,7 @@ import random
 import argparse
 import datetime
 from collections import defaultdict, deque
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -42,6 +45,7 @@ LOGFILE = "logfile.txt"
 SEED = 35
 RUNNING_CE_WINDOW_TOKENS = 200_000
 R_METRIC_GROUP_KEYS = ("embed", "atten", "mlp", "lm_head")
+GRAD_SPLIT_GROUP_KEYS = ("embed", "attn_qkv", "attn_out", "mlp", "lm_head")
 LR_ANNEAL_ALPHA = 0.02
 LR_ANNEAL_RATIO_UP = 1.01
 LR_ANNEAL_HOLD = 8
@@ -49,6 +53,7 @@ LR_ANNEAL_COOLDOWN = 8
 LR_ANNEAL_FACTOR = 0.5
 LR_ANNEAL_MIN_LR = 1e-6
 LR_ANNEAL_CHECK_INTERVAL = 500
+ROW_MAX_NORM_C = 2.0
 
 # Length buckets (inclusive ranges) for bucketed batching
 BUCKET_RANGES = [
@@ -129,7 +134,7 @@ class TokenDataset(Dataset):
                 raise ValueError(f"Expected integer .npy, got {arr.dtype} for {path}")
             return arr
         if path.endswith(".pt"):
-            obj = torch.load(path, map_location="cpu")
+            obj = torch.load(path, map_location="cpu", weights_only=False)
             if isinstance(obj, dict):
                 if "input_ids" in obj:
                     obj = obj["input_ids"]
@@ -667,6 +672,20 @@ def compute_r_value(parameters: Sequence[nn.Parameter], optimizer: Optional[torc
     return float(r_m1 if math.isfinite(r_m1) else r_grad)
 
 
+def grad_norm_for_params(parameters: Sequence[nn.Parameter]) -> float:
+    grad_sq = 0.0
+    found = False
+    for param in parameters:
+        if param.grad is None:
+            continue
+        grad = param.grad.detach()
+        grad_sq += float(torch.sum(grad * grad).item())
+        found = True
+    if not found:
+        return float("nan")
+    return float(math.sqrt(max(grad_sq, 0.0)))
+
+
 def _is_attention_param_name(name: str) -> bool:
     attn_markers = (
         "._in_proj.",
@@ -697,6 +716,67 @@ def _metric_group_for_param(name: str) -> Optional[str]:
     if _is_attention_param_name(name):
         return "atten"
     return None
+
+
+def _is_attn_qkv_param_name(name: str) -> bool:
+    markers = (
+        "._in_proj.",
+        "._self_in_proj.",
+        "._cross_q.",
+        "._cross_kv.",
+        ".q_proj.",
+        ".k_proj.",
+        ".v_proj.",
+    )
+    return any(marker in name for marker in markers)
+
+
+def _is_attn_out_param_name(name: str) -> bool:
+    markers = (
+        "._out_proj.",
+        "._self_out_proj.",
+        "._cross_out_proj.",
+        ".out_proj.",
+    )
+    return any(marker in name for marker in markers)
+
+
+def _grad_split_group_for_param(name: str) -> Optional[str]:
+    if name.startswith("_embed."):
+        return "embed"
+    if name.startswith("_unembed."):
+        return "lm_head"
+    if _is_mlp_param_name(name):
+        return "mlp"
+    if _is_attn_qkv_param_name(name):
+        return "attn_qkv"
+    if _is_attn_out_param_name(name):
+        return "attn_out"
+    return None
+
+
+def build_grad_split_param_groups(model: nn.Module, tie_embeddings: bool) -> Dict[str, List[nn.Parameter]]:
+    out: Dict[str, List[nn.Parameter]] = {k: [] for k in GRAD_SPLIT_GROUP_KEYS}
+    seen_ids: Dict[str, set] = {k: set() for k in GRAD_SPLIT_GROUP_KEYS}
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        group_name = _grad_split_group_for_param(str(name))
+        if group_name is None:
+            continue
+        pid = id(param)
+        if pid in seen_ids[group_name]:
+            continue
+        out[group_name].append(param)
+        seen_ids[group_name].add(pid)
+
+    if tie_embeddings:
+        shared_param = model._unembed.weight
+        shared_id = id(shared_param)
+        if shared_id not in seen_ids["lm_head"]:
+            out["lm_head"].append(shared_param)
+            seen_ids["lm_head"].add(shared_id)
+    return out
 
 
 def build_r_metric_param_groups(model: nn.Module, tie_embeddings: bool) -> Dict[str, List[nn.Parameter]]:
@@ -873,6 +953,69 @@ def adaptive_clip_grad_(parameters, clip_factor=0.01, eps=1e-3, grad_eps=1e-6):
     return (clipped, total)
 
 
+def collect_row_max_norm_targets(model: nn.Module) -> List[nn.Parameter]:
+    targets: List[nn.Parameter] = []
+    seen_ids = set()
+
+    def _add_param(param: Optional[torch.Tensor]) -> None:
+        if not isinstance(param, nn.Parameter):
+            return
+        pid = id(param)
+        if pid in seen_ids:
+            return
+        targets.append(param)
+        seen_ids.add(pid)
+
+    lm_head = getattr(model, "lm_head", None)
+    lm_head_weight = getattr(lm_head, "weight", None)
+    _add_param(lm_head_weight)
+
+    # TransformerV1 stores the LM head in _unembed when lm_head is not exposed.
+    if not isinstance(lm_head_weight, nn.Parameter):
+        _add_param(getattr(getattr(model, "_unembed", None), "weight", None))
+
+    # Cover common split-qkv naming as well as this repo's packed-qkv naming.
+    attn_weight_suffixes = (
+        "q_proj.weight",
+        "k_proj.weight",
+        "v_proj.weight",
+        "out_proj.weight",
+        "_in_proj.weight",
+        "_self_in_proj.weight",
+        "_cross_q.weight",
+        "_cross_kv.weight",
+        "_out_proj.weight",
+        "_self_out_proj.weight",
+        "_cross_out_proj.weight",
+    )
+    for name, param in model.named_parameters():
+        if name.endswith(attn_weight_suffixes):
+            _add_param(param)
+
+    return targets
+
+
+def apply_row_max_norm_projection_(
+    params: Sequence[nn.Parameter], c: float = ROW_MAX_NORM_C
+) -> Tuple[int, int]:
+    affected_params = 0
+    total_params = 0
+    if len(params) == 0:
+        return (affected_params, total_params)
+    with torch.no_grad():
+        for weight in params:
+            if weight.ndim != 2:
+                continue
+            total_params += int(weight.numel())
+            norms = weight.norm(dim=1, keepdim=True)
+            affected_rows = int((norms > c).sum().item())
+            if affected_rows > 0:
+                affected_params += affected_rows * int(weight.shape[1])
+            scale = torch.clamp(c / (norms + 1e-8), max=1.0)
+            weight.mul_(scale)
+    return (affected_params, total_params)
+
+
 def extract_attn_entropy_metrics(attn_state: Optional[dict]) -> dict:
     out = {}
     if not isinstance(attn_state, dict):
@@ -918,6 +1061,7 @@ def evaluate_model(
     device: str,
     pad_id: int,
     vocab_size: int,
+    z_loss_enable: bool = False,
     z_loss_coef: float = 0.0,
     max_tokens: int = 0,
     max_steps: int = 0,
@@ -946,8 +1090,11 @@ def evaluate_model(
         flat_logits = logits.reshape(-1, vocab_size)[flat_mask]
         flat_targets = target_ids.reshape(-1)[flat_mask]
         ce_loss_sum = F.cross_entropy(flat_logits, flat_targets, reduction="sum")
-        log_z = torch.logsumexp(flat_logits, dim=-1)
-        z_loss_sum = log_z.square().sum()
+        if z_loss_enable:
+            log_z = torch.logsumexp(flat_logits, dim=-1)
+            z_loss_sum = log_z.square().sum()
+        else:
+            z_loss_sum = ce_loss_sum.new_zeros(())
 
         log_probs = F.log_softmax(logits, dim=-1)
         probs = log_probs.exp()
@@ -1036,6 +1183,44 @@ def main():
         default=1e-5,
         help="Initial LayerScale value (used when --layerscale is set).",
     )
+    parser.add_argument(
+        "--logit_softcap",
+        type=float,
+        default=0.0,
+        help="Apply logit softcapping with cap t as t * tanh(logits / t). Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--resid_max_norm",
+        type=float,
+        default=None,
+        help="Residual-stream clamp max norm. Set <=0 to disable (legacy behavior default is sqrt(d_model)).",
+    )
+    parser.add_argument(
+        "--cap_attn_out_norm",
+        type=float,
+        default=0.0,
+        help="Cap norm of attention branch output (after out-proj + LayerScale, before dropout/add). 0 disables.",
+    )
+    parser.add_argument(
+        "--cap_mlp_out_norm",
+        type=float,
+        default=0.0,
+        help="Cap norm of MLP branch output (after LayerScale, before dropout/add). 0 disables.",
+    )
+    parser.add_argument(
+        "--cap_out_mode",
+        type=str,
+        default="token",
+        choices=["token", "token_head", "token_global"],
+        help="Vector-norm capping mode for branch outputs.",
+    )
+    parser.add_argument(
+        "--cap_keep_masked",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="When 1, exclude masked/pad rows from branch-output capping.",
+    )
 
     # training
     parser.add_argument("--epochs", type=int, default=10)
@@ -1058,10 +1243,20 @@ def main():
     parser.add_argument("--schedule", type=str, default="cosine", choices=["cosine", "flat", "stair"])
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument(
+        "--lr_anneal_enable",
+        action="store_true",
+        help="Enable EWMA-plateau LR annealing on top of the scheduler.",
+    )
+    parser.add_argument(
+        "--z_loss_enable",
+        action="store_true",
+        help="Enable z-loss regularization term in the training objective.",
+    )
+    parser.add_argument(
         "--z_loss_coef",
         type=float,
         default=0.0,
-        help="Coefficient for z-loss regularization: lambda * mean(logsumexp(logits)^2).",
+        help="Coefficient for z-loss regularization (used when --z_loss_enable is set).",
     )
     parser.add_argument(
         "--grad_clip_mode",
@@ -1087,6 +1282,17 @@ def main():
         type=float,
         default=1e-3,
         help="AGC minimum parameter norm epsilon.",
+    )
+    parser.add_argument(
+        "--row_max_norm_enable",
+        action="store_true",
+        help="Apply row-wise max-norm projection after optimizer.step() to attention q/k/v/out projection weights and lm_head.",
+    )
+    parser.add_argument(
+        "--row_max_norm_c",
+        type=float,
+        default=ROW_MAX_NORM_C,
+        help="Row-wise max-norm cap c for projection (used when --row_max_norm_enable is set).",
     )
     parser.add_argument("--eval_every_steps", type=int, default=1000)
     parser.add_argument("--val_max_tokens", type=int, default=200000)
@@ -1127,6 +1333,12 @@ def main():
     parser.add_argument("--persistent_workers", action="store_true")
     parser.add_argument("--prefetch_factor", type=int, default=1)
     parser.add_argument("--log_every", type=int, default=10)
+    parser.add_argument(
+        "--grad_split_every",
+        type=int,
+        default=250,
+        help="Log low-frequency pre-clip grad norms by module every N optimizer steps (0 disables).",
+    )
     parser.add_argument("--ckpt_every", type=int, default=2000)
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--bucket_width", type=int, default=64)
@@ -1297,8 +1509,23 @@ def main():
         raise SystemExit("--agc_eps must be > 0 when --grad_clip_mode=agc.")
     if args.dropout < 0.0 or args.dropout >= 1.0:
         raise SystemExit("--dropout must be in [0.0, 1.0).")
+    if args.logit_softcap < 0.0:
+        raise SystemExit("--logit_softcap must be >= 0.0.")
+    if args.cap_attn_out_norm < 0.0:
+        raise SystemExit("--cap_attn_out_norm must be >= 0.0.")
+    if args.cap_mlp_out_norm < 0.0:
+        raise SystemExit("--cap_mlp_out_norm must be >= 0.0.")
     if args.z_loss_coef < 0.0:
         raise SystemExit("--z_loss_coef must be >= 0.")
+    if args.row_max_norm_c <= 0.0:
+        raise SystemExit("--row_max_norm_c must be > 0.")
+    if int(args.grad_split_every) < 0:
+        raise SystemExit("--grad_split_every must be >= 0.")
+    if args.resid_max_norm is None:
+        args.resid_max_norm = math.sqrt(float(args.d_model))
+    z_loss_enabled = bool(args.z_loss_enable)
+    z_loss_coef = float(args.z_loss_coef) if z_loss_enabled else 0.0
+    lr_anneal_enabled = bool(args.lr_anneal_enable)
 
     cfg = LMConfig(
         vocab_size=args.vocab_size,
@@ -1316,9 +1543,16 @@ def main():
         v_rmsnorm=args.v_rmsnorm,
         layerscale=args.layerscale,
         layerscale_init=args.layerscale_init,
+        logit_softcap=args.logit_softcap,
+        resid_max_norm=float(args.resid_max_norm),
+        cap_attn_out_norm=float(args.cap_attn_out_norm),
+        cap_mlp_out_norm=float(args.cap_mlp_out_norm),
+        cap_out_mode=str(args.cap_out_mode),
+        cap_keep_masked=bool(int(args.cap_keep_masked)),
     )
     model = TransformerV1(cfg).to(device)
     r_metric_param_groups = build_r_metric_param_groups(model, tie_embeddings=bool(args.tie_embeddings))
+    grad_split_param_groups = build_grad_split_param_groups(model, tie_embeddings=bool(args.tie_embeddings))
 
     param_groups = build_optimizer_param_groups(
         model=model,
@@ -1335,7 +1569,7 @@ def main():
             param_groups,
             lr=args.lr,
             betas=(0.9, 0.95),
-            eps=1e-5,
+            eps=1e-6,
             weight_decay=0.0,
         )
 
@@ -1343,6 +1577,7 @@ def main():
     total_steps = args.max_steps if args.max_steps is not None else args.epochs * updates_per_epoch
     warmup_steps = max(1, int(total_steps * args.warmup_ratio))
     scheduler = WarmupScheduler(opt, args.lr, warmup_steps, total_steps, schedule=args.schedule)
+    row_max_norm_targets = collect_row_max_norm_targets(model) if args.row_max_norm_enable else []
 
     global_step = 0
     resume_epoch = 0
@@ -1352,8 +1587,8 @@ def main():
     optimizer_resume_status = "none"
     if args.checkpoint is not None:
         ckpt_file = os.path.join(LOGDIR, args.run_id, f"step_{args.checkpoint}.tar")
-        checkpoint = torch.load(ckpt_file, map_location="cpu")
-        model.load_state_dict(checkpoint["model_state_dict"], weights_only=False)
+        checkpoint = torch.load(ckpt_file, map_location="cpu", weights_only=False)
+        model.load_state_dict(checkpoint["model_state_dict"])
         optimizer_resume_status = load_optimizer_state_compat(opt, checkpoint["optimizer_state_dict"])
         if optimizer_resume_status == "failed":
             raise RuntimeError("Unable to load optimizer checkpoint with current parameter-group layout.")
@@ -1428,13 +1663,42 @@ def main():
     logger.log("optimizer lr scaling: _embed parameters use 0.5x base LR.")
     if args.half_lr_lm_head:
         logger.log("optimizer lr scaling: _unembed parameters use 0.5x base LR.")
-    logger.log(f"z-loss regularization coef: {args.z_loss_coef}")
+    if args.row_max_norm_enable:
+        logger.log(
+            f"row max-norm projection: on (c={args.row_max_norm_c}, targets={len(row_max_norm_targets)})"
+        )
+    else:
+        logger.log("row max-norm projection: off")
+    if z_loss_enabled:
+        logger.log(f"z-loss regularization: on (coef={z_loss_coef})")
+    else:
+        logger.log("z-loss regularization: off")
+        if args.z_loss_coef != 0.0:
+            logger.log("note: --z_loss_coef is ignored unless --z_loss_enable is set.")
+    if args.logit_softcap > 0.0:
+        logger.log(f"logit softcapping: on (cap={args.logit_softcap})")
+    else:
+        logger.log("logit softcapping: off")
+    if float(args.resid_max_norm) > 0.0:
+        logger.log(f"residual stream clamp: on (max_norm={float(args.resid_max_norm):.6f})")
+    else:
+        logger.log(f"residual stream clamp: off (max_norm={float(args.resid_max_norm):.6f})")
     logger.log(
-        "lr anneal (EWMA plateau): "
-        f"alpha={LR_ANNEAL_ALPHA}, ratio_up={LR_ANNEAL_RATIO_UP}, hold={LR_ANNEAL_HOLD}, "
-        f"cooldown={LR_ANNEAL_COOLDOWN}, factor={LR_ANNEAL_FACTOR}, min_lr={LR_ANNEAL_MIN_LR}, "
-        f"check_interval={LR_ANNEAL_CHECK_INTERVAL}"
+        "branch output caps: "
+        f"attn={float(args.cap_attn_out_norm):.6f}, "
+        f"mlp={float(args.cap_mlp_out_norm):.6f}, "
+        f"mode={args.cap_out_mode}, "
+        f"keep_masked={bool(int(args.cap_keep_masked))}"
     )
+    if lr_anneal_enabled:
+        logger.log(
+            "lr anneal (EWMA plateau): "
+            f"alpha={LR_ANNEAL_ALPHA}, ratio_up={LR_ANNEAL_RATIO_UP}, hold={LR_ANNEAL_HOLD}, "
+            f"cooldown={LR_ANNEAL_COOLDOWN}, factor={LR_ANNEAL_FACTOR}, min_lr={LR_ANNEAL_MIN_LR}, "
+            f"check_interval={LR_ANNEAL_CHECK_INTERVAL}"
+        )
+    else:
+        logger.log("lr anneal (EWMA plateau): off")
     if args.optimizer in ("adam", "adamw"):
         logger.log("R metric: Adam first-moment norm / weight norm (fallback to raw grad ratio before state init).")
     else:
@@ -1447,6 +1711,17 @@ def main():
         f"mlp={r_group_counts['mlp']}, "
         f"lm_head={r_group_counts['lm_head']}"
     )
+    grad_split_counts = {k: len(v) for k, v in grad_split_param_groups.items()}
+    if int(args.grad_split_every) > 0:
+        logger.log(
+            "grad split logging: "
+            f"every {int(args.grad_split_every)} steps "
+            f"(embed={grad_split_counts['embed']}, attn.qkv={grad_split_counts['attn_qkv']}, "
+            f"attn.out={grad_split_counts['attn_out']}, mlp={grad_split_counts['mlp']}, "
+            f"lm_head={grad_split_counts['lm_head']})"
+        )
+    else:
+        logger.log("grad split logging: off")
     logger.log(
         f"sanity: special tokens pad={args.pad_id}, eos={args.eos_id}, "
         f"bos={args.bos_id}, vocab={args.vocab_size}"
@@ -1489,6 +1764,8 @@ def main():
     attn_entropy_count_since_log = defaultdict(int)
     agc_clipped_params_since_log = 0
     agc_total_params_since_log = 0
+    row_max_norm_affected_params_since_log = 0
+    row_max_norm_total_params_since_log = 0
     running_ce_window = deque()
     running_ce_tokens = 0
     running_ce_loss_sum = 0.0
@@ -1532,6 +1809,12 @@ def main():
                     r_group_steps_since_log[k] = int(v)
         agc_clipped_params_since_log = int(restored_log_accum_state.get("agc_clipped_params_since_log", 0))
         agc_total_params_since_log = int(restored_log_accum_state.get("agc_total_params_since_log", 0))
+        row_max_norm_affected_params_since_log = int(
+            restored_log_accum_state.get("row_max_norm_affected_params_since_log", 0)
+        )
+        row_max_norm_total_params_since_log = int(
+            restored_log_accum_state.get("row_max_norm_total_params_since_log", 0)
+        )
         running_ce_tokens = int(restored_log_accum_state.get("running_ce_tokens", 0))
         running_ce_loss_sum = float(restored_log_accum_state.get("running_ce_loss_sum", 0.0))
         running_ce_list = restored_log_accum_state.get("running_ce_window", [])
@@ -1555,7 +1838,7 @@ def main():
             for k, v in attn_count_map.items():
                 if isinstance(k, str) and isinstance(v, (float, int)):
                     attn_entropy_count_since_log[k] = int(v)
-    if isinstance(restored_lr_anneal_state, dict):
+    if lr_anneal_enabled and isinstance(restored_lr_anneal_state, dict):
         restored_ema = restored_lr_anneal_state.get("ema_loss")
         if isinstance(restored_ema, (float, int)) and math.isfinite(float(restored_ema)):
             ema_loss = float(restored_ema)
@@ -1606,9 +1889,12 @@ def main():
                 flat_logits = logits.reshape(-1, args.vocab_size)[flat_mask]
                 flat_targets = target_ids.reshape(-1)[flat_mask]
                 ce_loss_sum = F.cross_entropy(flat_logits, flat_targets, reduction="sum")
-                log_z = torch.logsumexp(flat_logits, dim=-1)
-                z_loss_sum = log_z.square().sum()
-                total_loss_sum = ce_loss_sum + (float(args.z_loss_coef) * z_loss_sum)
+                if z_loss_enabled:
+                    log_z = torch.logsumexp(flat_logits, dim=-1)
+                    z_loss_sum = log_z.square().sum()
+                else:
+                    z_loss_sum = ce_loss_sum.new_zeros(())
+                total_loss_sum = ce_loss_sum + (z_loss_coef * z_loss_sum)
                 total_loss = total_loss_sum / float(token_count)
                 if not torch.isfinite(total_loss):
                     raise FloatingPointError(f"Non-finite training loss at step {global_step + 1}.")
@@ -1624,11 +1910,12 @@ def main():
 
                 loss_sum_value = float(ce_loss_sum.item())
                 z_loss_sum_value = float(z_loss_sum.item())
-                objective_item = (loss_sum_value + (float(args.z_loss_coef) * z_loss_sum_value)) / float(token_count)
-                if ema_loss is None:
-                    ema_loss = objective_item
-                else:
-                    ema_loss = (LR_ANNEAL_ALPHA * objective_item) + ((1.0 - LR_ANNEAL_ALPHA) * ema_loss)
+                objective_item = (loss_sum_value + (z_loss_coef * z_loss_sum_value)) / float(token_count)
+                if lr_anneal_enabled:
+                    if ema_loss is None:
+                        ema_loss = objective_item
+                    else:
+                        ema_loss = (LR_ANNEAL_ALPHA * objective_item) + ((1.0 - LR_ANNEAL_ALPHA) * ema_loss)
                 loss_sum_since_log += loss_sum_value
                 z_loss_sum_since_log += z_loss_sum_value
                 tokens_since_log += token_count
@@ -1679,6 +1966,17 @@ def main():
                 if param.grad is not None:
                     param.grad.detach().mul_(grad_scale)
 
+            grad_split_values = None
+            next_step = int(global_step) + 1
+            if int(args.grad_split_every) > 0 and (next_step % int(args.grad_split_every) == 0):
+                grad_split_values = {
+                    "embed": grad_norm_for_params(grad_split_param_groups.get("embed", [])),
+                    "attn_qkv": grad_norm_for_params(grad_split_param_groups.get("attn_qkv", [])),
+                    "attn_out": grad_norm_for_params(grad_split_param_groups.get("attn_out", [])),
+                    "mlp": grad_norm_for_params(grad_split_param_groups.get("mlp", [])),
+                    "lm_head": grad_norm_for_params(grad_split_param_groups.get("lm_head", [])),
+                }
+
             pre_grad_norm, _pre_weight_norm, r_grad, r_m1 = grad_weight_stats(
                 model.parameters(), optimizer=opt
             )
@@ -1707,12 +2005,29 @@ def main():
             if (global_step + 1) % args.log_every == 0:
                 top_grad_norms_for_log = topk_grad_norms(model.named_parameters(), k=5)
             opt.step()
+            if args.row_max_norm_enable:
+                affected_param_count, total_param_count = apply_row_max_norm_projection_(
+                    row_max_norm_targets, c=float(args.row_max_norm_c)
+                )
+                row_max_norm_affected_params_since_log += int(affected_param_count)
+                row_max_norm_total_params_since_log += int(total_param_count)
             lr = scheduler.step()
             opt.zero_grad(set_to_none=True)
             global_step += 1
+            if grad_split_values is not None:
+                logger.log(
+                    "GradSplit "
+                    f"Step={global_step} pre_clip "
+                    f"embed={grad_split_values['embed']:.6e} "
+                    f"attn.qkv={grad_split_values['attn_qkv']:.6e} "
+                    f"attn.out={grad_split_values['attn_out']:.6e} "
+                    f"mlp={grad_split_values['mlp']:.6e} "
+                    f"lm_head={grad_split_values['lm_head']:.6e}"
+                )
 
             if (
-                LR_ANNEAL_CHECK_INTERVAL > 0
+                lr_anneal_enabled
+                and LR_ANNEAL_CHECK_INTERVAL > 0
                 and global_step % LR_ANNEAL_CHECK_INTERVAL == 0
                 and ema_loss is not None
             ):
@@ -1767,7 +2082,7 @@ def main():
                 epoch_pct = min(100.0, 100.0 * float(batch_idx) / float(batches_per_epoch))
                 avg_ce = float(loss_sum_since_log) / float(max(1, tokens_since_log))
                 avg_z_loss = float(z_loss_sum_since_log) / float(max(1, tokens_since_log))
-                avg_objective = avg_ce + (float(args.z_loss_coef) * avg_z_loss)
+                avg_objective = avg_ce + (z_loss_coef * avg_z_loss)
                 avg_ppl = _safe_exp(avg_ce)
                 avg_entropy = float(entropy_sum_since_log) / float(max(1, tokens_since_log))
                 avg_pre_grad_norm = float(pre_grad_norm_sum_since_log) / float(max(1, pre_grad_norm_steps_since_log))
@@ -1800,6 +2115,14 @@ def main():
                 if args.grad_clip_mode == "agc":
                     frac = float(agc_clipped_params_since_log) / float(max(1, agc_total_params_since_log))
                     log_msg += f", AGC clipped params: {agc_clipped_params_since_log}/{agc_total_params_since_log} ({frac:.1%})"
+                if args.row_max_norm_enable:
+                    frac = float(row_max_norm_affected_params_since_log) / float(
+                        max(1, row_max_norm_total_params_since_log)
+                    )
+                    log_msg += (
+                        ", RowMaxNorm affected params: "
+                        f"{row_max_norm_affected_params_since_log}/{row_max_norm_total_params_since_log} ({frac:.1%})"
+                    )
                 if args.track_attn_entropy and len(attn_entropy_count_since_log) > 0:
                     ent_parts = []
                     for k in sorted(attn_entropy_count_since_log.keys()):
@@ -1830,6 +2153,8 @@ def main():
                 attn_entropy_count_since_log = defaultdict(int)
                 agc_clipped_params_since_log = 0
                 agc_total_params_since_log = 0
+                row_max_norm_affected_params_since_log = 0
+                row_max_norm_total_params_since_log = 0
 
             if args.eval_every_steps > 0 and global_step % args.eval_every_steps == 0:
                 val_metrics = evaluate_model(
@@ -1838,7 +2163,8 @@ def main():
                     device=device,
                     pad_id=args.pad_id,
                     vocab_size=args.vocab_size,
-                    z_loss_coef=args.z_loss_coef,
+                    z_loss_enable=z_loss_enabled,
+                    z_loss_coef=z_loss_coef,
                     max_tokens=0,
                     max_steps=0,
                     pin_memory=pin_memory,
@@ -1875,6 +2201,28 @@ def main():
                     "k_mag_mean",
                     "v_mag_mean",
                     "attn_score_mean",
+                    "attn_presoftmax_std",
+                    "attn_presoftmax_p99",
+                    "attn_presoftmax_max",
+                    "enc_self_attn_presoftmax_std",
+                    "enc_self_attn_presoftmax_p99",
+                    "enc_self_attn_presoftmax_max",
+                    "dec_self_attn_presoftmax_std",
+                    "dec_self_attn_presoftmax_p99",
+                    "dec_self_attn_presoftmax_max",
+                    "cross_attn_presoftmax_std",
+                    "cross_attn_presoftmax_p99",
+                    "cross_attn_presoftmax_max",
+                    "norm_attn_pre_rms",
+                    "norm_attn_post_rms",
+                    "norm_self_attn_pre_rms",
+                    "norm_self_attn_post_rms",
+                    "norm_cross_x_pre_rms",
+                    "norm_cross_x_post_rms",
+                    "norm_cross_kv_pre_rms",
+                    "norm_cross_kv_post_rms",
+                    "norm_mlp_pre_rms",
+                    "norm_mlp_post_rms",
                     "embed_pair_cos_mean",
                     "enc_last_lambda1_over_trace",
                 ):
@@ -1902,12 +2250,16 @@ def main():
                         "optimizer_state_dict": opt.state_dict(),
                         "scheduler_step_num": int(scheduler.step_num),
                         "rng_state": capture_rng_state(),
-                        "lr_anneal_state": {
-                            "ema_loss": None if ema_loss is None else float(ema_loss),
-                            "best_ema": float(best_ema),
-                            "bad_count": int(bad_count),
-                            "cooldown_count": int(cooldown_count),
-                        },
+                        "lr_anneal_state": (
+                            {
+                                "ema_loss": None if ema_loss is None else float(ema_loss),
+                                "best_ema": float(best_ema),
+                                "bad_count": int(bad_count),
+                                "cooldown_count": int(cooldown_count),
+                            }
+                            if lr_anneal_enabled
+                            else None
+                        ),
                         "log_accum_state": {
                             "tokens_since_log": int(tokens_since_log),
                             "loss_sum_since_log": float(loss_sum_since_log),
@@ -1923,6 +2275,10 @@ def main():
                             "r_group_steps_since_log": {k: int(v) for k, v in r_group_steps_since_log.items()},
                             "agc_clipped_params_since_log": int(agc_clipped_params_since_log),
                             "agc_total_params_since_log": int(agc_total_params_since_log),
+                            "row_max_norm_affected_params_since_log": int(
+                                row_max_norm_affected_params_since_log
+                            ),
+                            "row_max_norm_total_params_since_log": int(row_max_norm_total_params_since_log),
                             "running_ce_tokens": int(running_ce_tokens),
                             "running_ce_loss_sum": float(running_ce_loss_sum),
                             "running_ce_window": [list(x) for x in running_ce_window],
@@ -1943,7 +2299,8 @@ def main():
         device=device,
         pad_id=args.pad_id,
         vocab_size=args.vocab_size,
-        z_loss_coef=args.z_loss_coef,
+        z_loss_enable=z_loss_enabled,
+        z_loss_coef=z_loss_coef,
         max_tokens=max(0, int(args.test_max_tokens)),
         max_steps=max(0, int(args.test_steps)),
         pin_memory=pin_memory,

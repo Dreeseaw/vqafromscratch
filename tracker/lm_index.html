@@ -698,12 +698,14 @@
       reconnects: 0,
       latestAttention: null,
       attentionIndex: [],
+      attentionIndexMeta: { mtimeMs: 0, count: 0 },
       selectedAttentionFile: "",
       attnSelection: { prompt: null, block: "", layer: null, step: null },
       attnHover: null,
       attnGeom: null,
       probeRecords: [],
       probeSeriesMap: new Map(),
+      baselineSeriesMap: new Map(),
       compareOptions: [],
       generationRecords: [],
       generationProbes: [],
@@ -1618,6 +1620,10 @@
         const [, phase, metric] = key.split("|");
         return `log/${phase}/${metric}`;
       }
+      if (key.startsWith("baseline|")) {
+        const [, phase, metric] = key.split("|");
+        return `baseline/${phase}/${metric}`;
+      }
       if (key.startsWith("probe|")) {
         const [, probe, layer, metric] = key.split("|");
         return `probe${probe}/${layer}/${metric}`;
@@ -1631,6 +1637,10 @@
         const [, phase, metric] = key.split("|");
         const series = state.metricGroups.get(metric)?.phases.get(phase);
         return Array.isArray(series?.points) ? series.points.slice() : [];
+      }
+      if (key.startsWith("baseline|")) {
+        const series = state.baselineSeriesMap.get(key);
+        return Array.isArray(series) ? series.slice() : [];
       }
       if (key.startsWith("probe|")) {
         const series = state.probeSeriesMap.get(key);
@@ -1747,6 +1757,18 @@
           logGroups.get(groupLabel).push({ value: key, label: prettifyMetric(metric) });
         }
       }
+      const baselineGroups = new Map();
+      for (const [key, series] of state.baselineSeriesMap.entries()) {
+        if (!Array.isArray(series) || series.length === 0) continue;
+        const parts = String(key).split("|");
+        if (parts.length < 3) continue;
+        const phase = parts[1];
+        const metric = parts.slice(2).join("|");
+        options.push({ key, label: seriesLabelFromKey(key) });
+        const groupLabel = `Baseline / ${phase}`;
+        if (!baselineGroups.has(groupLabel)) baselineGroups.set(groupLabel, []);
+        baselineGroups.get(groupLabel).push({ value: key, label: prettifyMetric(metric) });
+      }
       const probeGroups = new Map();
       for (const key of state.probeSeriesMap.keys()) {
         options.push({ key, label: seriesLabelFromKey(key) });
@@ -1764,6 +1786,10 @@
       state.compareOptions = options;
       const groups = [];
       for (const [label, opts] of Array.from(logGroups.entries()).sort((a, b) => a[0].localeCompare(b[0]))) {
+        opts.sort((a, b) => a.label.localeCompare(b.label));
+        groups.push({ label, options: opts });
+      }
+      for (const [label, opts] of Array.from(baselineGroups.entries()).sort((a, b) => a[0].localeCompare(b[0]))) {
         opts.sort((a, b) => a.label.localeCompare(b.label));
         groups.push({ label, options: opts });
       }
@@ -2014,9 +2040,11 @@
         "/",
         "/meta",
         "/checkpoints",
+        "/baseline",
         "/probe_debug/records",
         "/probe_debug/generations",
-        "/probe_debug/attention_index",
+        "/probe_debug/attention_index_meta",
+        "/probe_debug/attention_index?compact=1",
         "/probe_debug/latest_attention",
       ];
       if (state.selectedAttentionFile) {
@@ -2083,8 +2111,54 @@
         const res = await fetch("/meta", { cache: "no-store" });
         if (!res.ok) return;
         const meta = await res.json();
-        els.subtitle.textContent = `${meta.runDir} | ${meta.logfile}`;
+        const mode = String(meta.logMode || "single");
+        let logsLabel = String(meta.logfile || "");
+        if (Array.isArray(meta.logfiles) && meta.logfiles.length > 0) {
+          logsLabel = meta.logfiles
+            .map((x) => (x && typeof x === "object" && x.file ? String(x.file) : String(x)))
+            .join(", ");
+        }
+        const baselineLabel = meta.baselineLogfile ? ` | baseline=${meta.baselineLogfile}` : "";
+        els.subtitle.textContent = `${meta.runDir} | mode=${mode} | logs=${logsLabel}${baselineLabel}`;
         drawCheckpoints(meta.checkpoints || []);
+      } catch {
+        // no-op
+      }
+    }
+
+    async function refreshBaselineSeries() {
+      try {
+        const res = await fetch("/baseline", { cache: "no-store" });
+        if (!res.ok) return;
+        const payload = await res.json();
+        if (!payload.available) {
+          state.baselineSeriesMap = new Map();
+          queueDraw();
+          return;
+        }
+        const rows = Array.isArray(payload.series) ? payload.series : [];
+        const map = new Map();
+        for (const row of rows) {
+          const phase = String(row?.phase || "");
+          const metric = String(row?.metric || "");
+          const pointsRaw = Array.isArray(row?.points) ? row.points : [];
+          if (!phase || !metric || pointsRaw.length === 0) continue;
+          const byStep = new Map();
+          for (const p of pointsRaw) {
+            const step = Number(p?.step);
+            const value = Number(p?.value);
+            if (!Number.isFinite(step) || !Number.isFinite(value)) continue;
+            byStep.set(step, value);
+          }
+          if (byStep.size === 0) continue;
+          const points = Array.from(byStep.entries())
+            .map(([step, value]) => ({ step, value }))
+            .sort((a, b) => a.step - b.step);
+          const key = `baseline|${phase}|${metric}`;
+          map.set(key, points);
+        }
+        state.baselineSeriesMap = map;
+        queueDraw();
       } catch {
         // no-op
       }
@@ -2284,13 +2358,39 @@
       await loadAttentionByFile(item.file);
     }
 
-    async function refreshAttentionIndex() {
+    async function refreshAttentionIndex(forceFull = false) {
       try {
-        const res = await fetch("/probe_debug/attention_index", { cache: "no-store" });
-        if (!res.ok) return;
-        const payload = await res.json();
-        const items = payload.available && Array.isArray(payload.items) ? payload.items : [];
-        state.attentionIndex = items;
+        let items = state.attentionIndex;
+        let shouldReload = !!forceFull || !Array.isArray(items) || items.length === 0;
+
+        if (!shouldReload) {
+          const metaRes = await fetch("/probe_debug/attention_index_meta", { cache: "no-store" });
+          if (metaRes.ok) {
+            const meta = await metaRes.json();
+            const mtimeMs = Number.isFinite(Number(meta.mtimeMs)) ? Number(meta.mtimeMs) : 0;
+            const count = Number.isFinite(Number(meta.count)) ? Number(meta.count) : 0;
+            const changed =
+              mtimeMs !== Number(state.attentionIndexMeta.mtimeMs || 0) ||
+              count !== Number(state.attentionIndexMeta.count || 0);
+            state.attentionIndexMeta = { mtimeMs, count };
+            shouldReload = changed;
+          } else {
+            shouldReload = true;
+          }
+        }
+
+        if (shouldReload) {
+          const res = await fetch("/probe_debug/attention_index?compact=1", { cache: "no-store" });
+          if (!res.ok) return;
+          const payload = await res.json();
+          items = payload.available && Array.isArray(payload.items) ? payload.items : [];
+          state.attentionIndex = items;
+          state.attentionIndexMeta = {
+            mtimeMs: Number.isFinite(Number(payload.mtimeMs)) ? Number(payload.mtimeMs) : 0,
+            count: Number.isFinite(Number(payload.count)) ? Number(payload.count) : items.length,
+          };
+        }
+
         const files = items.map((x) => String(x.file));
         if (state.selectedAttentionFile && !files.includes(String(state.selectedAttentionFile))) {
           state.selectedAttentionFile = "";
@@ -2539,11 +2639,13 @@
 
     bindControls();
     refreshMeta();
+    refreshBaselineSeries();
     refreshProbeRecords();
     refreshGenerations();
     refreshAttentionIndex();
     connectStream();
     setInterval(refreshMeta, 30000);
+    setInterval(refreshBaselineSeries, 30000);
     setInterval(refreshProbeRecords, 8000);
     setInterval(refreshGenerations, 8000);
     setInterval(refreshAttentionIndex, 5000);
