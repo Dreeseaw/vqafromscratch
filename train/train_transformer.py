@@ -1148,11 +1148,11 @@ def main():
     parser.add_argument("--eos_id", type=int, default=None)
 
     # model (models/lm.py)
-    parser.add_argument("--d_model", type=int, default=768)
-    parser.add_argument("--n_heads", type=int, default=12)
-    parser.add_argument("--enc_layers", type=int, default=6)  # must match dec_layers
-    parser.add_argument("--dec_layers", type=int, default=6)  # must match enc_layers
-    parser.add_argument("--ff_mult", type=int, default=4)
+    parser.add_argument("--d_model", type=int, default=512)
+    parser.add_argument("--n_heads", type=int, default=8)
+    parser.add_argument("--enc_layers", type=int, default=4)  # must match dec_layers
+    parser.add_argument("--dec_layers", type=int, default=4)  # must match enc_layers
+    parser.add_argument("--ff_mult", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--tie_embeddings", action="store_true")
     parser.add_argument("--attn_impl", type=str, default="sdpa", choices=["sdpa", "eager"])
@@ -1173,14 +1173,15 @@ def main():
         help="RMS-normalize projected V per head before attention.",
     )
     parser.add_argument(
-        "--layerscale",
-        action="store_true",
+        "--no-layerscale",
+        action="store_false",
+        dest="layerscale",
         help="Enable LayerScale on residual branches.",
     )
     parser.add_argument(
         "--layerscale_init",
         type=float,
-        default=1e-5,
+        default=0.01,
         help="Initial LayerScale value (used when --layerscale is set).",
     )
     parser.add_argument(
@@ -1192,19 +1193,19 @@ def main():
     parser.add_argument(
         "--resid_max_norm",
         type=float,
-        default=None,
+        default=0.0,
         help="Residual-stream clamp max norm. Set <=0 to disable (legacy behavior default is sqrt(d_model)).",
     )
     parser.add_argument(
         "--cap_attn_out_norm",
         type=float,
-        default=0.0,
+        default=1.5,
         help="Cap norm of attention branch output (after out-proj + LayerScale, before dropout/add). 0 disables.",
     )
     parser.add_argument(
         "--cap_mlp_out_norm",
         type=float,
-        default=0.0,
+        default=2.0,
         help="Cap norm of MLP branch output (after LayerScale, before dropout/add). 0 disables.",
     )
     parser.add_argument(
@@ -1223,7 +1224,7 @@ def main():
     )
 
     # training
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument(
         "--grad_accum_steps",
@@ -1231,15 +1232,15 @@ def main():
         default=1,
         help="Number of micro-batches to accumulate before optimizer step.",
     )
-    parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--lr", type=float, default=0.0001)
+    parser.add_argument("--weight_decay", type=float, default=0.05)
     parser.add_argument(
         "--half_lr_lm_head",
         action="store_true",
         help="Use 0.5x base LR for _unembed (LM head) parameters.",
     )
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["adam", "adamw"])
-    parser.add_argument("--warmup_ratio", type=float, default=0.02)
+    parser.add_argument("--warmup_ratio", type=float, default=0.04)
     parser.add_argument("--schedule", type=str, default="cosine", choices=["cosine", "flat", "stair"])
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument(
@@ -1268,7 +1269,7 @@ def main():
     parser.add_argument(
         "--clip_grad",
         type=float,
-        default=1.0,
+        default=5.0,
         help="Global gradient clip norm (used when --grad_clip_mode=global).",
     )
     parser.add_argument(
@@ -1284,22 +1285,23 @@ def main():
         help="AGC minimum parameter norm epsilon.",
     )
     parser.add_argument(
-        "--row_max_norm_enable",
-        action="store_true",
-        help="Apply row-wise max-norm projection after optimizer.step() to attention q/k/v/out projection weights and lm_head.",
+        "--no_row_max_norm_enable",
+        action="store_false",
+        dest="row_max_norm_enable",
+        help="Don't apply row-wise max-norm projection after optimizer.step() to attention q/k/v/out projection weights and lm_head.",
     )
     parser.add_argument(
         "--row_max_norm_c",
         type=float,
-        default=ROW_MAX_NORM_C,
+        default=1.0,
         help="Row-wise max-norm cap c for projection (used when --row_max_norm_enable is set).",
     )
     parser.add_argument("--eval_every_steps", type=int, default=1000)
-    parser.add_argument("--val_max_tokens", type=int, default=200000)
+    parser.add_argument("--val_max_tokens", type=int, default=100000)
     parser.add_argument("--val_steps", type=int, default=0)
     parser.add_argument("--test_max_tokens", type=int, default=0)
     parser.add_argument("--test_steps", type=int, default=0)
-    parser.add_argument("--run_probes", type=int, default=0)
+    parser.add_argument("--run_probes", type=int, default=500)
     parser.add_argument("--probe_file", type=str, default=None)
     parser.add_argument(
         "--probe_layers",
@@ -1327,22 +1329,81 @@ def main():
         action="store_true",
         help="Track mean attention entropy for encoder/self-cross decoder attention on training batches.",
     )
+    parser.add_argument(
+        "--track_train_token_entropy",
+        dest="track_train_token_entropy",
+        action="store_true",
+        help="Track token-level predictive entropy in the training hot path.",
+    )
+    parser.add_argument(
+        "--no_track_train_token_entropy",
+        dest="track_train_token_entropy",
+        action="store_false",
+        help="Disable token-level predictive entropy computation in the training hot path.",
+    )
+    parser.set_defaults(track_train_token_entropy=False)
 
     # performance
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--persistent_workers", action="store_true")
-    parser.add_argument("--prefetch_factor", type=int, default=1)
-    parser.add_argument("--log_every", type=int, default=10)
+    parser.add_argument("--prefetch_factor", type=int, default=4)
+    parser.add_argument("--log_every", type=int, default=100)
+    parser.add_argument(
+        "--track_r_metrics",
+        dest="track_r_metrics",
+        action="store_true",
+        help="Track R metrics (grad/weight and Adam m1/weight) on optimizer steps.",
+    )
+    parser.add_argument(
+        "--no_track_r_metrics",
+        dest="track_r_metrics",
+        action="store_false",
+        help="Disable R metric scans in the training hot path.",
+    )
+    parser.set_defaults(track_r_metrics=False)
+    parser.add_argument(
+        "--log_top_grad_norms",
+        dest="log_top_grad_norms",
+        action="store_true",
+        help="Include top-k gradient norm scan in periodic training logs.",
+    )
+    parser.add_argument(
+        "--no_log_top_grad_norms",
+        dest="log_top_grad_norms",
+        action="store_false",
+        help="Disable top-k gradient norm scans in periodic training logs.",
+    )
+    parser.set_defaults(log_top_grad_norms=False)
+    parser.add_argument(
+        "--grad_split_logging",
+        dest="grad_split_logging",
+        action="store_true",
+        help="Enable grad-split scans/logging governed by --grad_split_every.",
+    )
+    parser.add_argument(
+        "--no_grad_split_logging",
+        dest="grad_split_logging",
+        action="store_false",
+        help="Disable grad-split scans/logging regardless of --grad_split_every.",
+    )
+    parser.set_defaults(grad_split_logging=False)
     parser.add_argument(
         "--grad_split_every",
         type=int,
-        default=250,
+        default=0,
         help="Log low-frequency pre-clip grad norms by module every N optimizer steps (0 disables).",
     )
-    parser.add_argument("--ckpt_every", type=int, default=2000)
+    parser.add_argument(
+        "--probe_after_log_only",
+        action="store_true",
+        help="Run probes only when a probe cadence step is also a periodic log step.",
+    )
+    parser.add_argument("--ckpt_every", type=int, default=5000)
     parser.add_argument("--deterministic", action="store_true")
-    parser.add_argument("--bucket_width", type=int, default=64)
-    parser.add_argument("--activation_checkpointing", action="store_true")
+    parser.add_argument("--bucket_width", type=int, default=32)
+    parser.add_argument("--activation_checkpointing", action="store_true", dest="activation_checkpointing")
+    parser.add_argument("--no_activation_checkpointing", action="store_false", dest="activation_checkpointing")
+    parser.set_defaults(activation_checkpointing=True)
 
     args = parser.parse_args()
 
@@ -1519,10 +1580,17 @@ def main():
         raise SystemExit("--z_loss_coef must be >= 0.")
     if args.row_max_norm_c <= 0.0:
         raise SystemExit("--row_max_norm_c must be > 0.")
+    if int(args.log_every) <= 0:
+        raise SystemExit("--log_every must be > 0.")
     if int(args.grad_split_every) < 0:
         raise SystemExit("--grad_split_every must be >= 0.")
     if args.resid_max_norm is None:
         args.resid_max_norm = math.sqrt(float(args.d_model))
+    track_train_token_entropy = bool(args.track_train_token_entropy)
+    track_r_metrics = bool(args.track_r_metrics)
+    log_top_grad_norms = bool(args.log_top_grad_norms)
+    effective_grad_split_every = int(args.grad_split_every) if bool(args.grad_split_logging) else 0
+    probe_after_log_only = bool(args.probe_after_log_only)
     z_loss_enabled = bool(args.z_loss_enable)
     z_loss_coef = float(args.z_loss_coef) if z_loss_enabled else 0.0
     lr_anneal_enabled = bool(args.lr_anneal_enable)
@@ -1551,8 +1619,16 @@ def main():
         cap_keep_masked=bool(int(args.cap_keep_masked)),
     )
     model = TransformerV1(cfg).to(device)
-    r_metric_param_groups = build_r_metric_param_groups(model, tie_embeddings=bool(args.tie_embeddings))
-    grad_split_param_groups = build_grad_split_param_groups(model, tie_embeddings=bool(args.tie_embeddings))
+    r_metric_param_groups = (
+        build_r_metric_param_groups(model, tie_embeddings=bool(args.tie_embeddings))
+        if track_r_metrics
+        else {k: [] for k in R_METRIC_GROUP_KEYS}
+    )
+    grad_split_param_groups = (
+        build_grad_split_param_groups(model, tie_embeddings=bool(args.tie_embeddings))
+        if effective_grad_split_every > 0
+        else {k: [] for k in GRAD_SPLIT_GROUP_KEYS}
+    )
 
     param_groups = build_optimizer_param_groups(
         model=model,
@@ -1699,41 +1775,51 @@ def main():
         )
     else:
         logger.log("lr anneal (EWMA plateau): off")
-    if args.optimizer in ("adam", "adamw"):
-        logger.log("R metric: Adam first-moment norm / weight norm (fallback to raw grad ratio before state init).")
+    if track_r_metrics:
+        if args.optimizer in ("adam", "adamw"):
+            logger.log("R metric: Adam first-moment norm / weight norm (fallback to raw grad ratio before state init).")
+        else:
+            logger.log("R metric: raw grad norm / weight norm.")
+        r_group_counts = {k: len(v) for k, v in r_metric_param_groups.items()}
+        logger.log(
+            "R metric groups (trainable tensors): "
+            f"embed={r_group_counts['embed']}, "
+            f"atten={r_group_counts['atten']}, "
+            f"mlp={r_group_counts['mlp']}, "
+            f"lm_head={r_group_counts['lm_head']}"
+        )
     else:
-        logger.log("R metric: raw grad norm / weight norm.")
-    r_group_counts = {k: len(v) for k, v in r_metric_param_groups.items()}
-    logger.log(
-        "R metric groups (trainable tensors): "
-        f"embed={r_group_counts['embed']}, "
-        f"atten={r_group_counts['atten']}, "
-        f"mlp={r_group_counts['mlp']}, "
-        f"lm_head={r_group_counts['lm_head']}"
-    )
+        logger.log("R metric: off (--no_track_r_metrics).")
     grad_split_counts = {k: len(v) for k, v in grad_split_param_groups.items()}
-    if int(args.grad_split_every) > 0:
+    if effective_grad_split_every > 0:
         logger.log(
             "grad split logging: "
-            f"every {int(args.grad_split_every)} steps "
+            f"every {effective_grad_split_every} steps "
             f"(embed={grad_split_counts['embed']}, attn.qkv={grad_split_counts['attn_qkv']}, "
             f"attn.out={grad_split_counts['attn_out']}, mlp={grad_split_counts['mlp']}, "
             f"lm_head={grad_split_counts['lm_head']})"
         )
     else:
         logger.log("grad split logging: off")
+    logger.log(f"top-grad scan in periodic logs: {'on' if log_top_grad_norms else 'off'}")
     logger.log(
         f"sanity: special tokens pad={args.pad_id}, eos={args.eos_id}, "
         f"bos={args.bos_id}, vocab={args.vocab_size}"
     )
     if int(args.run_probes) > 0:
         probe_layers_label = "default(first,last)" if probe_layers is None else ",".join(str(x) for x in probe_layers)
+        probe_mode = (
+            f"every {args.run_probes} steps"
+            if not probe_after_log_only
+            else f"every {args.run_probes} steps (and only on log steps: {args.log_every})"
+        )
         logger.log(
-            f"probe debug cadence: every {args.run_probes} steps | prompts={len(probe_prompts)} | "
+            f"probe debug cadence: {probe_mode} | prompts={len(probe_prompts)} | "
             f"probe_file={probe_file_path} | probe_layers={probe_layers_label}"
         )
         if len(probe_prompts) != 5:
             logger.log(f"warning: expected 5 probes, found {len(probe_prompts)} in {probe_file_path}")
+    logger.log(f"token entropy (train hot path): {'on' if track_train_token_entropy else 'off'}")
     logger.log(f"attention entropy (train batches): {'on' if args.track_attn_entropy else 'off'}")
     logger.log(f"attention entropy (probe runs): {'on' if args.probe_attn_entropy else 'off'}")
     if args.track_attn_entropy and args.activation_checkpointing:
@@ -1902,11 +1988,13 @@ def main():
                 accum_tokens_for_backward += token_count
                 accum_has_grad = True
 
-                with torch.no_grad():
-                    log_probs = F.log_softmax(logits, dim=-1)
-                    probs = log_probs.exp()
-                    entropy = -(probs * log_probs).sum(dim=-1)
-                    entropy_sum = float(entropy[loss_mask].sum().item())
+                entropy_sum = 0.0
+                if track_train_token_entropy:
+                    with torch.no_grad():
+                        log_probs = F.log_softmax(logits, dim=-1)
+                        probs = log_probs.exp()
+                        entropy = -(probs * log_probs).sum(dim=-1)
+                        entropy_sum = float(entropy[loss_mask].sum().item())
 
                 loss_sum_value = float(ce_loss_sum.item())
                 z_loss_sum_value = float(z_loss_sum.item())
@@ -1919,7 +2007,8 @@ def main():
                 loss_sum_since_log += loss_sum_value
                 z_loss_sum_since_log += z_loss_sum_value
                 tokens_since_log += token_count
-                entropy_sum_since_log += entropy_sum
+                if track_train_token_entropy:
+                    entropy_sum_since_log += entropy_sum
                 for attn_key, attn_value in step_attn_entropy.items():
                     if not math.isfinite(float(attn_value)):
                         continue
@@ -1968,7 +2057,7 @@ def main():
 
             grad_split_values = None
             next_step = int(global_step) + 1
-            if int(args.grad_split_every) > 0 and (next_step % int(args.grad_split_every) == 0):
+            if effective_grad_split_every > 0 and (next_step % effective_grad_split_every == 0):
                 grad_split_values = {
                     "embed": grad_norm_for_params(grad_split_param_groups.get("embed", [])),
                     "attn_qkv": grad_norm_for_params(grad_split_param_groups.get("attn_qkv", [])),
@@ -1977,16 +2066,21 @@ def main():
                     "lm_head": grad_norm_for_params(grad_split_param_groups.get("lm_head", [])),
                 }
 
-            pre_grad_norm, _pre_weight_norm, r_grad, r_m1 = grad_weight_stats(
-                model.parameters(), optimizer=opt
-            )
-            r_value = r_m1 if math.isfinite(r_m1) else r_grad
-            r_values_by_group = {}
-            for group_name in R_METRIC_GROUP_KEYS:
-                r_values_by_group[group_name] = compute_r_value(
-                    r_metric_param_groups.get(group_name, []),
-                    optimizer=opt,
+            if track_r_metrics:
+                pre_grad_norm, _pre_weight_norm, r_grad, r_m1 = grad_weight_stats(
+                    model.parameters(), optimizer=opt
                 )
+                r_value = r_m1 if math.isfinite(r_m1) else r_grad
+                r_values_by_group = {}
+                for group_name in R_METRIC_GROUP_KEYS:
+                    r_values_by_group[group_name] = compute_r_value(
+                        r_metric_param_groups.get(group_name, []),
+                        optimizer=opt,
+                    )
+            else:
+                pre_grad_norm = global_grad_norm(model.parameters())
+                r_value = float("nan")
+                r_values_by_group = {}
             if args.grad_clip_mode == "global":
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
                 post_grad_norm = global_grad_norm(model.parameters())
@@ -2002,7 +2096,7 @@ def main():
             else:
                 post_grad_norm = pre_grad_norm
             top_grad_norms_for_log = []
-            if (global_step + 1) % args.log_every == 0:
+            if log_top_grad_norms and (global_step + 1) % args.log_every == 0:
                 top_grad_norms_for_log = topk_grad_norms(model.named_parameters(), k=5)
             opt.step()
             if args.row_max_norm_enable:
@@ -2062,13 +2156,14 @@ def main():
             pre_grad_norm_steps_since_log += 1
             post_grad_norm_sum_since_log += post_grad_norm
             post_grad_norm_steps_since_log += 1
-            r_sum_since_log += r_value
-            r_steps_since_log += 1
-            for group_name, group_r in r_values_by_group.items():
-                if not math.isfinite(group_r):
-                    continue
-                r_group_sum_since_log[group_name] += float(group_r)
-                r_group_steps_since_log[group_name] += 1
+            if track_r_metrics and math.isfinite(r_value):
+                r_sum_since_log += r_value
+                r_steps_since_log += 1
+                for group_name, group_r in r_values_by_group.items():
+                    if not math.isfinite(group_r):
+                        continue
+                    r_group_sum_since_log[group_name] += float(group_r)
+                    r_group_steps_since_log[group_name] += 1
             accum_micro_count = 0
             accum_tokens_for_backward = 0
             accum_has_grad = False
@@ -2084,17 +2179,23 @@ def main():
                 avg_z_loss = float(z_loss_sum_since_log) / float(max(1, tokens_since_log))
                 avg_objective = avg_ce + (z_loss_coef * avg_z_loss)
                 avg_ppl = _safe_exp(avg_ce)
-                avg_entropy = float(entropy_sum_since_log) / float(max(1, tokens_since_log))
+                avg_entropy = (
+                    float(entropy_sum_since_log) / float(max(1, tokens_since_log))
+                    if track_train_token_entropy
+                    else float("nan")
+                )
                 avg_pre_grad_norm = float(pre_grad_norm_sum_since_log) / float(max(1, pre_grad_norm_steps_since_log))
                 avg_post_grad_norm = float(post_grad_norm_sum_since_log) / float(max(1, post_grad_norm_steps_since_log))
-                avg_r = float(r_sum_since_log) / float(max(1, r_steps_since_log))
+                avg_r = float("nan")
                 avg_r_by_group = {}
-                for group_name in R_METRIC_GROUP_KEYS:
-                    steps = int(r_group_steps_since_log.get(group_name, 0))
-                    if steps <= 0:
-                        avg_r_by_group[group_name] = float("nan")
-                    else:
-                        avg_r_by_group[group_name] = float(r_group_sum_since_log[group_name]) / float(steps)
+                if track_r_metrics:
+                    avg_r = float(r_sum_since_log) / float(max(1, r_steps_since_log))
+                    for group_name in R_METRIC_GROUP_KEYS:
+                        steps = int(r_group_steps_since_log.get(group_name, 0))
+                        if steps <= 0:
+                            avg_r_by_group[group_name] = float("nan")
+                        else:
+                            avg_r_by_group[group_name] = float(r_group_sum_since_log[group_name]) / float(steps)
                 train_running_ce = float(running_ce_loss_sum) / float(max(1, running_ce_tokens))
 
                 log_msg = (
@@ -2103,15 +2204,20 @@ def main():
                     f"Train Z: {avg_z_loss:.6f}, "
                     f"Train Obj: {avg_objective:.6f}, "
                     f"train_running_ce: {train_running_ce:.6f} nats/token ({running_ce_tokens} tok), "
-                    f"Train PPL: {avg_ppl:.4f}, Train Entropy: {avg_entropy:.6f}, "
+                    f"Train PPL: {avg_ppl:.4f}, "
                     f"GradNorm(pre={avg_pre_grad_norm:.4f}, post={avg_post_grad_norm:.4f}), "
-                    f"R: {avg_r:.6e}, "
-                    f"R_embed: {avg_r_by_group['embed']:.6e}, "
-                    f"R_atten: {avg_r_by_group['atten']:.6e}, "
-                    f"R_mlp: {avg_r_by_group['mlp']:.6e}, "
-                    f"R_lm_head: {avg_r_by_group['lm_head']:.6e}, "
                     f"Tokens/s: {toks_per_sec:.2f}, LR: {lr:.6e}"
                 )
+                if track_train_token_entropy:
+                    log_msg += f", Train Entropy: {avg_entropy:.6f}"
+                if track_r_metrics:
+                    log_msg += (
+                        f", R: {avg_r:.6e}"
+                        f", R_embed: {avg_r_by_group['embed']:.6e}"
+                        f", R_atten: {avg_r_by_group['atten']:.6e}"
+                        f", R_mlp: {avg_r_by_group['mlp']:.6e}"
+                        f", R_lm_head: {avg_r_by_group['lm_head']:.6e}"
+                    )
                 if args.grad_clip_mode == "agc":
                     frac = float(agc_clipped_params_since_log) / float(max(1, agc_total_params_since_log))
                     log_msg += f", AGC clipped params: {agc_clipped_params_since_log}/{agc_total_params_since_log} ({frac:.1%})"
@@ -2133,7 +2239,8 @@ def main():
                         ent_parts.append(f"{k}={avg_v:.6f}")
                     if ent_parts:
                         log_msg += ", " + ", ".join(ent_parts)
-                log_msg += f", {format_top_grad_norms(top_grad_norms_for_log)}"
+                if log_top_grad_norms:
+                    log_msg += f", {format_top_grad_norms(top_grad_norms_for_log)}"
                 logger.log(log_msg)
 
                 log_start = time.perf_counter()
@@ -2177,7 +2284,10 @@ def main():
                     f"tokens={val_metrics['tokens']} steps={val_metrics['steps']}"
                 )
 
-            if int(args.run_probes) > 0 and global_step % int(args.run_probes) == 0:
+            probe_due = int(args.run_probes) > 0 and global_step % int(args.run_probes) == 0
+            if probe_due and probe_after_log_only and (global_step % int(args.log_every) != 0):
+                probe_due = False
+            if probe_due:
                 probe_summary = run_debug_probes(
                     model=model,
                     tokenizer=probe_tokenizer,
