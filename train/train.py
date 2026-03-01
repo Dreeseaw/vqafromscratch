@@ -2,10 +2,10 @@
 training code for vae
 
 new run
-> python3 train.py my_fun_run_id
+> python3 -m train.train my_fun_run_id
 
 continue from weights (in this case, from step 4000)
-> python3 train.py my_fun_run_id 4000
+> python3 -m train.train my_fun_run_id 4000
 
 results saved in 
 - /logs/<run_id>/logfile.txt
@@ -27,11 +27,12 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.utils import save_image
 
-from vae import VariationalAutoEncoder as VAE, VAEConfig
-from vae import VariationalAutoEncoderRes as VAEr
+from models.vae import VariationalAutoEncoder as VAE, VAEConfig
+from models.vae import VariationalAutoEncoderRes as VAEr
+from models.vae import ViTVAE, ViTVAE2
 
 
-DATA_DIR = "/Users/williamdreese/percy/vqa/VQA/Images/mscoco/"
+DATA_DIR = "/Users/williamdreese/percy/vqa/vqafromscratch/images/mscoco/"
 SEED = 35
 
 
@@ -356,7 +357,7 @@ def set_decoder_trainable(vae, step) -> (float, float, float):
     """
     # if step < 5001:
     #     return (200.0, 0.0005, 0.0) 
-    return (0.0, 0.0005, 0.001)  # let the model have a lil ortho
+    return (0.0, 0.00521, 0.0)  # let the model have a lil ortho
 
 
 ### Training loop
@@ -368,7 +369,7 @@ if __name__=="__main__":
     # hyperparams
     epochs = 20_000  # by the time my kids have kids
     global_step = 0
-    batch_size = 96
+    batch_size = 128
 
     # cpu performance guidance
     device = "cpu" 
@@ -391,9 +392,10 @@ if __name__=="__main__":
         dataset, 
         batch_size=batch_size, 
         shuffle=True,
-        num_workers=1,
+        num_workers=4,
         persistent_workers=True,
-        prefetch_factor=2,
+        prefetch_factor=4,
+        pin_memory=False,
     )
 
     # uncomment for overfit testing
@@ -410,8 +412,8 @@ if __name__=="__main__":
     )
 
     # torch object creation
-    config = VAEConfig() 
-    vae = VAEr(config).to(device)
+    config = VAEConfig(latent_dim=768, cbld=1536) 
+    vae = ViTVAE2(config).to(device)
     opt = torch.optim.Adam(vae.parameters(), lr=0.001, weight_decay=0.0001)
 
     if checkpoint_id:

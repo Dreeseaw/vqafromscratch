@@ -305,7 +305,7 @@ function draw() {
   const rl = data.map(d => Math.min(d.rl, 0.6));
 
   // KL log view (for the KL plot only)
-  const klClamp = 20.0;
+  const klClamp = 10.0;
   let klLog = data.map(d => Math.max(d.kl, klClamp));
   // let klLog = data.map(d => Math.log10(Math.max(d.kl, 0) + eps));
 

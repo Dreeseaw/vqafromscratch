@@ -4,17 +4,17 @@ probe.py
 Linear probe on VAE latent z (flattened [B,16,7,7] -> [B,784]) using COCO-style annotations.
 
 Key changes vs prior version:
-- Uses your Logger from train.py (same folder import).
+- Uses your Logger from train/train.py.
 - Adds CLI arg to choose label mode: --label_mode {multilabel,singlelabel}
   - multilabel: multi-hot object presence (BCEWithLogits + F1 metric)
   - singlelabel: pick ONE category per image (most frequent category in that image) (CrossEntropy + top1 acc)
 
 Example:
-python3 probe.py --ckpt logs/my_run/step_4000.tar --label_mode multilabel
-python3 probe.py --ckpt logs/my_run/step_4000.tar --label_mode singlelabel
-python3 probe.py --ckpts logs/run1/step_2000.tar logs/run2/step_4000.tar --max_parallel 2
-python3 probe.py --ckpts logs/run1/step_2000.tar logs/run2/step_4000.tar --multi_mode lockstep
-python3 probe.py --ckpt logs/my_run/step_4000.tar --amp --compile
+python3 -m evals.probe --ckpt logs/my_run/step_4000.tar --label_mode multilabel
+python3 -m evals.probe --ckpt logs/my_run/step_4000.tar --label_mode singlelabel
+python3 -m evals.probe --ckpts logs/run1/step_2000.tar logs/run2/step_4000.tar --max_parallel 2
+python3 -m evals.probe --ckpts logs/run1/step_2000.tar logs/run2/step_4000.tar --multi_mode lockstep
+python3 -m evals.probe --ckpt logs/my_run/step_4000.tar --amp --compile
 """
 
 import os
@@ -34,12 +34,13 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
-from vae import VariationalAutoEncoder as VAE,VariationalAutoEncoderRes as VAEr, VAEConfig
-from train import Logger
+from models.vae import VariationalAutoEncoder as VAE, VariationalAutoEncoderRes as VAEr, VAEConfig
+from models.vae import ViTVAE2 as ViTVAE
+from train.train import Logger
 
 # match train.py defaults
-DATA_DIR_DEFAULT = "/Users/williamdreese/percy/vqa/VQA/Images/mscoco/"
-ANNO_DIR_DEFAULT = "/Users/williamdreese/percy/vqa/VQA/Annotations/"
+DATA_DIR_DEFAULT = "/Users/williamdreese/percy/vqa/vqafromscratch/images/mscoco/"
+ANNO_DIR_DEFAULT = "/Users/williamdreese/percy/vqa/vqafromscratch/annotations/"
 COLOR_MEAN = (0.485, 0.456, 0.406)
 COLOR_STD  = (0.229, 0.224, 0.225)
 SEED = 35
@@ -513,9 +514,16 @@ def run_probes_lockstep(ckpt_paths: list[str], args: argparse.Namespace) -> None
             ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
             vae.load_state_dict(ckpt["model_state_dict"])
         except:
-            vae = VAEr(VAEConfig()).to(device)
-            ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-            vae.load_state_dict(ckpt["model_state_dict"])
+            try:
+                # config = VAEConfig(latent_dim=256, cbld=256) 
+                config = VAEConfig(latent_dim=768, cbld=1536) 
+                vae = ViTVAE(config).to(device)
+                ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+                vae.load_state_dict(ckpt["model_state_dict"])
+            except:
+                vae = VAEr(VAEConfig()).to(device)
+                ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+                vae.load_state_dict(ckpt["model_state_dict"])
         vae.eval()
         for p in vae.parameters():
             p.requires_grad_(False)

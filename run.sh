@@ -11,9 +11,9 @@ RUN_ID="$1"
 mkdir -pv "logs/$RUN_ID" 
 if [ $# -ge 2 ]; then
   CKPT_STEP="$2"
-  cat vae.py train.py > "logs/$RUN_ID/code_$CKPT_STEP.py"
-  python train.py "$RUN_ID" "$CKPT_STEP"
+  cat models/vae.py train/train.py > "logs/$RUN_ID/code_$CKPT_STEP.py"
+  python -m train.train "$RUN_ID" "$CKPT_STEP"
 else
-  cat vae.py train.py > "logs/$RUN_ID/code.py"
-  python train.py "$RUN_ID"
+  cat models/vae.py train/train.py > "logs/$RUN_ID/code.py"
+  python -m train.train "$RUN_ID"
 fi

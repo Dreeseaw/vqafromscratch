@@ -1,0 +1,2655 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LM Training Tracker</title>
+  <style>
+    :root {
+      --bg-0: #08121a;
+      --bg-1: #102533;
+      --bg-2: #17394d;
+      --card: rgba(6, 18, 28, 0.78);
+      --card-border: rgba(147, 208, 255, 0.24);
+      --text: #e8f5ff;
+      --muted: #9ab5c7;
+      --ok: #7cf7c1;
+      --warn: #ffd074;
+      --bad: #ff738b;
+      --shadow: 0 18px 38px rgba(0, 0, 0, 0.28);
+      --radius: 16px;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      color: var(--text);
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      background:
+        radial-gradient(1400px 560px at -2% -8%, #1f6c9f55 0%, transparent 60%),
+        radial-gradient(1000px 400px at 110% 5%, #17a27a44 0%, transparent 62%),
+        linear-gradient(165deg, var(--bg-0), var(--bg-1) 40%, var(--bg-2));
+      min-height: 100vh;
+    }
+
+    .grain {
+      pointer-events: none;
+      position: fixed;
+      inset: 0;
+      opacity: 0.08;
+      background-image: radial-gradient(circle at 25% 22%, #ffffff 0.3px, transparent 0.9px);
+      background-size: 11px 11px;
+      mix-blend-mode: screen;
+      z-index: 0;
+    }
+
+    .wrap {
+      position: relative;
+      z-index: 1;
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 18px 14px 36px;
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(1.15rem, 4.3vw, 1.85rem);
+      letter-spacing: 0.02em;
+      font-weight: 700;
+    }
+
+    .subtitle {
+      color: var(--muted);
+      font-size: 0.92rem;
+      margin-top: 2px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 90vw;
+    }
+
+    .live {
+      justify-self: end;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 11px;
+      border-radius: 999px;
+      border: 1px solid #4ef3be55;
+      background: #02251a77;
+      font-size: 0.83rem;
+    }
+
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 999px;
+      background: #5cffc2;
+      box-shadow: 0 0 0 0 rgba(92, 255, 194, 0.7);
+      animation: pulse 1.8s infinite;
+    }
+
+    .dot.stale {
+      background: #ff9a7a;
+      box-shadow: none;
+      animation: none;
+    }
+
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(92, 255, 194, 0.68); }
+      70% { box-shadow: 0 0 0 11px rgba(92, 255, 194, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(92, 255, 194, 0); }
+    }
+
+    .panel {
+      background: var(--card);
+      border: 1px solid var(--card-border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(4px);
+    }
+
+    .controls {
+      padding: 11px;
+      display: grid;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    .controls-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .field {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      background: #0f263580;
+      border: 1px solid #65c3ff38;
+      border-radius: 10px;
+      padding: 6px 8px;
+      min-height: 36px;
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+
+    .field input,
+    .field select {
+      width: 88px;
+      border: 0;
+      background: transparent;
+      color: var(--text);
+      font-size: 0.85rem;
+      outline: none;
+    }
+
+    .field input[type="checkbox"] {
+      width: 15px;
+      height: 15px;
+      accent-color: #4ed8ff;
+    }
+
+    .field input[type="range"] {
+      width: 120px;
+      accent-color: #64d6ff;
+    }
+
+    .btn {
+      border: 1px solid #6cc3ff66;
+      background: #1132479c;
+      color: #d7f3ff;
+      border-radius: 9px;
+      padding: 6px 10px;
+      font-size: 0.8rem;
+      cursor: pointer;
+    }
+
+    .btn:hover { filter: brightness(1.12); }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    .stat {
+      padding: 10px;
+      min-height: 68px;
+      display: grid;
+      gap: 4px;
+      align-content: center;
+    }
+
+    .stat .k {
+      color: var(--muted);
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .stat .v {
+      font-size: 1.02rem;
+      font-weight: 600;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 12px;
+    }
+
+    .chart {
+      padding: 11px;
+      display: grid;
+      gap: 8px;
+    }
+
+    .chart-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .chart-title {
+      margin: 0;
+      font-size: 0.95rem;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+      color: #c7e4f6;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+      justify-content: flex-end;
+    }
+
+    .pill {
+      font-size: 0.72rem;
+      color: #cbe9ff;
+      border-radius: 999px;
+      border: 1px solid #5cb8ff56;
+      padding: 2px 7px;
+      background: #0a273777;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      white-space: nowrap;
+    }
+
+    .swatch {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      display: inline-block;
+    }
+
+    canvas {
+      width: 100%;
+      height: 220px;
+      background: linear-gradient(180deg, #0a1e2b99, #081b2788);
+      border: 1px solid #4f9ccb44;
+      border-radius: 12px;
+      touch-action: none;
+    }
+
+    .meta {
+      margin-top: 12px;
+      padding: 10px;
+    }
+
+    .meta h3 {
+      margin: 0 0 8px;
+      font-size: 0.9rem;
+      color: #cbe6f7;
+    }
+
+    .attn-meta {
+      color: var(--muted);
+      font-size: 0.8rem;
+      line-height: 1.35;
+      word-break: break-word;
+    }
+
+    .attn-hover {
+      margin: 6px 0 6px;
+      color: #d7f0ff;
+      font-size: 0.76rem;
+      line-height: 1.35;
+      font-family: "SF Mono", Menlo, monospace;
+      min-height: 34px;
+      padding: 6px 8px;
+      border-radius: 8px;
+      border: 1px solid #5cb8ff56;
+      background: #082030cc;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .attn-legend {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 8px;
+      align-items: center;
+      margin: 4px 0 8px;
+      color: var(--muted);
+      font-size: 0.75rem;
+    }
+
+    .attn-legend-bar {
+      height: 10px;
+      border-radius: 999px;
+      border: 1px solid #5cb8ff56;
+      background: linear-gradient(
+        90deg,
+        hsl(220 85% 30%),
+        hsl(176 85% 36%),
+        hsl(132 85% 42%),
+        hsl(88 85% 48%),
+        hsl(44 85% 54%),
+        hsl(0 85% 58%)
+      );
+    }
+
+    .gen-scroll {
+      max-height: 280px;
+      overflow: auto;
+      display: grid;
+      gap: 8px;
+      padding-right: 4px;
+    }
+
+    .gen-item {
+      border: 1px solid #5cb8ff56;
+      border-radius: 10px;
+      padding: 8px;
+      background: #0a273777;
+      font-size: 0.8rem;
+    }
+
+    .grad-list {
+      margin-top: 8px;
+      display: grid;
+      gap: 6px;
+    }
+
+    .grad-item {
+      border: 1px solid #5cb8ff56;
+      border-radius: 8px;
+      padding: 6px 8px;
+      background: #0a273777;
+      color: #d7f0ff;
+      font-size: 0.76rem;
+      line-height: 1.35;
+      font-family: "SF Mono", Menlo, monospace;
+      word-break: break-word;
+    }
+
+    .mini-controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 8px;
+      align-items: center;
+    }
+
+    .compare-picked {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+      margin-bottom: 8px;
+    }
+
+    .compare-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid #5cb8ff56;
+      border-radius: 999px;
+      padding: 4px 8px;
+      background: #0a273777;
+      color: #d7f0ff;
+      font-size: 0.74rem;
+      max-width: 100%;
+    }
+
+    .compare-chip button {
+      border: 0;
+      background: transparent;
+      color: #a8d8f1;
+      cursor: pointer;
+      font-size: 0.8rem;
+      line-height: 1;
+      padding: 0;
+    }
+
+    .compare-results {
+      max-height: 170px;
+      overflow: auto;
+      display: grid;
+      gap: 6px;
+      margin-bottom: 8px;
+      padding-right: 3px;
+    }
+
+    .compare-color-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 8px;
+      color: var(--muted);
+      font-size: 0.74rem;
+    }
+
+    .compare-color-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid #5cb8ff56;
+      border-radius: 999px;
+      padding: 3px 8px;
+      background: #0a273777;
+      color: #d7f0ff;
+    }
+
+    .compare-color-swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      display: inline-block;
+    }
+
+    .compare-result {
+      border: 1px solid #5cb8ff56;
+      border-radius: 9px;
+      padding: 6px 8px;
+      background: #0a273777;
+      color: #dff5ff;
+      text-align: left;
+      cursor: pointer;
+      font-size: 0.76rem;
+      font-family: "SF Mono", Menlo, monospace;
+      width: 100%;
+    }
+
+    .compare-result:hover {
+      filter: brightness(1.1);
+    }
+
+    .compare-native {
+      display: none;
+    }
+
+    .ckpt-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .ckpt {
+      font-family: "SF Mono", Menlo, monospace;
+      font-size: 0.71rem;
+      border: 1px solid #7fbde34b;
+      border-radius: 8px;
+      padding: 4px 7px;
+      color: #d4efff;
+      background: #0f27387a;
+    }
+
+    .toasts {
+      position: fixed;
+      right: 10px;
+      bottom: 10px;
+      display: grid;
+      gap: 8px;
+      z-index: 4;
+      max-width: min(92vw, 360px);
+    }
+
+    .toast {
+      background: #0b2737ee;
+      color: #dff5ff;
+      border: 1px solid #6cc8ff66;
+      border-radius: 12px;
+      padding: 9px 11px;
+      font-size: 0.82rem;
+      animation: rise 260ms ease-out;
+      box-shadow: 0 12px 30px rgba(0,0,0,0.35);
+    }
+
+    @keyframes rise {
+      from { transform: translateY(12px); opacity: 0; }
+      to { transform: translateY(0); opacity: 1; }
+    }
+
+    @media (max-width: 680px) {
+      .wrap { padding: 12px 9px 30px; }
+      .controls-row { gap: 8px; }
+      .field { padding: 5px 7px; min-height: 34px; }
+      .field input[type="range"] { width: 92px; }
+      canvas { height: 190px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="grain"></div>
+  <div class="wrap">
+    <div class="hero">
+      <div>
+        <h1>LM Training Radar</h1>
+        <div class="subtitle" id="subtitle">Connecting...</div>
+      </div>
+      <div class="live"><span class="dot" id="liveDot"></span><span id="liveText">live</span></div>
+    </div>
+
+    <section class="panel controls">
+      <div class="controls-row">
+        <label class="field">mode
+          <select id="windowMode">
+            <option value="tail">tail</option>
+            <option value="range">range</option>
+          </select>
+        </label>
+        <label class="field">tail steps
+          <input id="tailSteps" type="number" min="20" step="20" value="5000" />
+        </label>
+        <label class="field">start
+          <input id="fromStep" type="number" step="1" value="0" />
+        </label>
+        <label class="field">end
+          <input id="toStep" type="number" step="1" value="0" />
+        </label>
+        <button class="btn" data-tail="1000">1k</button>
+        <button class="btn" data-tail="5000">5k</button>
+        <button class="btn" data-tail="20000">20k</button>
+        <button class="btn" id="btnAll">all</button>
+      </div>
+
+      <div class="controls-row">
+        <label class="field">smooth
+          <input id="smooth" type="range" min="1" max="40" value="1" />
+          <span id="smoothVal">1</span>
+        </label>
+        <label class="field">y-trim %
+          <input id="trimPct" type="range" min="0" max="15" value="1" />
+          <span id="trimVal">1</span>
+        </label>
+        <label class="field">scale
+          <select id="scaleType">
+            <option value="linear">linear</option>
+            <option value="log">log (positive only)</option>
+          </select>
+        </label>
+        <label class="field">metric filter
+          <input id="metricFilter" type="text" placeholder="ce, ppl, lr..." style="width:120px" />
+        </label>
+        <label class="field"><input id="autoScroll" type="checkbox" checked /> auto-follow</label>
+        <label class="field">hidden graph
+          <select id="hiddenGraphSelect" style="width:220px"></select>
+        </label>
+        <button class="btn" id="btnShowHidden">show selected</button>
+        <button class="btn" id="btnShowAllGraphs">show all graphs</button>
+      </div>
+    </section>
+
+    <section class="stats" id="stats"></section>
+
+    <section class="panel meta">
+      <h3>Top Grad Norm Layers</h3>
+      <div class="attn-meta" id="topGradMeta">No gradient layer ranking logged yet.</div>
+      <div class="grad-list" id="topGradList"></div>
+    </section>
+
+    <section class="grid graph-panel" id="chartGrid"></section>
+
+    <section class="panel chart graph-panel" id="comparePanel">
+      <div class="chart-head">
+        <h2 class="chart-title">Time Series Compare</h2>
+        <button class="btn" id="compareToggleBtn" type="button">hide</button>
+      </div>
+      <div class="mini-controls">
+        <label class="field">slot
+          <select id="compareSlotPick" style="width:80px">
+            <option value="0">A</option>
+            <option value="1">B</option>
+            <option value="2">C</option>
+            <option value="3">D</option>
+          </select>
+        </label>
+        <label class="field">search series
+          <input id="compareSearch" type="text" placeholder="type metric or probe..." style="width:220px" />
+        </label>
+        <button class="btn" id="compareClearSlot" type="button">clear slot</button>
+        <button class="btn" id="compareClearAll" type="button">clear all</button>
+      </div>
+      <div class="compare-picked" id="comparePicked"></div>
+      <div class="compare-results" id="compareSearchResults"></div>
+      <div class="compare-color-legend" id="compareColorLegend"></div>
+      <details class="compare-native">
+        <summary>native selectors</summary>
+        <div class="mini-controls">
+          <label class="field">series A
+            <select id="compareSeriesA" style="width:220px"></select>
+          </label>
+          <label class="field">series B
+            <select id="compareSeriesB" style="width:220px"></select>
+          </label>
+          <label class="field">series C
+            <select id="compareSeriesC" style="width:220px"></select>
+          </label>
+          <label class="field">series D
+            <select id="compareSeriesD" style="width:220px"></select>
+          </label>
+        </div>
+      </details>
+      <canvas id="compareCanvas" width="900" height="220"></canvas>
+      <div class="attn-meta" id="compareMeta">No time-series selected yet.</div>
+    </section>
+
+    <section class="panel chart graph-panel" id="attnPanel">
+      <div class="chart-head">
+        <h2 class="chart-title">Attention Grid Browser</h2>
+        <button class="btn" id="attnToggleBtn" type="button">hide</button>
+      </div>
+      <div class="mini-controls">
+        <label class="field">prompt #
+          <select id="attnPromptSelect" style="width:130px"></select>
+        </label>
+        <label class="field">attn block
+          <select id="attnBlockSelect" style="width:180px"></select>
+        </label>
+        <label class="field">layer
+          <select id="attnLayerSelect" style="width:130px"></select>
+        </label>
+        <label class="field">step
+          <select id="attnStepSelect" style="width:150px"></select>
+        </label>
+      </div>
+      <div class="attn-legend">
+        <span id="attnLegendMin">min</span>
+        <div class="attn-legend-bar"></div>
+        <span id="attnLegendMax">max</span>
+      </div>
+      <canvas id="attnHeatmap" width="900" height="260"></canvas>
+      <div class="attn-hover" id="attnHoverMeta">Hover a cell to inspect q/k token identity.</div>
+      <div class="attn-meta" id="attnMeta">No probe attention grid available yet.</div>
+    </section>
+
+    <section class="panel meta">
+      <h3>Probe Responses</h3>
+      <div class="mini-controls">
+        <label class="field">probe
+          <select id="genProbeSelect" style="width:120px"></select>
+        </label>
+      </div>
+      <div class="gen-scroll" id="genList"></div>
+    </section>
+
+    <section class="panel meta">
+      <h3>Routes</h3>
+      <div class="ckpt-list" id="routeLinks"></div>
+    </section>
+
+    <section class="panel meta">
+      <h3>Latest checkpoints</h3>
+      <div class="ckpt-list" id="ckptList"></div>
+    </section>
+  </div>
+
+  <div class="toasts" id="toasts"></div>
+
+  <script>
+    const PHASES = ["train", "val", "test", "other"];
+    const PHASE_COLORS = {
+      train: "#66d5ff",
+      val: "#7df7b0",
+      test: "#ffd576",
+      other: "#ff8fb2",
+    };
+    const COMPARE_SLOT_LABELS = ["A", "B", "C", "D"];
+    const COMPARE_SLOT_COLORS = ["#ffd576", "#7df7b0", "#66d5ff", "#ff8fb2"];
+    const GRAPH_PREF_COOKIE = "lm_graph_prefs_v1";
+
+    const state = {
+      minStep: Infinity,
+      maxStep: -Infinity,
+      partial: "",
+      flushTimer: null,
+      lastActivityMs: Date.now(),
+      metricGroups: new Map(), // metric -> { displayName, phases: Map<phase, series> }
+      lastStepByPhase: { train: 0, val: 0, test: 0, other: 0 },
+      bestVal: { ce: Infinity, step: null },
+      eventCount: 0,
+      reconnects: 0,
+      latestAttention: null,
+      attentionIndex: [],
+      attentionIndexMeta: { mtimeMs: 0, count: 0 },
+      selectedAttentionFile: "",
+      attnSelection: { prompt: null, block: "", layer: null, step: null },
+      attnHover: null,
+      attnGeom: null,
+      probeRecords: [],
+      probeSeriesMap: new Map(),
+      baselineSeriesMap: new Map(),
+      compareOptions: [],
+      generationRecords: [],
+      generationProbes: [],
+      topGrad: { step: null, entries: [] },
+      hiddenGraphs: { metrics: {}, compare: false, attention: false },
+    };
+
+    const els = {
+      subtitle: document.getElementById("subtitle"),
+      liveDot: document.getElementById("liveDot"),
+      liveText: document.getElementById("liveText"),
+      chartGrid: document.getElementById("chartGrid"),
+      stats: document.getElementById("stats"),
+      topGradMeta: document.getElementById("topGradMeta"),
+      topGradList: document.getElementById("topGradList"),
+      ckptList: document.getElementById("ckptList"),
+      genProbeSelect: document.getElementById("genProbeSelect"),
+      genList: document.getElementById("genList"),
+      routeLinks: document.getElementById("routeLinks"),
+      compareSeriesA: document.getElementById("compareSeriesA"),
+      compareSeriesB: document.getElementById("compareSeriesB"),
+      compareSeriesC: document.getElementById("compareSeriesC"),
+      compareSeriesD: document.getElementById("compareSeriesD"),
+      compareSlotPick: document.getElementById("compareSlotPick"),
+      compareSearch: document.getElementById("compareSearch"),
+      compareClearSlot: document.getElementById("compareClearSlot"),
+      compareClearAll: document.getElementById("compareClearAll"),
+      comparePicked: document.getElementById("comparePicked"),
+      compareSearchResults: document.getElementById("compareSearchResults"),
+      compareColorLegend: document.getElementById("compareColorLegend"),
+      comparePanel: document.getElementById("comparePanel"),
+      compareToggleBtn: document.getElementById("compareToggleBtn"),
+      compareCanvas: document.getElementById("compareCanvas"),
+      compareMeta: document.getElementById("compareMeta"),
+      attnPanel: document.getElementById("attnPanel"),
+      attnToggleBtn: document.getElementById("attnToggleBtn"),
+      attnHeatmap: document.getElementById("attnHeatmap"),
+      attnHoverMeta: document.getElementById("attnHoverMeta"),
+      attnMeta: document.getElementById("attnMeta"),
+      attnLegendMin: document.getElementById("attnLegendMin"),
+      attnLegendMax: document.getElementById("attnLegendMax"),
+      attnPromptSelect: document.getElementById("attnPromptSelect"),
+      attnBlockSelect: document.getElementById("attnBlockSelect"),
+      attnLayerSelect: document.getElementById("attnLayerSelect"),
+      attnStepSelect: document.getElementById("attnStepSelect"),
+      toasts: document.getElementById("toasts"),
+      windowMode: document.getElementById("windowMode"),
+      tailSteps: document.getElementById("tailSteps"),
+      fromStep: document.getElementById("fromStep"),
+      toStep: document.getElementById("toStep"),
+      smooth: document.getElementById("smooth"),
+      smoothVal: document.getElementById("smoothVal"),
+      trimPct: document.getElementById("trimPct"),
+      trimVal: document.getElementById("trimVal"),
+      scaleType: document.getElementById("scaleType"),
+      metricFilter: document.getElementById("metricFilter"),
+      autoScroll: document.getElementById("autoScroll"),
+      hiddenGraphSelect: document.getElementById("hiddenGraphSelect"),
+      btnShowHidden: document.getElementById("btnShowHidden"),
+      btnShowAllGraphs: document.getElementById("btnShowAllGraphs"),
+      btnAll: document.getElementById("btnAll"),
+    };
+
+    let rafQueued = false;
+
+    function readCookie(name) {
+      const parts = String(document.cookie || "").split(";");
+      const prefix = `${name}=`;
+      for (const raw of parts) {
+        const part = raw.trim();
+        if (!part.startsWith(prefix)) continue;
+        return decodeURIComponent(part.slice(prefix.length));
+      }
+      return "";
+    }
+
+    function writeCookie(name, value, maxAgeSec = 3600 * 24 * 365) {
+      document.cookie =
+        `${name}=${encodeURIComponent(value)}; Max-Age=${Math.max(1, Math.trunc(maxAgeSec))}; Path=/; SameSite=Lax`;
+    }
+
+    function loadGraphPrefsFromCookie() {
+      try {
+        const raw = readCookie(GRAPH_PREF_COOKIE);
+        if (!raw) return;
+        const parsed = JSON.parse(raw);
+        const hiddenMetrics = parsed && typeof parsed.hidden_metrics === "object" ? parsed.hidden_metrics : {};
+        const hidden = { metrics: {}, compare: false, attention: false };
+        for (const [k, v] of Object.entries(hiddenMetrics || {})) {
+          if (String(k || "") && !!v) hidden.metrics[String(k)] = true;
+        }
+        hidden.compare = !!parsed?.compare;
+        hidden.attention = !!parsed?.attention;
+        state.hiddenGraphs = hidden;
+      } catch {
+        state.hiddenGraphs = { metrics: {}, compare: false, attention: false };
+      }
+    }
+
+    function saveGraphPrefsToCookie() {
+      const payload = {
+        hidden_metrics: state.hiddenGraphs.metrics || {},
+        compare: !!state.hiddenGraphs.compare,
+        attention: !!state.hiddenGraphs.attention,
+      };
+      try {
+        writeCookie(GRAPH_PREF_COOKIE, JSON.stringify(payload));
+      } catch {
+        // no-op
+      }
+    }
+
+    function isMetricHidden(metric) {
+      return !!state.hiddenGraphs?.metrics?.[String(metric || "")];
+    }
+
+    function setMetricHidden(metric, hidden) {
+      const key = String(metric || "");
+      if (!key) return;
+      if (!state.hiddenGraphs || typeof state.hiddenGraphs !== "object") {
+        state.hiddenGraphs = { metrics: {}, compare: false, attention: false };
+      }
+      if (!state.hiddenGraphs.metrics || typeof state.hiddenGraphs.metrics !== "object") {
+        state.hiddenGraphs.metrics = {};
+      }
+      if (hidden) state.hiddenGraphs.metrics[key] = true;
+      else delete state.hiddenGraphs.metrics[key];
+      saveGraphPrefsToCookie();
+    }
+
+    function toggleMetricHidden(metric) {
+      const next = !isMetricHidden(metric);
+      setMetricHidden(metric, next);
+      queueDraw();
+    }
+
+    function setPanelHidden(panelName, hidden) {
+      const key = String(panelName || "");
+      if (key !== "compare" && key !== "attention") return;
+      if (!state.hiddenGraphs || typeof state.hiddenGraphs !== "object") {
+        state.hiddenGraphs = { metrics: {}, compare: false, attention: false };
+      }
+      state.hiddenGraphs[key] = !!hidden;
+      saveGraphPrefsToCookie();
+    }
+
+    function togglePanelHidden(panelName) {
+      const key = String(panelName || "");
+      if (key !== "compare" && key !== "attention") return;
+      setPanelHidden(key, !state.hiddenGraphs[key]);
+      queueDraw();
+    }
+
+    function applyGraphVisibility() {
+      const compareHidden = !!state.hiddenGraphs?.compare;
+      const attentionHidden = !!state.hiddenGraphs?.attention;
+      if (els.comparePanel) {
+        els.comparePanel.style.display = compareHidden ? "none" : "grid";
+      }
+      if (els.compareToggleBtn) {
+        els.compareToggleBtn.textContent = compareHidden ? "show" : "hide";
+      }
+      if (els.attnPanel) {
+        els.attnPanel.style.display = attentionHidden ? "none" : "grid";
+      }
+      if (els.attnToggleBtn) {
+        els.attnToggleBtn.textContent = attentionHidden ? "show" : "hide";
+      }
+    }
+
+    function queueDraw() {
+      if (rafQueued) return;
+      rafQueued = true;
+      requestAnimationFrame(() => {
+        rafQueued = false;
+        applyGraphVisibility();
+        drawAllCharts();
+        drawStats();
+        drawTopGrad();
+        refreshCompareOptions();
+        if (!state.hiddenGraphs.compare) {
+          drawCompareChart();
+        }
+        if (!state.hiddenGraphs.attention) {
+          drawAttentionHeatmap();
+        }
+        refreshHiddenGraphOptions();
+        drawGenerations();
+        drawRouteLinks();
+      });
+    }
+
+    function heatColor(tRaw) {
+      const t = clamp(tRaw, 0, 1);
+      const hue = (1 - t) * 220;
+      const sat = 85;
+      const light = 30 + 28 * t;
+      return `hsl(${hue.toFixed(0)} ${sat}% ${light.toFixed(1)}%)`;
+    }
+
+    function clamp(v, lo, hi) {
+      return Math.max(lo, Math.min(hi, v));
+    }
+
+    function parseNumber(value) {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : null;
+    }
+
+    function escapeTokenText(value) {
+      if (value === null || value === undefined) return "(n/a)";
+      return JSON.stringify(String(value)).slice(1, -1);
+    }
+
+    function getAxisToken(payload, axis, idx) {
+      const idKey = axis === "q" ? "q_token_ids" : "k_token_ids";
+      const tokKey = axis === "q" ? "q_tokens" : "k_tokens";
+      const ids = Array.isArray(payload?.[idKey]) ? payload[idKey] : [];
+      const toks = Array.isArray(payload?.[tokKey]) ? payload[tokKey] : [];
+      const id = idx >= 0 && idx < ids.length ? Number(ids[idx]) : null;
+      const tok = idx >= 0 && idx < toks.length ? toks[idx] : null;
+      return {
+        id: Number.isFinite(id) ? id : null,
+        tok: tok === null || tok === undefined ? null : String(tok),
+      };
+    }
+
+    function updateAttentionHoverMeta(payload, hover, value) {
+      const out = els.attnHoverMeta;
+      if (!out) return;
+      if (!payload || !hover) {
+        out.textContent = "Hover a cell to inspect q/k token identity.";
+        return;
+      }
+      const q = getAxisToken(payload, "q", hover.row);
+      const k = getAxisToken(payload, "k", hover.col);
+      const valStr = Number.isFinite(value) ? Number(value).toExponential(4) : "nan";
+      out.textContent =
+        `q#${hover.row} id=${q.id ?? "?"} tok="${escapeTokenText(q.tok)}"\n` +
+        `k#${hover.col} id=${k.id ?? "?"} tok="${escapeTokenText(k.tok)}"\n` +
+        `value=${valStr}`;
+    }
+
+    function normalizeMetricKey(raw) {
+      let out = raw.toLowerCase();
+      out = out.replace(/[()]/g, " ");
+      out = out.replace(/[^a-z0-9]+/g, "_");
+      out = out.replace(/^_+|_+$/g, "");
+      out = out.replace(/^train_/, "");
+      out = out.replace(/^validation_/, "");
+      out = out.replace(/^val_/, "");
+      out = out.replace(/^test_/, "");
+      return out;
+    }
+
+    function isProbeMetricKey(metric) {
+      return /^probe\d+_/i.test(String(metric || ""));
+    }
+
+    function prettifyMetric(metric) {
+      return metric.replace(/_/g, " ");
+    }
+
+    function detectPhase(segment) {
+      const s = segment.trim();
+      if (/^validation\b/i.test(s)) return "val";
+      if (/^test\b/i.test(s)) return "test";
+      if (/\btrain\b/i.test(s) || /^epoch\b/i.test(s)) return "train";
+      return "other";
+    }
+
+    function splitByMarkers(text) {
+      if (!text) return [];
+      const starts = [];
+      const re = /Epoch:\s*\d+\/\d+|Validation\s+Step\s*[:=]\s*\d+|Test(?:\s+Step\s*[:=]\s*\d+|\s+CE\s*=)|\bStep\s*[:=]\s*\d+/gi;
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        starts.push(m.index);
+        if (m.index === re.lastIndex) re.lastIndex += 1;
+      }
+
+      if (starts.length <= 1) return [text.trim()].filter(Boolean);
+
+      const out = [];
+      const prefix = text.slice(0, starts[0]).trim();
+      if (prefix) out.push(prefix);
+
+      for (let i = 0; i < starts.length; i++) {
+        const from = starts[i];
+        const to = i + 1 < starts.length ? starts[i + 1] : text.length;
+        const seg = text.slice(from, to).trim();
+        if (seg) out.push(seg);
+      }
+
+      return out;
+    }
+
+    function upsertPoint(series, step, value) {
+      const idx = series.stepIndex.get(step);
+      if (idx === undefined) {
+        const point = { step, value };
+        series.points.push(point);
+        series.stepIndex.set(step, series.points.length - 1);
+      } else {
+        series.points[idx].value = value;
+      }
+    }
+
+    function getOrCreateSeries(metric, phase) {
+      let group = state.metricGroups.get(metric);
+      if (!group) {
+        group = {
+          metric,
+          displayName: prettifyMetric(metric),
+          phases: new Map(),
+          card: null,
+        };
+        state.metricGroups.set(metric, group);
+      }
+
+      let series = group.phases.get(phase);
+      if (!series) {
+        series = { phase, points: [], stepIndex: new Map() };
+        group.phases.set(phase, series);
+      }
+
+      return { group, series };
+    }
+
+    function parseTopGradSegment(segment, step) {
+      const topMatch = segment.match(/TopGradNorms\s*[:=]\s*\[([^\]]*)\]/i);
+      if (!topMatch) return false;
+      const raw = String(topMatch[1] || "").trim();
+      const entries = [];
+      if (raw.length > 0) {
+        const items = raw.split(";").map((x) => x.trim()).filter(Boolean);
+        for (const item of items) {
+          const m = item.match(/^(.+?)@([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)$/);
+          if (!m) continue;
+          const name = String(m[1] || "").trim();
+          const norm = parseNumber(m[2]);
+          if (!name || norm === null) continue;
+          entries.push({ name, norm });
+        }
+      }
+      entries.sort((a, b) => b.norm - a.norm);
+      state.topGrad = {
+        step: Number.isFinite(step) ? step : null,
+        entries: entries.slice(0, 5),
+      };
+      return true;
+    }
+
+    function parseSegment(segment) {
+      if (!segment || segment.length < 4) return;
+
+      const phase = detectPhase(segment);
+      const stepMatch = segment.match(/\bStep\s*[:=]\s*(\d+)/i);
+      let step = stepMatch ? Number(stepMatch[1]) : null;
+      if (!Number.isFinite(step)) {
+        const phaseStep = state.lastStepByPhase[phase];
+        const maxStep = state.maxStep;
+        if (Number.isFinite(phaseStep) && phaseStep > 0) step = phaseStep;
+        else if (Number.isFinite(maxStep) && maxStep > 0) step = maxStep;
+        else step = 0;
+      }
+      if (!stepMatch && phase === "other") return;
+
+      const topGradUpdated = parseTopGradSegment(segment, step);
+      const pairRe = /([A-Za-z][A-Za-z0-9_\-\/\s]*?)\s*[:=]\s*([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)/g;
+      let found = 0;
+      let m;
+
+      while ((m = pairRe.exec(segment)) !== null) {
+        const rawKey = m[1].trim();
+        const value = parseNumber(m[2]);
+        if (value === null) continue;
+
+        const key = normalizeMetricKey(rawKey);
+        if (!key || key === "step" || key === "epoch") continue;
+        if (key.startsWith("nats_token")) continue;
+        if (key === "tok" || key.endsWith("_tok")) continue;
+
+        const { series } = getOrCreateSeries(key, phase);
+        upsertPoint(series, step, value);
+        found += 1;
+      }
+
+      if (found === 0 && !topGradUpdated) return;
+
+      state.eventCount += 1;
+      state.lastActivityMs = Date.now();
+      state.lastStepByPhase[phase] = Math.max(state.lastStepByPhase[phase] || 0, step);
+      state.minStep = Math.min(state.minStep, step);
+      state.maxStep = Math.max(state.maxStep, step);
+
+      const ceSeries = state.metricGroups.get("ce")?.phases.get("val");
+      if (ceSeries && ceSeries.points.length > 0) {
+        const last = ceSeries.points[ceSeries.points.length - 1];
+        if (Number.isFinite(last.value) && last.value < state.bestVal.ce) {
+          state.bestVal = { ce: last.value, step: last.step };
+          toast(`New best val CE ${last.value.toFixed(4)} @ step ${last.step}`);
+        }
+      }
+    }
+
+    function flushPartialNow() {
+      const text = state.partial.trim();
+      if (text.length < 8) return;
+      parseSegment(text);
+      state.partial = "";
+      queueDraw();
+    }
+
+    function consumeIncomingText(text) {
+      if (!text) return;
+
+      state.partial += text.replace(/\r/g, "\n");
+
+      const lines = state.partial.split("\n");
+      state.partial = lines.pop() || "";
+
+      for (const line of lines) {
+        const chunks = splitByMarkers(line);
+        for (const chunk of chunks) parseSegment(chunk);
+      }
+
+      const inlineChunks = splitByMarkers(state.partial);
+      if (inlineChunks.length > 1) {
+        for (let i = 0; i < inlineChunks.length - 1; i++) {
+          parseSegment(inlineChunks[i]);
+        }
+        state.partial = inlineChunks[inlineChunks.length - 1] || "";
+      }
+
+      if (state.flushTimer) clearTimeout(state.flushTimer);
+      state.flushTimer = setTimeout(flushPartialNow, 260);
+
+      if (els.autoScroll.checked && Number.isFinite(state.maxStep)) {
+        els.toStep.value = String(state.maxStep);
+      }
+
+      queueDraw();
+    }
+
+    function getWindowBounds() {
+      if (!Number.isFinite(state.minStep) || !Number.isFinite(state.maxStep)) {
+        return { from: 0, to: 1 };
+      }
+
+      const mode = els.windowMode.value;
+      if (mode === "tail") {
+        const tail = Math.max(20, Number(els.tailSteps.value) || 5000);
+        const to = state.maxStep;
+        const from = Math.max(state.minStep, to - tail);
+        return { from, to };
+      }
+
+      const fromInput = Number(els.fromStep.value);
+      const toInput = Number(els.toStep.value);
+      let from = Number.isFinite(fromInput) ? fromInput : state.minStep;
+      let to = Number.isFinite(toInput) ? toInput : state.maxStep;
+      if (from > to) [from, to] = [to, from];
+      from = clamp(from, state.minStep, state.maxStep);
+      to = clamp(to, from, state.maxStep);
+      return { from, to };
+    }
+
+    function smoothPoints(points, win) {
+      if (win <= 1 || points.length < 3) return points;
+      const out = [];
+      let sum = 0;
+      const q = [];
+      for (const p of points) {
+        q.push(p.value);
+        sum += p.value;
+        if (q.length > win) sum -= q.shift();
+        out.push({ step: p.step, value: sum / q.length });
+      }
+      return out;
+    }
+
+    function quantile(sorted, q) {
+      if (sorted.length === 0) return 0;
+      const pos = (sorted.length - 1) * q;
+      const lo = Math.floor(pos);
+      const hi = Math.ceil(pos);
+      if (lo === hi) return sorted[lo];
+      const t = pos - lo;
+      return sorted[lo] * (1 - t) + sorted[hi] * t;
+    }
+
+    function setSelectOptions(
+      selectEl,
+      values,
+      formatter = (x) => String(x),
+      includeEmpty = false,
+      emptyLabel = "(none)"
+    ) {
+      const prev = selectEl.value;
+      selectEl.textContent = "";
+      if (includeEmpty) {
+        const empty = document.createElement("option");
+        empty.value = "";
+        empty.textContent = emptyLabel;
+        selectEl.appendChild(empty);
+      }
+      for (const value of values) {
+        const option = document.createElement("option");
+        option.value = String(value);
+        option.textContent = formatter(value);
+        selectEl.appendChild(option);
+      }
+      if (!includeEmpty && values.length === 0) {
+        const option = document.createElement("option");
+        option.value = "";
+        option.textContent = "(none)";
+        selectEl.appendChild(option);
+      }
+      if (prev === "" && includeEmpty) {
+        selectEl.value = "";
+      } else if (values.some((x) => String(x) === prev)) {
+        selectEl.value = prev;
+      }
+    }
+
+    function setGroupedSelectOptions(selectEl, groups, includeEmpty = true, emptyLabel = "(none)") {
+      const prev = selectEl.value;
+      selectEl.textContent = "";
+      if (includeEmpty) {
+        const empty = document.createElement("option");
+        empty.value = "";
+        empty.textContent = emptyLabel;
+        selectEl.appendChild(empty);
+      }
+      for (const group of groups || []) {
+        const opts = Array.isArray(group?.options) ? group.options : [];
+        if (opts.length === 0) continue;
+        const og = document.createElement("optgroup");
+        og.label = String(group.label || "group");
+        for (const item of opts) {
+          const opt = document.createElement("option");
+          opt.value = String(item.value);
+          opt.textContent = String(item.label);
+          og.appendChild(opt);
+        }
+        selectEl.appendChild(og);
+      }
+      const allValues = [];
+      for (const g of groups || []) {
+        for (const item of g.options || []) allValues.push(String(item.value));
+      }
+      if (prev === "" && includeEmpty) {
+        selectEl.value = "";
+      } else if (allValues.includes(prev)) {
+        selectEl.value = prev;
+      }
+    }
+
+    function hiddenGraphLabel(key) {
+      const s = String(key || "");
+      if (s === "panel|compare") return "Time Series Compare";
+      if (s === "panel|attention") return "Attention Grid Browser";
+      if (s.startsWith("metric|")) {
+        const metric = s.slice("metric|".length);
+        return `Metric: ${prettifyMetric(metric)}`;
+      }
+      return s || "(none)";
+    }
+
+    function getHiddenGraphKeys() {
+      const keys = [];
+      if (state.hiddenGraphs?.compare) keys.push("panel|compare");
+      if (state.hiddenGraphs?.attention) keys.push("panel|attention");
+      const metrics = state.hiddenGraphs?.metrics || {};
+      for (const [metric, hidden] of Object.entries(metrics)) {
+        if (hidden) keys.push(`metric|${metric}`);
+      }
+      keys.sort((a, b) => hiddenGraphLabel(a).localeCompare(hiddenGraphLabel(b)));
+      return keys;
+    }
+
+    function showHiddenGraphByKey(key) {
+      const s = String(key || "");
+      if (!s) return;
+      if (s === "panel|compare") {
+        setPanelHidden("compare", false);
+        return;
+      }
+      if (s === "panel|attention") {
+        setPanelHidden("attention", false);
+        return;
+      }
+      if (s.startsWith("metric|")) {
+        setMetricHidden(s.slice("metric|".length), false);
+      }
+    }
+
+    function refreshHiddenGraphOptions() {
+      const sel = els.hiddenGraphSelect;
+      if (!sel) return;
+      const keys = getHiddenGraphKeys();
+      setSelectOptions(sel, keys, (x) => hiddenGraphLabel(x), true, "(none)");
+    }
+
+    function drawAxes(ctx, w, h, xMin, xMax, yMin, yMax) {
+      const pad = { l: 48, r: 12, t: 14, b: 28 };
+      const left = pad.l;
+      const right = w - pad.r;
+      const top = pad.t;
+      const bottom = h - pad.b;
+
+      ctx.fillStyle = "#061520";
+      ctx.fillRect(0, 0, w, h);
+
+      ctx.strokeStyle = "#4f789440";
+      ctx.lineWidth = 1;
+
+      for (let i = 0; i <= 4; i++) {
+        const t = i / 4;
+        const y = bottom - (bottom - top) * t;
+        ctx.beginPath();
+        ctx.moveTo(left, y);
+        ctx.lineTo(right, y);
+        ctx.stroke();
+      }
+
+      for (let i = 0; i <= 6; i++) {
+        const t = i / 6;
+        const x = left + (right - left) * t;
+        ctx.beginPath();
+        ctx.moveTo(x, top);
+        ctx.lineTo(x, bottom);
+        ctx.stroke();
+      }
+
+      ctx.strokeStyle = "#89b8d977";
+      ctx.beginPath();
+      ctx.moveTo(left, top);
+      ctx.lineTo(left, bottom);
+      ctx.lineTo(right, bottom);
+      ctx.stroke();
+
+      ctx.fillStyle = "#b8d8eb";
+      ctx.font = "11px Menlo, monospace";
+
+      for (let i = 0; i <= 4; i++) {
+        const t = i / 4;
+        const y = bottom - (bottom - top) * t;
+        const v = yMin + (yMax - yMin) * t;
+        ctx.fillText(Number(v).toExponential(2), 3, y + 4);
+      }
+
+      for (let i = 0; i <= 4; i++) {
+        const t = i / 4;
+        const x = left + (right - left) * t;
+        const v = xMin + (xMax - xMin) * t;
+        ctx.fillText(Math.round(v).toString(), x - 12, h - 8);
+      }
+
+      return {
+        left,
+        right,
+        top,
+        bottom,
+        xMap: (x) => left + ((x - xMin) / Math.max(1e-9, xMax - xMin)) * (right - left),
+        yMap: (y) => bottom - ((y - yMin) / Math.max(1e-12, yMax - yMin)) * (bottom - top),
+      };
+    }
+
+    function drawSeriesLine(ctx, points, maps, color) {
+      if (points.length < 2) return;
+      const { xMap, yMap, bottom } = maps;
+
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = color;
+      ctx.beginPath();
+      for (let i = 0; i < points.length; i++) {
+        const x = xMap(points[i].step);
+        const y = yMap(points[i].value);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+
+      const g = ctx.createLinearGradient(0, maps.top, 0, bottom);
+      g.addColorStop(0, color + "44");
+      g.addColorStop(1, color + "00");
+
+      ctx.beginPath();
+      for (let i = 0; i < points.length; i++) {
+        const x = xMap(points[i].step);
+        const y = yMap(points[i].value);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      const lastX = xMap(points[points.length - 1].step);
+      const firstX = xMap(points[0].step);
+      ctx.lineTo(lastX, bottom);
+      ctx.lineTo(firstX, bottom);
+      ctx.closePath();
+      ctx.fillStyle = g;
+      ctx.fill();
+
+      const latest = points[points.length - 1];
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(xMap(latest.step), yMap(latest.value), 3.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    function ensureCard(group) {
+      if (group.card) return group.card;
+
+      const card = document.createElement("article");
+      card.className = "panel chart";
+      card.dataset.metric = group.metric;
+
+      const head = document.createElement("div");
+      head.className = "chart-head";
+
+      const title = document.createElement("h2");
+      title.className = "chart-title";
+      title.textContent = group.displayName;
+
+      const hideBtn = document.createElement("button");
+      hideBtn.className = "btn";
+      hideBtn.type = "button";
+      hideBtn.textContent = "hide";
+      hideBtn.addEventListener("click", () => {
+        toggleMetricHidden(group.metric);
+      });
+
+      const legend = document.createElement("div");
+      legend.className = "legend";
+
+      head.appendChild(title);
+      head.appendChild(hideBtn);
+
+      const canvas = document.createElement("canvas");
+      canvas.width = 900;
+      canvas.height = 220;
+
+      card.appendChild(head);
+      card.appendChild(legend);
+      card.appendChild(canvas);
+      els.chartGrid.appendChild(card);
+
+      group.card = { root: card, canvas, title, legend, hideBtn };
+      return group.card;
+    }
+
+    function drawGroup(group, bounds, smoothWin, trimPct, scaleType) {
+      const isProbeCard = isProbeMetricKey(group.metric);
+      if (isProbeCard) {
+        if (group.card) group.card.root.style.display = "none";
+        return;
+      }
+      const card = ensureCard(group);
+      const filterText = els.metricFilter.value.trim().toLowerCase();
+      const show =
+        !filterText || group.metric.includes(filterText) || group.displayName.includes(filterText);
+      const hidden = isMetricHidden(group.metric);
+      if (card.hideBtn) {
+        card.hideBtn.textContent = hidden ? "show" : "hide";
+      }
+      card.root.style.display = show && !hidden ? "grid" : "none";
+      if (!show) return;
+      if (hidden) return;
+
+      const ctx = card.canvas.getContext("2d");
+      const w = card.canvas.width;
+      const h = card.canvas.height;
+      const lowQ = trimPct / 100;
+      const highQ = 1 - lowQ;
+
+      const phasePoints = [];
+      const yAll = [];
+
+      for (const [phase, series] of group.phases.entries()) {
+        let pts = series.points.filter((p) => p.step >= bounds.from && p.step <= bounds.to);
+        if (pts.length < 2) continue;
+        pts = smoothPoints(pts, smoothWin);
+        for (const p of pts) yAll.push(p.value);
+        phasePoints.push({ phase, pts });
+      }
+
+      if (phasePoints.length === 0) {
+        card.legend.textContent = "";
+        ctx.clearRect(0, 0, w, h);
+        return;
+      }
+
+      let yMin = Math.min(...yAll);
+      let yMax = Math.max(...yAll);
+      if (!Number.isFinite(yMin) || !Number.isFinite(yMax)) return;
+      if (yMin === yMax) {
+        yMin -= 1;
+        yMax += 1;
+      }
+
+      if (trimPct > 0 && yAll.length > 10) {
+        const sorted = yAll.slice().sort((a, b) => a - b);
+        yMin = quantile(sorted, lowQ);
+        yMax = quantile(sorted, highQ);
+      }
+
+      if (scaleType === "log" && yMin > 0 && yMax > 0) {
+        yMin = Math.log10(yMin);
+        yMax = Math.log10(yMax);
+        phasePoints.forEach((x) => {
+          x.pts = x.pts.filter((p) => p.value > 0).map((p) => ({ step: p.step, value: Math.log10(p.value) }));
+        });
+      }
+
+      const maps = drawAxes(ctx, w, h, bounds.from, bounds.to, yMin, yMax);
+
+      card.legend.textContent = "";
+      for (const { phase, pts } of phasePoints) {
+        const color = PHASE_COLORS[phase] || PHASE_COLORS.other;
+        drawSeriesLine(ctx, pts, maps, color);
+
+        const chip = document.createElement("span");
+        chip.className = "pill";
+        const sw = document.createElement("span");
+        sw.className = "swatch";
+        sw.style.background = color;
+        chip.appendChild(sw);
+
+        const last = pts[pts.length - 1];
+        const labelValue = Number.isFinite(last?.value) ? last.value.toExponential(2) : "-";
+        chip.appendChild(document.createTextNode(`${phase}: ${labelValue}`));
+        card.legend.appendChild(chip);
+      }
+    }
+
+    function drawAllCharts() {
+      const groups = Array.from(state.metricGroups.values()).sort((a, b) => a.metric.localeCompare(b.metric));
+      if (groups.length === 0) return;
+
+      const bounds = getWindowBounds();
+      const smoothWin = Math.max(1, Number(els.smooth.value) || 1);
+      const trimPct = Math.max(0, Number(els.trimPct.value) || 0);
+      const scaleType = els.scaleType.value;
+
+      if (els.autoScroll.checked && state.maxStep > 0) {
+        els.fromStep.value = String(bounds.from);
+        els.toStep.value = String(bounds.to);
+      }
+
+      for (const group of groups) {
+        drawGroup(group, bounds, smoothWin, trimPct, scaleType);
+      }
+    }
+
+    function latestValue(metric, phase) {
+      const series = state.metricGroups.get(metric)?.phases.get(phase);
+      if (!series || series.points.length === 0) return "-";
+      const v = series.points[series.points.length - 1].value;
+      return Number.isFinite(v) ? v.toFixed(4) : "-";
+    }
+
+    function drawStats() {
+      const GLOBAL_CE_MIN = 5.950318;
+      const stats = [
+        ["step", Number.isFinite(state.maxStep) ? String(state.maxStep) : "-"],
+        ["train ce "+"("+GLOBAL_CE_MIN+")", latestValue("ce", "train")],
+        ["val ce", latestValue("ce", "val")],
+        ["train ppl", latestValue("ppl", "train")],
+        ["val ppl", latestValue("ppl", "val")],
+        ["lr", latestValue("lr", "train")],
+        ["tokens/s", latestValue("tokens_s", "train")],
+        ["events", String(state.eventCount)],
+      ];
+
+      els.stats.textContent = "";
+      for (const [k, v] of stats) {
+        const el = document.createElement("article");
+        el.className = "panel stat";
+        el.innerHTML = `<div class="k">${k}</div><div class="v">${v}</div>`;
+        els.stats.appendChild(el);
+      }
+    }
+
+    function drawTopGrad() {
+      const root = els.topGradList;
+      const meta = els.topGradMeta;
+      if (!root || !meta) return;
+      const snapshot = state.topGrad || { step: null, entries: [] };
+      const entries = Array.isArray(snapshot.entries) ? snapshot.entries : [];
+      root.textContent = "";
+      if (entries.length === 0) {
+        meta.textContent = "No gradient layer ranking logged yet.";
+        return;
+      }
+      meta.textContent = Number.isFinite(snapshot.step)
+        ? `latest snapshot @ step ${snapshot.step}`
+        : "latest snapshot";
+      for (let i = 0; i < entries.length; i++) {
+        const row = entries[i];
+        const item = document.createElement("div");
+        item.className = "grad-item";
+        const val = Number.isFinite(row.norm) ? Number(row.norm).toExponential(3) : "nan";
+        item.textContent = `#${i + 1}  ${val}  ${row.name}`;
+        root.appendChild(item);
+      }
+    }
+
+    function seriesLabelFromKey(key) {
+      if (!key) return "(none)";
+      if (key.startsWith("log|")) {
+        const [, phase, metric] = key.split("|");
+        return `log/${phase}/${metric}`;
+      }
+      if (key.startsWith("baseline|")) {
+        const [, phase, metric] = key.split("|");
+        return `baseline/${phase}/${metric}`;
+      }
+      if (key.startsWith("probe|")) {
+        const [, probe, layer, metric] = key.split("|");
+        return `probe${probe}/${layer}/${metric}`;
+      }
+      return key;
+    }
+
+    function getSeriesByKey(key) {
+      if (!key) return [];
+      if (key.startsWith("log|")) {
+        const [, phase, metric] = key.split("|");
+        const series = state.metricGroups.get(metric)?.phases.get(phase);
+        return Array.isArray(series?.points) ? series.points.slice() : [];
+      }
+      if (key.startsWith("baseline|")) {
+        const series = state.baselineSeriesMap.get(key);
+        return Array.isArray(series) ? series.slice() : [];
+      }
+      if (key.startsWith("probe|")) {
+        const series = state.probeSeriesMap.get(key);
+        return Array.isArray(series) ? series.slice() : [];
+      }
+      return [];
+    }
+
+    function compareSelectElements() {
+      return [els.compareSeriesA, els.compareSeriesB, els.compareSeriesC, els.compareSeriesD];
+    }
+
+    function getSelectedCompareKeys() {
+      return compareSelectElements()
+        .map((el) => (el ? String(el.value || "") : ""))
+        .filter(Boolean);
+    }
+
+    function setCompareSlotValue(slotIdx, key) {
+      const idx = clamp(Number(slotIdx), 0, 3);
+      const selects = compareSelectElements();
+      const selectEl = selects[idx];
+      if (!selectEl) return;
+      const value = String(key || "");
+      if (value !== "" && !Array.from(selectEl.options || []).some((x) => String(x.value) === value)) return;
+      selectEl.value = value;
+      selectEl.dispatchEvent(new Event("change"));
+    }
+
+    function drawComparePicked() {
+      const root = els.comparePicked;
+      if (!root) return;
+      root.textContent = "";
+      const selects = compareSelectElements();
+      for (let i = 0; i < selects.length; i++) {
+        const key = String(selects[i]?.value || "");
+        const chip = document.createElement("div");
+        chip.className = "compare-chip";
+        const labelText = key ? `${COMPARE_SLOT_LABELS[i]}: ${seriesLabelFromKey(key)}` : `${COMPARE_SLOT_LABELS[i]}: (none)`;
+        chip.appendChild(document.createTextNode(labelText));
+        const clearBtn = document.createElement("button");
+        clearBtn.type = "button";
+        clearBtn.textContent = "x";
+        clearBtn.title = `Clear slot ${COMPARE_SLOT_LABELS[i]}`;
+        clearBtn.addEventListener("click", () => setCompareSlotValue(i, ""));
+        chip.appendChild(clearBtn);
+        root.appendChild(chip);
+      }
+    }
+
+    function drawCompareColorLegend() {
+      const root = els.compareColorLegend;
+      if (!root) return;
+      root.textContent = "";
+      const selects = compareSelectElements();
+      for (let i = 0; i < COMPARE_SLOT_LABELS.length; i++) {
+        const key = String(selects[i]?.value || "");
+        const item = document.createElement("div");
+        item.className = "compare-color-item";
+        const sw = document.createElement("span");
+        sw.className = "compare-color-swatch";
+        sw.style.background = COMPARE_SLOT_COLORS[i];
+        item.appendChild(sw);
+        const label = key ? `${COMPARE_SLOT_LABELS[i]}: ${seriesLabelFromKey(key)}` : `${COMPARE_SLOT_LABELS[i]}: (none)`;
+        item.appendChild(document.createTextNode(label));
+        root.appendChild(item);
+      }
+    }
+
+    function refreshCompareSearchResults() {
+      const root = els.compareSearchResults;
+      if (!root) return;
+      const query = String(els.compareSearch?.value || "").trim().toLowerCase();
+      const slotIdx = clamp(Number(els.compareSlotPick?.value || 0), 0, 3);
+      const selectedKeys = new Set(getSelectedCompareKeys());
+      const filtered = state.compareOptions.filter((opt) => {
+        const label = String(opt?.label || "").toLowerCase();
+        const key = String(opt?.key || "").toLowerCase();
+        if (!query) return true;
+        return label.includes(query) || key.includes(query);
+      });
+      root.textContent = "";
+      if (filtered.length === 0) {
+        const none = document.createElement("div");
+        none.className = "attn-meta";
+        none.textContent = "No matching series.";
+        root.appendChild(none);
+        return;
+      }
+
+      const top = filtered.slice(0, 80);
+      for (const opt of top) {
+        const btn = document.createElement("button");
+        btn.className = "compare-result";
+        btn.type = "button";
+        const tag = selectedKeys.has(String(opt.key)) ? " [selected]" : "";
+        btn.textContent = `${opt.label}${tag}`;
+        btn.addEventListener("click", () => setCompareSlotValue(slotIdx, opt.key));
+        root.appendChild(btn);
+      }
+    }
+
+    function refreshCompareOptions() {
+      const options = [];
+      const logGroups = new Map();
+      for (const [metric, group] of state.metricGroups.entries()) {
+        if (isProbeMetricKey(metric)) continue;
+        for (const [phase, series] of group.phases.entries()) {
+          if (!series || !Array.isArray(series.points) || series.points.length === 0) continue;
+          const key = `log|${phase}|${metric}`;
+          options.push({ key, label: seriesLabelFromKey(key) });
+          const groupLabel = `Log / ${phase}`;
+          if (!logGroups.has(groupLabel)) logGroups.set(groupLabel, []);
+          logGroups.get(groupLabel).push({ value: key, label: prettifyMetric(metric) });
+        }
+      }
+      const baselineGroups = new Map();
+      for (const [key, series] of state.baselineSeriesMap.entries()) {
+        if (!Array.isArray(series) || series.length === 0) continue;
+        const parts = String(key).split("|");
+        if (parts.length < 3) continue;
+        const phase = parts[1];
+        const metric = parts.slice(2).join("|");
+        options.push({ key, label: seriesLabelFromKey(key) });
+        const groupLabel = `Baseline / ${phase}`;
+        if (!baselineGroups.has(groupLabel)) baselineGroups.set(groupLabel, []);
+        baselineGroups.get(groupLabel).push({ value: key, label: prettifyMetric(metric) });
+      }
+      const probeGroups = new Map();
+      for (const key of state.probeSeriesMap.keys()) {
+        options.push({ key, label: seriesLabelFromKey(key) });
+        const parts = String(key).split("|");
+        if (parts.length >= 4) {
+          const probe = parts[1];
+          const layer = parts[2];
+          const metric = parts.slice(3).join("|");
+          const groupLabel = `Probe ${probe} / ${layer}`;
+          if (!probeGroups.has(groupLabel)) probeGroups.set(groupLabel, []);
+          probeGroups.get(groupLabel).push({ value: key, label: prettifyMetric(metric) });
+        }
+      }
+      options.sort((a, b) => a.label.localeCompare(b.label));
+      state.compareOptions = options;
+      const groups = [];
+      for (const [label, opts] of Array.from(logGroups.entries()).sort((a, b) => a[0].localeCompare(b[0]))) {
+        opts.sort((a, b) => a.label.localeCompare(b.label));
+        groups.push({ label, options: opts });
+      }
+      for (const [label, opts] of Array.from(baselineGroups.entries()).sort((a, b) => a[0].localeCompare(b[0]))) {
+        opts.sort((a, b) => a.label.localeCompare(b.label));
+        groups.push({ label, options: opts });
+      }
+      for (const [label, opts] of Array.from(probeGroups.entries()).sort((a, b) => a[0].localeCompare(b[0]))) {
+        opts.sort((a, b) => a.label.localeCompare(b.label));
+        groups.push({ label, options: opts });
+      }
+      setGroupedSelectOptions(els.compareSeriesA, groups, true, "(none)");
+      setGroupedSelectOptions(els.compareSeriesB, groups, true, "(none)");
+      setGroupedSelectOptions(els.compareSeriesC, groups, true, "(none)");
+      setGroupedSelectOptions(els.compareSeriesD, groups, true, "(none)");
+      drawComparePicked();
+      drawCompareColorLegend();
+      refreshCompareSearchResults();
+    }
+
+    function drawCompareChart() {
+      const canvas = els.compareCanvas;
+      if (!canvas) return;
+      const ctx = canvas.getContext("2d");
+      const w = canvas.width;
+      const h = canvas.height;
+      ctx.fillStyle = "#061520";
+      ctx.fillRect(0, 0, w, h);
+
+      const slotKeys = compareSelectElements().map((el, idx) => ({ idx, key: String(el?.value || "") }));
+      const activeSlots = slotKeys.filter((x) => !!x.key);
+      if (activeSlots.length === 0) {
+        els.compareMeta.textContent = "Pick one or more series to compare.";
+        return;
+      }
+
+      const seriesPayload = [];
+      for (const slot of activeSlots) {
+        const key = slot.key;
+        const pts0 = getSeriesByKey(key);
+        if (pts0.length < 2) continue;
+        const pts = pts0
+          .map((p) => ({ step: Number(p.step), value: Number(p.value) }))
+          .filter((p) => Number.isFinite(p.step) && Number.isFinite(p.value))
+          .sort((a, b) => a.step - b.step);
+        if (pts.length < 2) continue;
+        seriesPayload.push({
+          key,
+          slot: slot.idx,
+          pts,
+          color: COMPARE_SLOT_COLORS[slot.idx],
+          slotLabel: COMPARE_SLOT_LABELS[slot.idx],
+        });
+      }
+
+      if (seriesPayload.length === 0) {
+        els.compareMeta.textContent = "Selected series do not have enough points.";
+        return;
+      }
+
+      const bounds = getWindowBounds();
+      const smoothWin = Math.max(1, Number(els.smooth.value) || 1);
+      const yVals = [];
+      let xMin = Infinity;
+      let xMax = -Infinity;
+      for (const s of seriesPayload) {
+        let pts = s.pts.filter((p) => p.step >= bounds.from && p.step <= bounds.to);
+        if (pts.length < 2) pts = s.pts;
+        pts = smoothPoints(pts, smoothWin);
+        s.pts = pts;
+        for (const p of pts) yVals.push(p.value);
+        if (pts.length > 0) {
+          xMin = Math.min(xMin, pts[0].step);
+          xMax = Math.max(xMax, pts[pts.length - 1].step);
+        }
+      }
+      if (!Number.isFinite(xMin) || !Number.isFinite(xMax) || yVals.length === 0) {
+        els.compareMeta.textContent = "No values in selected range.";
+        return;
+      }
+      let yMin = Math.min(...yVals);
+      let yMax = Math.max(...yVals);
+      if (yMin === yMax) {
+        yMin -= 1;
+        yMax += 1;
+      }
+
+      const maps = drawAxes(ctx, w, h, xMin, xMax, yMin, yMax);
+      const parts = [];
+      for (const s of seriesPayload) {
+        if (s.pts.length < 2) continue;
+        drawSeriesLine(ctx, s.pts, maps, s.color);
+        const last = s.pts[s.pts.length - 1];
+        parts.push(`${s.slotLabel}:${seriesLabelFromKey(s.key)}=${last.value.toExponential(3)}`);
+      }
+      els.compareMeta.textContent = parts.join(" | ");
+    }
+
+    function drawAttentionHeatmap() {
+      const canvas = els.attnHeatmap;
+      if (!canvas) return;
+      const ctx = canvas.getContext("2d");
+      const w = canvas.width;
+      const h = canvas.height;
+      ctx.fillStyle = "#061520";
+      ctx.fillRect(0, 0, w, h);
+
+      const payload = state.latestAttention;
+      if (!payload || !payload.grid || payload.grid.length === 0) {
+        els.attnMeta.textContent = "No probe attention grid available yet.";
+        state.attnGeom = null;
+        state.attnHover = null;
+        updateAttentionHoverMeta(null, null, null);
+        if (els.attnLegendMin) els.attnLegendMin.textContent = "min";
+        if (els.attnLegendMax) els.attnLegendMax.textContent = "max";
+        return;
+      }
+
+      const rows = payload.grid.length;
+      const cols = payload.grid[0]?.length || 0;
+      if (rows <= 0 || cols <= 0) {
+        els.attnMeta.textContent = "Attention grid is empty.";
+        state.attnGeom = null;
+        state.attnHover = null;
+        updateAttentionHoverMeta(payload, null, null);
+        if (els.attnLegendMin) els.attnLegendMin.textContent = "min";
+        if (els.attnLegendMax) els.attnLegendMax.textContent = "max";
+        return;
+      }
+
+      const vals = [];
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const v = Number(payload.grid[r][c]);
+          if (Number.isFinite(v)) vals.push(v);
+        }
+      }
+      if (vals.length === 0) {
+        els.attnMeta.textContent = "Attention grid has no finite values.";
+        state.attnGeom = null;
+        state.attnHover = null;
+        updateAttentionHoverMeta(payload, null, null);
+        if (els.attnLegendMin) els.attnLegendMin.textContent = "min";
+        if (els.attnLegendMax) els.attnLegendMax.textContent = "max";
+        return;
+      }
+
+      let vMin = Math.min(...vals);
+      let vMax = Math.max(...vals);
+      if (vMax <= vMin) {
+        vMax = vMin + 1e-6;
+      }
+      if (els.attnLegendMin) els.attnLegendMin.textContent = vMin.toExponential(2);
+      if (els.attnLegendMax) els.attnLegendMax.textContent = vMax.toExponential(2);
+
+      const pad = { l: 56, r: 12, t: 14, b: 36 };
+      const left = pad.l;
+      const top = pad.t;
+      const plotW = w - pad.l - pad.r;
+      const plotH = h - pad.t - pad.b;
+      // Flip display axes: x=Q (query), y=K (key).
+      const displayRows = cols;
+      const displayCols = rows;
+      const cellW = plotW / displayCols;
+      const cellH = plotH / displayRows;
+      state.attnGeom = { left, top, plotW, plotH, rows: displayRows, cols: displayCols, cellW, cellH };
+
+      for (let r = 0; r < displayRows; r++) {
+        for (let c = 0; c < displayCols; c++) {
+          const qIdx = c;
+          const kIdx = r;
+          const raw = Number(payload.grid[qIdx]?.[kIdx]);
+          const t = Number.isFinite(raw) ? (raw - vMin) / (vMax - vMin) : 0;
+          ctx.fillStyle = heatColor(t);
+          const x = left + c * cellW;
+          const y = top + r * cellH;
+          ctx.fillRect(x, y, Math.max(1, cellW + 0.5), Math.max(1, cellH + 0.5));
+        }
+      }
+
+      let hoverValue = null;
+      if (state.attnHover) {
+        const hr = clamp(Number(state.attnHover.row), 0, displayRows - 1);
+        const hc = clamp(Number(state.attnHover.col), 0, displayCols - 1);
+        const qIdx = hc;
+        const kIdx = hr;
+        const x = left + hc * cellW;
+        const y = top + hr * cellH;
+        hoverValue = Number(payload.grid[qIdx]?.[kIdx]);
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(x + 0.5, y + 0.5, Math.max(1, cellW - 1), Math.max(1, cellH - 1));
+        ctx.strokeStyle = "#00253e";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(x + 1.5, y + 1.5, Math.max(1, cellW - 3), Math.max(1, cellH - 3));
+        updateAttentionHoverMeta(payload, { row: qIdx, col: kIdx }, hoverValue);
+      } else {
+        updateAttentionHoverMeta(payload, null, null);
+      }
+
+      ctx.strokeStyle = "#89b8d977";
+      ctx.strokeRect(left, top, plotW, plotH);
+      ctx.fillStyle = "#b8d8eb";
+      ctx.font = "11px Menlo, monospace";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "alphabetic";
+      ctx.fillText("0", left - 22, top + 10);
+      ctx.fillText(String(cols - 1), left - 42, top + plotH - 2);
+      ctx.fillText("0", left, top + plotH + 14);
+      ctx.textAlign = "right";
+      ctx.fillText(String(rows - 1), left + plotW, top + plotH + 14);
+      ctx.textAlign = "center";
+      ctx.fillText("query index (Q, columns)", left + plotW * 0.5, h - 6);
+      ctx.save();
+      ctx.translate(15, top + plotH * 0.5);
+      ctx.rotate(-Math.PI / 2);
+      ctx.textAlign = "center";
+      ctx.fillText("key index (K, rows)", 0, 0);
+      ctx.restore();
+      ctx.textAlign = "left";
+      ctx.fillStyle = "#95c3de";
+      ctx.fillText("(q=0,k=0)", left + 4, top + 12);
+
+      const promptSnippet = (payload.prompt || "").replace(/\s+/g, " ").slice(0, 120);
+      els.attnMeta.textContent =
+        `prompt# ${payload.probe_idx} | attn_block ${payload.scope}/${payload.kind} | layer ${payload.layer} | step ${payload.step} | ` +
+        `${payload.kind} grid ${rows}x${cols} | display rows=key (top->bottom), display cols=query (left->right) | min=${vMin.toExponential(2)} max=${vMax.toExponential(2)} | ` +
+        `prompt: ${promptSnippet}`;
+    }
+
+    function drawCheckpoints(items) {
+      els.ckptList.textContent = "";
+      for (const item of items || []) {
+        const div = document.createElement("div");
+        div.className = "ckpt";
+        const mb = (item.bytes / (1024 * 1024)).toFixed(1);
+        div.textContent = `${item.file} (${mb} MB)`;
+        els.ckptList.appendChild(div);
+      }
+      if (!items || items.length === 0) {
+        const none = document.createElement("div");
+        none.className = "ckpt";
+        none.textContent = "No checkpoints yet";
+        els.ckptList.appendChild(none);
+      }
+    }
+
+    function drawRouteLinks() {
+      const root = els.routeLinks;
+      if (!root) return;
+      const routes = [
+        "/",
+        "/meta",
+        "/checkpoints",
+        "/baseline",
+        "/probe_debug/records",
+        "/probe_debug/generations",
+        "/probe_debug/attention_index_meta",
+        "/probe_debug/attention_index?compact=1",
+        "/probe_debug/latest_attention",
+      ];
+      if (state.selectedAttentionFile) {
+        routes.push(`/probe_debug/attention_grid?file=${encodeURIComponent(state.selectedAttentionFile)}`);
+      }
+      root.textContent = "";
+      for (const route of routes) {
+        const a = document.createElement("a");
+        a.className = "ckpt";
+        a.href = route;
+        a.textContent = route;
+        root.appendChild(a);
+      }
+    }
+
+    function drawGenerations() {
+      const root = els.genList;
+      if (!root) return;
+      const probeValue = els.genProbeSelect.value;
+      const selectedProbe = probeValue === "" ? null : Number(probeValue);
+      const rows = state.generationRecords
+        .filter((r) => selectedProbe === null || r.probe_idx === selectedProbe)
+        .sort((a, b) => b.step - a.step)
+        .slice(0, 40);
+
+      root.textContent = "";
+      if (rows.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "attn-meta";
+        empty.textContent = "No generated probe responses yet.";
+        root.appendChild(empty);
+        return;
+      }
+
+      for (const row of rows) {
+        const item = document.createElement("div");
+        item.className = "gen-item";
+        const header = document.createElement("div");
+        header.className = "attn-meta";
+        header.textContent = `step ${row.step} | probe ${row.probe_idx} | stop=${row.stop_reason}`;
+        const prompt = document.createElement("div");
+        prompt.textContent = `prompt: ${row.prompt}`;
+        const gen = document.createElement("div");
+        gen.textContent = `generated: ${row.generated_text}`;
+        item.appendChild(header);
+        item.appendChild(prompt);
+        item.appendChild(gen);
+        root.appendChild(item);
+      }
+    }
+
+    function toast(text) {
+      const node = document.createElement("div");
+      node.className = "toast";
+      node.textContent = text;
+      els.toasts.appendChild(node);
+      setTimeout(() => {
+        node.remove();
+      }, 4200);
+    }
+
+    async function refreshMeta() {
+      try {
+        const res = await fetch("/meta", { cache: "no-store" });
+        if (!res.ok) return;
+        const meta = await res.json();
+        const mode = String(meta.logMode || "single");
+        let logsLabel = String(meta.logfile || "");
+        if (Array.isArray(meta.logfiles) && meta.logfiles.length > 0) {
+          logsLabel = meta.logfiles
+            .map((x) => (x && typeof x === "object" && x.file ? String(x.file) : String(x)))
+            .join(", ");
+        }
+        const baselineLabel = meta.baselineLogfile ? ` | baseline=${meta.baselineLogfile}` : "";
+        els.subtitle.textContent = `${meta.runDir} | mode=${mode} | logs=${logsLabel}${baselineLabel}`;
+        drawCheckpoints(meta.checkpoints || []);
+      } catch {
+        // no-op
+      }
+    }
+
+    async function refreshBaselineSeries() {
+      try {
+        const res = await fetch("/baseline", { cache: "no-store" });
+        if (!res.ok) return;
+        const payload = await res.json();
+        if (!payload.available) {
+          state.baselineSeriesMap = new Map();
+          queueDraw();
+          return;
+        }
+        const rows = Array.isArray(payload.series) ? payload.series : [];
+        const map = new Map();
+        for (const row of rows) {
+          const phase = String(row?.phase || "");
+          const metric = String(row?.metric || "");
+          const pointsRaw = Array.isArray(row?.points) ? row.points : [];
+          if (!phase || !metric || pointsRaw.length === 0) continue;
+          const byStep = new Map();
+          for (const p of pointsRaw) {
+            const step = Number(p?.step);
+            const value = Number(p?.value);
+            if (!Number.isFinite(step) || !Number.isFinite(value)) continue;
+            byStep.set(step, value);
+          }
+          if (byStep.size === 0) continue;
+          const points = Array.from(byStep.entries())
+            .map(([step, value]) => ({ step, value }))
+            .sort((a, b) => a.step - b.step);
+          const key = `baseline|${phase}|${metric}`;
+          map.set(key, points);
+        }
+        state.baselineSeriesMap = map;
+        queueDraw();
+      } catch {
+        // no-op
+      }
+    }
+
+    async function refreshProbeRecords() {
+      try {
+        const res = await fetch("/probe_debug/records", { cache: "no-store" });
+        if (!res.ok) return;
+        const payload = await res.json();
+        if (!payload.available) {
+          state.probeRecords = [];
+          state.probeSeriesMap = new Map();
+          queueDraw();
+          return;
+        }
+        state.probeRecords = Array.isArray(payload.records) ? payload.records : [];
+        const map = new Map();
+        for (const r of state.probeRecords) {
+          const key = `probe|${r.probe_idx}|${r.layer}|${r.metric}`;
+          if (!map.has(key)) map.set(key, []);
+          map.get(key).push({ step: Number(r.step), value: Number(r.value) });
+        }
+        for (const [k, arr] of map.entries()) {
+          arr.sort((a, b) => a.step - b.step);
+          const dedup = [];
+          for (const p of arr) {
+            if (dedup.length > 0 && dedup[dedup.length - 1].step === p.step) dedup[dedup.length - 1] = p;
+            else dedup.push(p);
+          }
+          map.set(k, dedup);
+        }
+        state.probeSeriesMap = map;
+        queueDraw();
+      } catch {
+        // no-op
+      }
+    }
+
+    async function refreshGenerations() {
+      try {
+        const res = await fetch("/probe_debug/generations", { cache: "no-store" });
+        if (!res.ok) return;
+        const payload = await res.json();
+        if (!payload.available) {
+          state.generationRecords = [];
+          state.generationProbes = [];
+          setSelectOptions(els.genProbeSelect, [], (x) => `probe ${x}`, true, "all probes");
+          queueDraw();
+          return;
+        }
+        state.generationRecords = Array.isArray(payload.records) ? payload.records : [];
+        state.generationProbes = Array.isArray(payload.probes) ? payload.probes : [];
+        setSelectOptions(els.genProbeSelect, state.generationProbes, (x) => `probe ${x}`, true, "all probes");
+        queueDraw();
+      } catch {
+        // no-op
+      }
+    }
+
+    function setSelectedAttentionFile(file) {
+      state.selectedAttentionFile = file || "";
+    }
+
+    function attnBlockValue(item) {
+      return `${item.scope}|${item.kind}`;
+    }
+
+    function attnBlockLabel(value) {
+      const [scope, kind] = String(value || "").split("|");
+      return `${scope}/${kind}`;
+    }
+
+    function _toNumOrNull(v) {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    }
+
+    function syncAttnFieldOptions(preferLatestStep = true) {
+      const items = Array.isArray(state.attentionIndex) ? state.attentionIndex : [];
+      if (items.length === 0) {
+        setSelectOptions(els.attnPromptSelect, []);
+        setSelectOptions(els.attnBlockSelect, []);
+        setSelectOptions(els.attnLayerSelect, []);
+        setSelectOptions(els.attnStepSelect, []);
+        state.attnSelection = { prompt: null, block: "", layer: null, step: null };
+        return false;
+      }
+
+      const prompts = Array.from(new Set(items.map((x) => Number(x.probe_idx)).filter((x) => Number.isFinite(x))))
+        .sort((a, b) => a - b);
+      setSelectOptions(els.attnPromptSelect, prompts, (x) => `prompt ${x}`);
+      let prompt = _toNumOrNull(els.attnPromptSelect.value);
+      if (prompt === null || !prompts.includes(prompt)) {
+        prompt = prompts[0];
+        els.attnPromptSelect.value = String(prompt);
+      }
+
+      const itemsP = items.filter((x) => Number(x.probe_idx) === prompt);
+      const blocks = Array.from(new Set(itemsP.map((x) => attnBlockValue(x)))).sort();
+      setSelectOptions(els.attnBlockSelect, blocks, (v) => attnBlockLabel(v));
+      let block = els.attnBlockSelect.value;
+      if (!blocks.includes(block)) {
+        block = blocks[0] || "";
+        els.attnBlockSelect.value = block;
+      }
+
+      const itemsPB = itemsP.filter((x) => attnBlockValue(x) === block);
+      const layers = Array.from(new Set(itemsPB.map((x) => Number(x.layer)).filter((x) => Number.isFinite(x))))
+        .sort((a, b) => a - b);
+      setSelectOptions(els.attnLayerSelect, layers, (x) => `layer ${x}`);
+      let layer = _toNumOrNull(els.attnLayerSelect.value);
+      if (layer === null || !layers.includes(layer)) {
+        layer = layers[0] ?? null;
+        if (layer !== null) els.attnLayerSelect.value = String(layer);
+      }
+
+      const itemsPBL = itemsPB.filter((x) => Number(x.layer) === layer);
+      const steps = Array.from(new Set(itemsPBL.map((x) => Number(x.step)).filter((x) => Number.isFinite(x))))
+        .sort((a, b) => a - b);
+      setSelectOptions(els.attnStepSelect, steps, (x) => `step ${x}`);
+      let step = _toNumOrNull(els.attnStepSelect.value);
+      if (step === null || !steps.includes(step)) {
+        if (steps.length > 0) {
+          step = preferLatestStep ? steps[steps.length - 1] : steps[0];
+          els.attnStepSelect.value = String(step);
+        } else {
+          step = null;
+        }
+      }
+
+      state.attnSelection = { prompt, block, layer, step };
+      return true;
+    }
+
+    function updateAttnSelectionFromItem(item) {
+      if (!item) return;
+      state.attnSelection.prompt = Number(item.probe_idx);
+      state.attnSelection.block = attnBlockValue(item);
+      state.attnSelection.layer = Number(item.layer);
+      state.attnSelection.step = Number(item.step);
+    }
+
+    function getSelectedAttentionItem() {
+      const sel = state.attnSelection;
+      if (sel.prompt === null || !sel.block || sel.layer === null || sel.step === null) return null;
+      const match = state.attentionIndex.find((x) =>
+        Number(x.probe_idx) === sel.prompt &&
+        attnBlockValue(x) === sel.block &&
+        Number(x.layer) === sel.layer &&
+        Number(x.step) === sel.step
+      );
+      return match || null;
+    }
+
+    async function loadAttentionByFile(file) {
+      if (!file) return;
+      try {
+        const res = await fetch(`/probe_debug/attention_grid?file=${encodeURIComponent(file)}`, { cache: "no-store" });
+        if (!res.ok) return;
+        const payload = await res.json();
+        if (!payload.available) return;
+        if (!Array.isArray(payload.grid) || payload.grid.length === 0) return;
+        state.latestAttention = {
+          step: payload.step,
+          probe_idx: payload.probe_idx,
+          scope: payload.scope,
+          layer: payload.layer,
+          prompt: payload.prompt || "",
+          kind: payload.kind || "attn_prob",
+          grid: payload.grid,
+          q_token_ids: Array.isArray(payload.q_token_ids) ? payload.q_token_ids : [],
+          k_token_ids: Array.isArray(payload.k_token_ids) ? payload.k_token_ids : [],
+          q_tokens: Array.isArray(payload.q_tokens) ? payload.q_tokens : [],
+          k_tokens: Array.isArray(payload.k_tokens) ? payload.k_tokens : [],
+        };
+        state.attnHover = null;
+        setSelectedAttentionFile(file);
+        const item = state.attentionIndex.find((x) => String(x.file) === String(file));
+        if (item) {
+          updateAttnSelectionFromItem(item);
+          syncAttnFieldOptions(false);
+        }
+        queueDraw();
+      } catch {
+        // no-op
+      }
+    }
+
+    async function loadSelectedAttentionFromFields() {
+      const item = getSelectedAttentionItem();
+      if (!item) return;
+      if (String(item.file) === String(state.selectedAttentionFile) && state.latestAttention) {
+        queueDraw();
+        return;
+      }
+      await loadAttentionByFile(item.file);
+    }
+
+    async function refreshAttentionIndex(forceFull = false) {
+      try {
+        let items = state.attentionIndex;
+        let shouldReload = !!forceFull || !Array.isArray(items) || items.length === 0;
+
+        if (!shouldReload) {
+          const metaRes = await fetch("/probe_debug/attention_index_meta", { cache: "no-store" });
+          if (metaRes.ok) {
+            const meta = await metaRes.json();
+            const mtimeMs = Number.isFinite(Number(meta.mtimeMs)) ? Number(meta.mtimeMs) : 0;
+            const count = Number.isFinite(Number(meta.count)) ? Number(meta.count) : 0;
+            const changed =
+              mtimeMs !== Number(state.attentionIndexMeta.mtimeMs || 0) ||
+              count !== Number(state.attentionIndexMeta.count || 0);
+            state.attentionIndexMeta = { mtimeMs, count };
+            shouldReload = changed;
+          } else {
+            shouldReload = true;
+          }
+        }
+
+        if (shouldReload) {
+          const res = await fetch("/probe_debug/attention_index?compact=1", { cache: "no-store" });
+          if (!res.ok) return;
+          const payload = await res.json();
+          items = payload.available && Array.isArray(payload.items) ? payload.items : [];
+          state.attentionIndex = items;
+          state.attentionIndexMeta = {
+            mtimeMs: Number.isFinite(Number(payload.mtimeMs)) ? Number(payload.mtimeMs) : 0,
+            count: Number.isFinite(Number(payload.count)) ? Number(payload.count) : items.length,
+          };
+        }
+
+        const files = items.map((x) => String(x.file));
+        if (state.selectedAttentionFile && !files.includes(String(state.selectedAttentionFile))) {
+          state.selectedAttentionFile = "";
+        }
+
+        if (files.length > 0) {
+          if (state.selectedAttentionFile) {
+            const item = items.find((x) => String(x.file) === String(state.selectedAttentionFile));
+            if (item) updateAttnSelectionFromItem(item);
+          }
+          syncAttnFieldOptions(true);
+          await loadSelectedAttentionFromFields();
+          return;
+        }
+
+        const fallback = await fetch("/probe_debug/latest_attention", { cache: "no-store" });
+        if (!fallback.ok) return;
+        const latest = await fallback.json();
+        if (!latest.available) return;
+        const grid = Array.isArray(latest.attn_prob_grid) ? latest.attn_prob_grid : latest.attn_score_grid;
+        const kind = Array.isArray(latest.attn_prob_grid) ? "attn_prob" : "attn_score";
+        if (!Array.isArray(grid) || grid.length === 0) return;
+        state.latestAttention = {
+          step: latest.step,
+          probe_idx: latest.probe_idx,
+          scope: latest.scope,
+          layer: latest.layer,
+          prompt: latest.prompt || "",
+          kind,
+          grid,
+          q_token_ids: Array.isArray(latest.q_token_ids) ? latest.q_token_ids : [],
+          k_token_ids: Array.isArray(latest.k_token_ids) ? latest.k_token_ids : [],
+          q_tokens: Array.isArray(latest.q_tokens) ? latest.q_tokens : [],
+          k_tokens: Array.isArray(latest.k_tokens) ? latest.k_tokens : [],
+        };
+        state.attnHover = null;
+        syncAttnFieldOptions(true);
+        queueDraw();
+      } catch {
+        // no-op
+      }
+    }
+
+    function bindControls() {
+      loadGraphPrefsFromCookie();
+      applyGraphVisibility();
+      refreshHiddenGraphOptions();
+
+      const redraw = () => queueDraw();
+      els.windowMode.addEventListener("change", redraw);
+      els.tailSteps.addEventListener("input", redraw);
+      els.fromStep.addEventListener("input", redraw);
+      els.toStep.addEventListener("input", redraw);
+      els.scaleType.addEventListener("change", redraw);
+      els.metricFilter.addEventListener("input", redraw);
+      els.autoScroll.addEventListener("change", redraw);
+      if (els.compareToggleBtn) {
+        els.compareToggleBtn.addEventListener("click", () => togglePanelHidden("compare"));
+      }
+      if (els.attnToggleBtn) {
+        els.attnToggleBtn.addEventListener("click", () => togglePanelHidden("attention"));
+      }
+      if (els.btnShowHidden) {
+        els.btnShowHidden.addEventListener("click", () => {
+          const key = String(els.hiddenGraphSelect?.value || "");
+          if (!key) return;
+          showHiddenGraphByKey(key);
+          queueDraw();
+        });
+      }
+      if (els.btnShowAllGraphs) {
+        els.btnShowAllGraphs.addEventListener("click", () => {
+          state.hiddenGraphs = { metrics: {}, compare: false, attention: false };
+          saveGraphPrefsToCookie();
+          queueDraw();
+        });
+      }
+      if (els.hiddenGraphSelect) {
+        els.hiddenGraphSelect.addEventListener("change", redraw);
+      }
+
+      els.smooth.addEventListener("input", () => {
+        els.smoothVal.textContent = els.smooth.value;
+        redraw();
+      });
+      els.trimPct.addEventListener("input", () => {
+        els.trimVal.textContent = els.trimPct.value;
+        redraw();
+      });
+
+      document.querySelectorAll("button[data-tail]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const tail = Number(btn.getAttribute("data-tail")) || 5000;
+          els.windowMode.value = "tail";
+          els.tailSteps.value = String(tail);
+          redraw();
+        });
+      });
+
+      els.btnAll.addEventListener("click", () => {
+        if (!Number.isFinite(state.minStep) || !Number.isFinite(state.maxStep)) return;
+        els.windowMode.value = "range";
+        els.fromStep.value = String(state.minStep);
+        els.toStep.value = String(state.maxStep);
+        redraw();
+      });
+
+      const onCompareSelectionChanged = () => {
+        drawComparePicked();
+        drawCompareColorLegend();
+        refreshCompareSearchResults();
+        redraw();
+      };
+      [els.compareSeriesA, els.compareSeriesB, els.compareSeriesC, els.compareSeriesD].forEach((el) => {
+        el.addEventListener("change", onCompareSelectionChanged);
+      });
+      if (els.compareSlotPick) {
+        els.compareSlotPick.addEventListener("change", refreshCompareSearchResults);
+      }
+      if (els.compareSearch) {
+        els.compareSearch.addEventListener("input", refreshCompareSearchResults);
+      }
+      if (els.compareClearSlot) {
+        els.compareClearSlot.addEventListener("click", () => {
+          const slotIdx = clamp(Number(els.compareSlotPick?.value || 0), 0, 3);
+          setCompareSlotValue(slotIdx, "");
+        });
+      }
+      if (els.compareClearAll) {
+        els.compareClearAll.addEventListener("click", () => {
+          for (let i = 0; i < 4; i++) {
+            setCompareSlotValue(i, "");
+          }
+        });
+      }
+      els.genProbeSelect.addEventListener("change", redraw);
+
+      const attnFields = [
+        els.attnPromptSelect,
+        els.attnBlockSelect,
+        els.attnLayerSelect,
+        els.attnStepSelect,
+      ];
+
+      const syncFromAttnInputs = async (preferLatestStep = true) => {
+        state.attnSelection.prompt = _toNumOrNull(els.attnPromptSelect.value);
+        state.attnSelection.block = els.attnBlockSelect.value || "";
+        state.attnSelection.layer = _toNumOrNull(els.attnLayerSelect.value);
+        state.attnSelection.step = _toNumOrNull(els.attnStepSelect.value);
+        syncAttnFieldOptions(preferLatestStep);
+        await loadSelectedAttentionFromFields();
+      };
+
+      const cycleField = (selectEl, delta) => {
+        if (!selectEl || selectEl.options.length <= 0) return;
+        let idx = Number(selectEl.selectedIndex);
+        if (!Number.isFinite(idx) || idx < 0) idx = 0;
+        const next = clamp(idx + delta, 0, selectEl.options.length - 1);
+        if (next === idx) return;
+        selectEl.selectedIndex = next;
+        selectEl.dispatchEvent(new Event("change"));
+      };
+
+      attnFields.forEach((el, idx) => {
+        el.addEventListener("change", async () => {
+          if (idx === 0) {
+            state.attnSelection.block = "";
+            state.attnSelection.layer = null;
+            state.attnSelection.step = null;
+          } else if (idx === 1) {
+            state.attnSelection.layer = null;
+            state.attnSelection.step = null;
+          } else if (idx === 2) {
+            state.attnSelection.step = null;
+          }
+          await syncFromAttnInputs(true);
+        });
+        el.addEventListener("keydown", (ev) => {
+          const key = ev.key;
+          if (key === "ArrowLeft" || key === "ArrowUp") {
+            ev.preventDefault();
+            cycleField(el, -1);
+          } else if (key === "ArrowRight" || key === "ArrowDown") {
+            ev.preventDefault();
+            cycleField(el, 1);
+          }
+        });
+      });
+
+      if (els.attnHeatmap) {
+        els.attnHeatmap.addEventListener("mousemove", (ev) => {
+          const geom = state.attnGeom;
+          const payload = state.latestAttention;
+          if (!geom || !payload) return;
+          const rect = els.attnHeatmap.getBoundingClientRect();
+          if (rect.width <= 0 || rect.height <= 0) return;
+          const x = (ev.clientX - rect.left) * (els.attnHeatmap.width / rect.width);
+          const y = (ev.clientY - rect.top) * (els.attnHeatmap.height / rect.height);
+          if (x < geom.left || x >= geom.left + geom.plotW || y < geom.top || y >= geom.top + geom.plotH) {
+            if (state.attnHover !== null) {
+              state.attnHover = null;
+              drawAttentionHeatmap();
+            }
+            return;
+          }
+          const col = clamp(Math.floor((x - geom.left) / geom.cellW), 0, geom.cols - 1);
+          const row = clamp(Math.floor((y - geom.top) / geom.cellH), 0, geom.rows - 1);
+          if (!state.attnHover || state.attnHover.row !== row || state.attnHover.col !== col) {
+            state.attnHover = { row, col };
+            drawAttentionHeatmap();
+          }
+        });
+        els.attnHeatmap.addEventListener("mouseleave", () => {
+          if (state.attnHover !== null) {
+            state.attnHover = null;
+            drawAttentionHeatmap();
+          }
+        });
+      }
+    }
+
+    function updateLiveBadge() {
+      const ageSec = (Date.now() - state.lastActivityMs) / 1000;
+      const stale = ageSec > 25;
+      els.liveDot.classList.toggle("stale", stale);
+      els.liveText.textContent = stale ? `idle ${Math.round(ageSec)}s` : "live";
+    }
+
+    function connectStream() {
+      const es = new EventSource("/stream");
+
+      es.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          consumeIncomingText(msg.text || "");
+        } catch {
+          // no-op
+        }
+      };
+
+      es.onerror = () => {
+        state.reconnects += 1;
+        toast("Stream interrupted, reconnecting...");
+      };
+    }
+
+    bindControls();
+    refreshMeta();
+    refreshBaselineSeries();
+    refreshProbeRecords();
+    refreshGenerations();
+    refreshAttentionIndex();
+    connectStream();
+    setInterval(refreshMeta, 30000);
+    setInterval(refreshBaselineSeries, 30000);
+    setInterval(refreshProbeRecords, 8000);
+    setInterval(refreshGenerations, 8000);
+    setInterval(refreshAttentionIndex, 5000);
+    setInterval(updateLiveBadge, 1000);
+  </script>
+</body>
+</html>

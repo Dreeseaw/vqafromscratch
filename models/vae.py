@@ -1,16 +1,20 @@
 """
 define models used in project
 """
+import copy
+
 import torch
 import torch.nn as nn
 
 class VAEConfig():
-    def __init__(self):
+    def __init__(self, latent_dim=256, cbld=None):
         self.x_w = 224
         self.x_h = 224
         self.feature_w = 7
         self.feature_h = 7
-        self.latent_dim = 256
+        self.latent_dim = latent_dim
+        self.p_s = 32
+        self.core_block_lin_dim = cbld
 
 
 def nan_check(tensor):
@@ -195,6 +199,150 @@ class ResEncoder(nn.Module):
         return self._encoder(x)
 
 
+"""
+ViT encoder
+"""
+class ViTBlock(nn.Module):
+    def __init__(self, config, n_heads=12, dim=768, lin_dim=3072):
+        super().__init__()
+        self._config = config
+        lin_dim = config.core_block_lin_dim or lin_dim
+        self._ln = nn.LayerNorm(config.latent_dim)
+        self._mhsa = nn.MultiheadAttention(config.latent_dim, n_heads, batch_first=True)
+        self._ln2 = nn.LayerNorm(config.latent_dim)
+        self._mlp = nn.Sequential(
+            nn.Linear(config.latent_dim, lin_dim),
+            nn.GELU(),
+            nn.Linear(lin_dim, config.latent_dim),
+        )
+
+    def forward(self, image_tokens):
+        # attention half
+        it = self._ln(image_tokens)
+        at, _ = self._mhsa(it, it, it, need_weights=False)
+        it = image_tokens + at
+        # linear half
+        return it + self._mlp(self._ln2(it))
+
+
+class ViTVAEAdapter(nn.Module):
+    def __init__(self, config, n_heads=12, dim=768, lin_dim=3072, out_dim=16):
+        super().__init__()
+        self._config = config
+        self._dim = dim
+        self._ln_q = nn.LayerNorm(dim)
+        self._ln_kv = nn.LayerNorm(dim)
+        self._xattn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
+        self._to_sl = nn.Conv2d(dim, out_dim, kernel_size=1)
+
+    def forward(self, patch, cls):
+        # patch: [B,N,D], cls: [B,1,D]
+        # attention half (each patch queries global)
+        q = self._ln_q(patch)
+        kv = self._ln_kv(cls)
+        a, _ = self._xattn(q, kv, kv, need_weights=False)
+        patch = patch + a
+        
+        grid = patch.transpose(1, 2).reshape(
+            patch.shape[0], 
+            self._dim, 
+            self._config.feature_w, 
+            self._config.feature_h,
+        )
+        return self._to_sl(grid)
+
+
+class ViTEncoder(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self._conv_as_embed = nn.Conv2d(
+            3,  # assume RGB always 
+            config.latent_dim, 
+            kernel_size=config.p_s, 
+            stride=config.p_s,
+        )
+        self._cls = nn.Parameter(torch.zeros(1, 1, config.latent_dim))
+
+        # L layers of blocks with N heads and D dim
+        self._core_blocks = nn.Sequential(
+            *[ViTBlock(config, n_heads=16) for _ in range(5)]
+        )
+        
+        # Spatial latent transform
+        self._vva = ViTVAEAdapter(config, n_heads=4, dim=config.latent_dim, lin_dim=256, out_dim=256)
+
+    def forward(self, x):
+        # tokenize image, add CLS token
+        image_tokens = self._conv_as_embed(x)
+        all_tokens = torch.cat([
+            self._cls.expand(x.shape[0], -1, -1), 
+            image_tokens.flatten(2).transpose(1,2),
+        ], dim=1)
+
+        t = self._core_blocks(all_tokens)
+
+        # have each position token attend to each global class token
+        cls = t[:, :1, :]
+        pos = t[:, 1:, :]
+        
+        return self._vva(pos, cls)
+
+
+"""
+ViT decoder (token -> patch -> image)
+"""
+class ViTDecoder(nn.Module):
+    def __init__(self, config, in_channels: int = 16):
+        super().__init__()
+        dec_config = copy.deepcopy(config)
+        dec_config.latent_dim = config.latent_dim // 2
+        dec_config.core_block_lin_dim = config.core_block_lin_dim // 2
+        config = dec_config
+        self._config = config
+
+        # project spatial latent into token dim
+        self._z_proj = nn.Conv2d(in_channels, config.latent_dim, kernel_size=1)
+        self._cls = nn.Parameter(torch.zeros(1, 1, config.latent_dim))
+
+        # mirror encoder blocks minus some depth
+        self._core_blocks = nn.Sequential(
+            *[ViTBlock(config, n_heads=8) for _ in range(3)]
+        )
+        self._ln = nn.LayerNorm(config.latent_dim)
+
+        # map tokens back to pixel patches
+        self._to_patch = nn.Linear(
+            config.latent_dim, 
+            3 * config.p_s * config.p_s,
+        )
+
+    def forward(self, z):
+        # z: [B,C,7,7] (or config.feature_h/feature_w)
+        z = self._z_proj(z)
+        tokens = z.flatten(2).transpose(1, 2)  # [B,N,D]
+        tokens = torch.cat([
+            self._cls.expand(z.shape[0], -1, -1),
+            tokens,
+        ], dim=1)
+
+        t = self._core_blocks(tokens)
+        pos = self._ln(t[:, 1:, :])
+        patches = self._to_patch(pos)  # [B,N,3*ps*ps]
+
+        b = z.shape[0]
+        h = self._config.feature_h
+        w = self._config.feature_w
+        ps = self._config.p_s
+
+        patches = patches.view(b, h, w, 3, ps, ps)
+        img = patches.permute(0, 3, 1, 4, 2, 5).contiguous()
+        img = img.view(b, 3, h * ps, w * ps)
+        return img
+
+
+"""
+Base decoder
+"""
 class Decoder(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -294,8 +442,45 @@ class SpatialPosteriorHead(nn.Module):
         return mu, logvar
 
 """
-Full x -> x' model 
+Full x -> x' models 
 """
+class ViTVAE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self._config = config
+        self._encoder = ViTEncoder(config)
+        self._post_head = SpatialPosteriorHead(256, 16)
+        self._decoder = ResDecoder(config)
+
+    def forward(self, x):
+        f = self._encoder(x)
+        mu, lv = self._post_head(f)
+        clipped_lv = torch.clamp(lv, min=-10.0, max=1.0)  # help combat exploding gradients
+        std = torch.exp(clipped_lv / 2.0)
+        sample = mu  + (torch.randn_like(std) * std)  # reparam trick
+
+        x_hat = self._decoder(sample)
+        return x_hat, sample, mu, clipped_lv
+
+class ViTVAE2(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self._config = config
+        self._encoder = ViTEncoder(config)
+        self._post_head = SpatialPosteriorHead(256, 16)
+        self._decoder = ViTDecoder(config)
+
+    def forward(self, x):
+        f = self._encoder(x)
+        mu, lv = self._post_head(f)
+        clipped_lv = torch.clamp(lv, min=-10.0, max=1.0)  # help combat exploding gradients
+        std = torch.exp(clipped_lv / 2.0)
+        sample = mu  + (torch.randn_like(std) * std)  # reparam trick
+
+        x_hat = self._decoder(sample)
+        return x_hat, sample, mu, clipped_lv
+
+
 class VariationalAutoEncoderRes(nn.Module):
     def __init__(self, config):
         super().__init__()
