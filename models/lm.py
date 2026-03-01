@@ -56,34 +56,6 @@ def _masked_mean_std(values: torch.Tensor, keep_mask: Optional[torch.Tensor] = N
     return mean, std
 
 
-def _masked_rms(values: torch.Tensor, keep_mask: Optional[torch.Tensor] = None) -> float:
-    vals = values.detach().float()
-    if keep_mask is not None:
-        mask = keep_mask.to(device=vals.device, dtype=torch.bool)
-        while mask.dim() < vals.dim():
-            mask = mask.unsqueeze(-1)
-        mask = mask.expand_as(vals)
-        selected = vals[mask]
-    else:
-        selected = vals.reshape(-1)
-    if selected.numel() == 0:
-        return float("nan")
-    return float(torch.sqrt(torch.mean(selected * selected)).item())
-
-
-def _capture_norm_rms(
-    debug_capture: Optional[Dict[str, Any]],
-    prefix: str,
-    pre: torch.Tensor,
-    post: torch.Tensor,
-    keep_mask: Optional[torch.Tensor],
-) -> None:
-    if debug_capture is None:
-        return
-    debug_capture[f"{prefix}_pre_rms"] = _masked_rms(pre, keep_mask)
-    debug_capture[f"{prefix}_post_rms"] = _masked_rms(post, keep_mask)
-
-
 def _mean_attn_entropy(
     masked_scores: torch.Tensor,
     valid: torch.Tensor,
@@ -534,15 +506,7 @@ class TransformerEncoderBlock(nn.Module):
         """
         B, S, E = x.shape
         x_residual = x
-        x_pre_norm = x
         x = _rms_norm_last_dim(x, eps=self._rmsnorm_eps)
-        _capture_norm_rms(
-            debug_capture=debug_capture,
-            prefix="norm_attn",
-            pre=x_pre_norm,
-            post=x,
-            keep_mask=(None if pad_mask is None else ~pad_mask),
-        )
         qkv = self._in_proj(x)
         wq, wk, wv = qkv.chunk(3, dim=-1)
         wq = wq.view(B, S, self._num_heads, self._head_dim)
@@ -578,15 +542,7 @@ class TransformerEncoderBlock(nn.Module):
             x = clamp_residual(x, self._resid_max_norm)
 
         x_residual = x
-        x_pre_norm = x
         x = _rms_norm_last_dim(x, eps=self._rmsnorm_eps)
-        _capture_norm_rms(
-            debug_capture=debug_capture,
-            prefix="norm_mlp",
-            pre=x_pre_norm,
-            post=x,
-            keep_mask=(None if pad_mask is None else ~pad_mask),
-        )
         mlp_out = _apply_layerscale(self._mlp(x), self._ls_mlp)
         mlp_keep_mask = (~pad_mask) if (pad_mask is not None and self._cap_keep_masked) else None
         mlp_out = cap_vector_norm(
@@ -806,15 +762,7 @@ class TransformerDecoderBlock(nn.Module):
         """
         (B, S, E) = x.shape
         x_residual = x
-        x_pre_norm = x
         x = _rms_norm_last_dim(x, eps=self._rmsnorm_eps)
-        _capture_norm_rms(
-            debug_capture=self_debug_capture,
-            prefix="norm_self_attn",
-            pre=x_pre_norm,
-            post=x,
-            keep_mask=(None if self_pad_mask is None else ~self_pad_mask),
-        )
         qkv = self._self_in_proj(x)
         wq, wk, wv = qkv.chunk(3, dim=-1)
         wq = wq.view(B, S, self._num_heads, self._head_dim)
@@ -851,24 +799,8 @@ class TransformerDecoderBlock(nn.Module):
 
         # Cross attention third
         x_residual = x
-        x_pre_norm = x
-        kv_pre_norm = kv
         x = _rms_norm_last_dim(x, eps=self._rmsnorm_eps)
         kv = _rms_norm_last_dim(kv, eps=self._rmsnorm_eps)
-        _capture_norm_rms(
-            debug_capture=cross_debug_capture,
-            prefix="norm_cross_x",
-            pre=x_pre_norm,
-            post=x,
-            keep_mask=(None if self_pad_mask is None else ~self_pad_mask),
-        )
-        _capture_norm_rms(
-            debug_capture=cross_debug_capture,
-            prefix="norm_cross_kv",
-            pre=kv_pre_norm,
-            post=kv,
-            keep_mask=(None if enc_pad_mask is None else ~enc_pad_mask),
-        )
 
         wq2 = self._cross_q(x)
         wk2, wv2 = self._cross_kv(kv).chunk(2, dim=-1)
@@ -904,15 +836,7 @@ class TransformerDecoderBlock(nn.Module):
             x = clamp_residual(x, self._resid_max_norm)
 
         x_residual = x
-        x_pre_norm = x
         x = _rms_norm_last_dim(x, eps=self._rmsnorm_eps)
-        _capture_norm_rms(
-            debug_capture=cross_debug_capture,
-            prefix="norm_mlp",
-            pre=x_pre_norm,
-            post=x,
-            keep_mask=(None if self_pad_mask is None else ~self_pad_mask),
-        )
         mlp_out = _apply_layerscale(self._mlp(x), self._ls_mlp)
         mlp_out = cap_vector_norm(
             mlp_out,
