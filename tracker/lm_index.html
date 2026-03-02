@@ -710,6 +710,7 @@
       generationRecords: [],
       generationProbes: [],
       topGrad: { step: null, entries: [] },
+      runTiming: { startedAtMs: null, startedAtRaw: "", elapsedSec: null, timezone: "", tzOffset: "" },
       hiddenGraphs: { metrics: {}, compare: false, attention: false },
     };
 
@@ -1570,8 +1571,38 @@
 
     function drawStats() {
       const GLOBAL_CE_MIN = 5.950318;
+      const startTimeLabel = (() => {
+        const startedMsRaw = state.runTiming?.startedAtMs;
+        const ms = typeof startedMsRaw === "number" ? startedMsRaw : Number.NaN;
+        if (Number.isFinite(ms) && ms > 0) {
+          try {
+            return new Date(ms).toLocaleString();
+          } catch {
+            // no-op
+          }
+        }
+        const raw = String(state.runTiming?.startedAtRaw || "").trim();
+        return raw || "-";
+      })();
+      const elapsedLabel = (() => {
+        const elapsedRaw = state.runTiming?.elapsedSec;
+        const secFromMeta =
+          typeof elapsedRaw === "number" && Number.isFinite(elapsedRaw) ? elapsedRaw : Number.NaN;
+        const startedMsRaw = state.runTiming?.startedAtMs;
+        const ms = typeof startedMsRaw === "number" ? startedMsRaw : Number.NaN;
+        const sec = Number.isFinite(secFromMeta)
+          ? Math.max(0, Math.floor(secFromMeta))
+          : (Number.isFinite(ms) && ms > 0 ? Math.max(0, Math.floor((Date.now() - ms) / 1000)) : -1);
+        if (sec < 0) return "-";
+        const h = Math.floor(sec / 3600);
+        const m = Math.floor((sec % 3600) / 60);
+        const s = sec % 60;
+        return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+      })();
       const stats = [
         ["step", Number.isFinite(state.maxStep) ? String(state.maxStep) : "-"],
+        ["start time", startTimeLabel],
+        ["elapsed", elapsedLabel],
         ["train ce "+"("+GLOBAL_CE_MIN+")", latestValue("ce", "train")],
         ["val ce", latestValue("ce", "val")],
         ["train ppl", latestValue("ppl", "train")],
@@ -2120,7 +2151,15 @@
         }
         const baselineLabel = meta.baselineLogfile ? ` | baseline=${meta.baselineLogfile}` : "";
         els.subtitle.textContent = `${meta.runDir} | mode=${mode} | logs=${logsLabel}${baselineLabel}`;
+        state.runTiming = {
+          startedAtMs: Number.isFinite(Number(meta.startedAtMs)) ? Number(meta.startedAtMs) : null,
+          startedAtRaw: String(meta.startedAtRaw || ""),
+          elapsedSec: Number.isFinite(Number(meta.elapsedSec)) ? Number(meta.elapsedSec) : null,
+          timezone: String(meta.timezone || ""),
+          tzOffset: String(meta.tzOffset || ""),
+        };
         drawCheckpoints(meta.checkpoints || []);
+        drawStats();
       } catch {
         // no-op
       }
@@ -2617,6 +2656,11 @@
       const stale = ageSec > 25;
       els.liveDot.classList.toggle("stale", stale);
       els.liveText.textContent = stale ? `idle ${Math.round(ageSec)}s` : "live";
+      if (state.runTiming && typeof state.runTiming.startedAtMs === "number" && Number.isFinite(state.runTiming.startedAtMs)) {
+        const ms = state.runTiming.startedAtMs;
+        state.runTiming.elapsedSec = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+      }
+      drawStats();
     }
 
     function connectStream() {

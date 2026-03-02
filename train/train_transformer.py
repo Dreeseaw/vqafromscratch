@@ -1224,7 +1224,7 @@ def main():
     )
 
     # training
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument(
         "--grad_accum_steps",
@@ -1347,6 +1347,30 @@ def main():
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--persistent_workers", action="store_true")
     parser.add_argument("--prefetch_factor", type=int, default=4)
+    parser.add_argument(
+        "--eval_num_workers",
+        type=int,
+        default=0,
+        help="Validation/test DataLoader workers (0 isolates eval from train workers).",
+    )
+    parser.add_argument(
+        "--eval_persistent_workers",
+        action="store_true",
+        help="Enable persistent workers for eval loaders when --eval_num_workers > 0.",
+    )
+    parser.add_argument(
+        "--eval_prefetch_factor",
+        type=int,
+        default=2,
+        help="Prefetch factor for eval loaders when --eval_num_workers > 0.",
+    )
+    parser.add_argument(
+        "--eval_pin_memory",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="Use pinned host memory for eval DataLoaders (0/1).",
+    )
     parser.add_argument("--log_every", type=int, default=100)
     parser.add_argument(
         "--track_r_metrics",
@@ -1515,10 +1539,11 @@ def main():
         drop_last=True,
     )
 
-    pin_memory = device == "cuda"
+    train_pin_memory = device == "cuda"
+    eval_pin_memory = bool(int(args.eval_pin_memory)) and device == "cuda"
     loader_kwargs = {
         "num_workers": args.num_workers,
-        "pin_memory": pin_memory,
+        "pin_memory": train_pin_memory,
         "collate_fn": collate_fn,
         "worker_init_fn": seed_worker,
     }
@@ -1546,15 +1571,15 @@ def main():
     eval_loader_kwargs = {
         "batch_size": args.batch_size,
         "shuffle": False,
-        "num_workers": args.num_workers,
-        "pin_memory": pin_memory,
+        "num_workers": args.eval_num_workers,
+        "pin_memory": eval_pin_memory,
         "collate_fn": collate_fn,
         "worker_init_fn": seed_worker,
     }
-    if args.num_workers > 0:
-        if args.persistent_workers:
+    if args.eval_num_workers > 0:
+        if args.eval_persistent_workers:
             eval_loader_kwargs["persistent_workers"] = True
-        eval_loader_kwargs["prefetch_factor"] = max(1, int(args.prefetch_factor))
+        eval_loader_kwargs["prefetch_factor"] = max(1, int(args.eval_prefetch_factor))
     val_loader = DataLoader(val_eval_dataset, **eval_loader_kwargs)
     test_loader = DataLoader(test_dataset, **eval_loader_kwargs)
 
@@ -1582,6 +1607,10 @@ def main():
         raise SystemExit("--row_max_norm_c must be > 0.")
     if int(args.log_every) <= 0:
         raise SystemExit("--log_every must be > 0.")
+    if int(args.eval_num_workers) < 0:
+        raise SystemExit("--eval_num_workers must be >= 0.")
+    if int(args.eval_prefetch_factor) <= 0:
+        raise SystemExit("--eval_prefetch_factor must be > 0.")
     if int(args.grad_split_every) < 0:
         raise SystemExit("--grad_split_every must be >= 0.")
     if args.resid_max_norm is None:
@@ -1728,6 +1757,13 @@ def main():
             )
     logger.log(f"bucket width: {args.bucket_width} ({'auto' if args.bucket_width > 0 else 'legacy ranges'})")
     logger.log(f"activation checkpointing: {'on' if args.activation_checkpointing else 'off'}")
+    logger.log(
+        "eval loader: "
+        f"workers={args.eval_num_workers}, "
+        f"persistent={bool(args.eval_persistent_workers and int(args.eval_num_workers) > 0)}, "
+        f"prefetch={max(1, int(args.eval_prefetch_factor)) if int(args.eval_num_workers) > 0 else 0}, "
+        f"pin_memory={bool(eval_pin_memory)}"
+    )
     if args.grad_clip_mode == "global":
         logger.log(f"grad clipping: global (max_norm={args.clip_grad})")
     elif args.grad_clip_mode == "agc":
@@ -1948,9 +1984,9 @@ def main():
                 continue
 
             input_ids, target_ids, loss_mask = batch
-            input_ids = input_ids.to(device, non_blocking=pin_memory)
-            target_ids = target_ids.to(device, non_blocking=pin_memory)
-            loss_mask = loss_mask.to(device, non_blocking=pin_memory)
+            input_ids = input_ids.to(device, non_blocking=train_pin_memory)
+            target_ids = target_ids.to(device, non_blocking=train_pin_memory)
+            loss_mask = loss_mask.to(device, non_blocking=train_pin_memory)
             attn_pad_mask = input_ids.eq(args.pad_id)
 
             if not did_sanity:
@@ -2264,6 +2300,7 @@ def main():
                 row_max_norm_total_params_since_log = 0
 
             if args.eval_every_steps > 0 and global_step % args.eval_every_steps == 0:
+                eval_t0 = time.perf_counter()
                 val_metrics = evaluate_model(
                     model=model,
                     loader=val_loader,
@@ -2274,7 +2311,7 @@ def main():
                     z_loss_coef=z_loss_coef,
                     max_tokens=0,
                     max_steps=0,
-                    pin_memory=pin_memory,
+                    pin_memory=eval_pin_memory,
                 )
                 logger.log(
                     "Validation "
@@ -2283,11 +2320,14 @@ def main():
                     f"PPL={val_metrics['ppl']:.4f} Entropy={val_metrics['entropy']:.6f} "
                     f"tokens={val_metrics['tokens']} steps={val_metrics['steps']}"
                 )
+                # Keep training Tokens/s from being penalized by eval wall-time.
+                log_start += max(0.0, time.perf_counter() - eval_t0)
 
             probe_due = int(args.run_probes) > 0 and global_step % int(args.run_probes) == 0
             if probe_due and probe_after_log_only and (global_step % int(args.log_every) != 0):
                 probe_due = False
             if probe_due:
+                probe_t0 = time.perf_counter()
                 probe_summary = run_debug_probes(
                     model=model,
                     tokenizer=probe_tokenizer,
@@ -2333,6 +2373,8 @@ def main():
                     f"{' '.join(agg_items)} "
                     f"artifacts={os.path.join(LOGDIR, args.run_id, 'probe_debug')}"
                 )
+                # Keep training Tokens/s from being penalized by probe wall-time.
+                log_start += max(0.0, time.perf_counter() - probe_t0)
 
             if global_step % args.ckpt_every == 0:
                 ckpt_path = os.path.join(LOGDIR, args.run_id, f"step_{global_step}.tar")
@@ -2403,7 +2445,7 @@ def main():
         z_loss_coef=z_loss_coef,
         max_tokens=max(0, int(args.test_max_tokens)),
         max_steps=max(0, int(args.test_steps)),
-        pin_memory=pin_memory,
+        pin_memory=eval_pin_memory,
     )
     logger.log(
         "Test "

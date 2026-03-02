@@ -986,6 +986,102 @@ function loadProbeGenerations() {
   };
 }
 
+function _parseLogTimestampToMs(raw: string): number | null {
+  const s = String(raw || "").trim();
+  if (!s) return null;
+  const m = s.match(
+    /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?$/
+  );
+  if (!m) {
+    const t = Date.parse(s);
+    return Number.isFinite(t) ? t : null;
+  }
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  const hour = Number(m[4]);
+  const minute = Number(m[5]);
+  const second = Number(m[6]);
+  const frac = String(m[7] ?? "");
+  const ms = frac ? Number(frac.slice(0, 3).padEnd(3, "0")) : 0;
+  const tLocal = new Date(year, month - 1, day, hour, minute, second, ms).getTime();
+  const tUtc = Date.UTC(year, month - 1, day, hour, minute, second, ms);
+  if (Number.isFinite(tLocal)) return tLocal;
+  if (Number.isFinite(tUtc)) return tUtc;
+  return null;
+}
+
+function _formatTzOffset(offsetMinutesWest: number): string {
+  const offsetMinutesEast = -offsetMinutesWest;
+  const sign = offsetMinutesEast >= 0 ? "+" : "-";
+  const abs = Math.abs(offsetMinutesEast);
+  const hh = String(Math.floor(abs / 60)).padStart(2, "0");
+  const mm = String(abs % 60).padStart(2, "0");
+  return `${sign}${hh}:${mm}`;
+}
+
+function _inferRunStartFromLogs(): { startedAtMs: number | null; startedAtRaw: string | null } {
+  const candidates = (streamLogPaths.length > 0 ? streamLogPaths : [logfile]).filter(Boolean);
+  if (candidates.length === 0) return { startedAtMs: null, startedAtRaw: null };
+
+  let fallbackMtimeMs: number | null = null;
+  for (const fp of candidates) {
+    if (!fp || !fs.existsSync(fp) || !fs.statSync(fp).isFile()) continue;
+    try {
+      const st = fs.statSync(fp);
+      if (Number.isFinite(st.mtimeMs)) {
+        if (fallbackMtimeMs === null || st.mtimeMs < fallbackMtimeMs) fallbackMtimeMs = st.mtimeMs;
+      }
+    } catch {
+      // no-op
+    }
+  }
+
+  try {
+    const maxBytes = 256 * 1024;
+    for (const candidate of candidates) {
+      if (!candidate || !fs.existsSync(candidate) || !fs.statSync(candidate).isFile()) continue;
+      const sz = fs.statSync(candidate).size;
+      const head = readSlice(candidate, 0, Math.min(maxBytes, sz));
+      const m = head.match(/Run start time:\s*(\d{4}-\d{2}-\d{2} [0-9:.]+)/i);
+      if (!m?.[1]) continue;
+      const startedAtRaw = String(m[1]).trim();
+      const startedAtMsLocal = _parseLogTimestampToMs(startedAtRaw);
+      const ts = startedAtRaw.match(
+        /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?$/
+      );
+      let startedAtMsUtc: number | null = null;
+      if (ts) {
+        const frac = String(ts[7] ?? "");
+        const ms = frac ? Number(frac.slice(0, 3).padEnd(3, "0")) : 0;
+        const tUtc = Date.UTC(
+          Number(ts[1]),
+          Number(ts[2]) - 1,
+          Number(ts[3]),
+          Number(ts[4]),
+          Number(ts[5]),
+          Number(ts[6]),
+          ms
+        );
+        startedAtMsUtc = Number.isFinite(tUtc) ? tUtc : null;
+      }
+      let startedAtMs = startedAtMsLocal;
+      if (fallbackMtimeMs !== null) {
+        const candidatesMs = [startedAtMsLocal, startedAtMsUtc].filter((x): x is number => x !== null);
+        if (candidatesMs.length > 0) {
+          candidatesMs.sort((a, b) => Math.abs(a - fallbackMtimeMs) - Math.abs(b - fallbackMtimeMs));
+          startedAtMs = candidatesMs[0];
+        }
+      }
+      if (startedAtMs !== null) return { startedAtMs, startedAtRaw };
+      return { startedAtMs: fallbackMtimeMs, startedAtRaw };
+    }
+    return { startedAtMs: fallbackMtimeMs, startedAtRaw: null };
+  } catch {
+    return { startedAtMs: fallbackMtimeMs, startedAtRaw: null };
+  }
+}
+
 prewarmAttentionGridCache();
 
 serve({
@@ -1015,12 +1111,25 @@ serve({
         };
       });
       const totalBytes = logfiles.reduce((sum, x) => sum + Number(x.bytes || 0), 0);
+      const runStart = _inferRunStartFromLogs();
+      const elapsedSec =
+        runStart.startedAtMs !== null
+          ? Math.max(0, (Date.now() - runStart.startedAtMs) / 1000)
+          : null;
+      const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "local";
+      const tzOffsetMinutes = new Date().getTimezoneOffset();
       return Response.json({
         runDir,
         logfile: streamLogNames.join(", "),
         logfiles,
         logMode: hasContinuedMode ? "continued" : "single",
         logfileBytes: totalBytes,
+        startedAtRaw: runStart.startedAtRaw,
+        startedAtMs: runStart.startedAtMs,
+        startedAtIso: runStart.startedAtMs !== null ? new Date(runStart.startedAtMs).toISOString() : null,
+        tzOffset: _formatTzOffset(tzOffsetMinutes),
+        timezone,
+        elapsedSec,
         baselineLogfile: baselineLogfile ? path.basename(baselineLogfile) : null,
         checkpoints: listCheckpoints(),
       });
