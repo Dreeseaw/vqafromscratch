@@ -29,6 +29,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+from models.bpe_tokenizer import ByteBPETokenizer
+
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 TEXT_KEYS = ("text", "context", "content", "body", "extract")
 DEFAULT_MODEL = "qwen2.5-coder:7b-instruct"
@@ -208,6 +210,76 @@ def find_span(context: str, answer: str) -> Optional[Tuple[int, int]]:
     return raw_start, raw_end
 
 
+def _token_count_text(tokenizer: ByteBPETokenizer, text: str) -> int:
+    ids = tokenizer.encode(text, add_bos=False, add_eos=False)
+    return int(ids.numel())
+
+
+def _split_sentences_with_offsets(text: str) -> List[Tuple[str, int, int]]:
+    out: List[Tuple[str, int, int]] = []
+    for m in re.finditer(r"[^.!?\n]+(?:[.!?]+|$)", text):
+        start = int(m.start())
+        end = int(m.end())
+        chunk = text[start:end]
+        if not chunk.strip():
+            continue
+        out.append((chunk, start, end))
+    if not out and text.strip():
+        out.append((text, 0, len(text)))
+    return out
+
+
+def _context_with_sentence_removed(context: str, sent_start: int, sent_end: int) -> str:
+    merged = (context[:sent_start] + context[sent_end:]).strip()
+    return re.sub(r"\n{3,}", "\n\n", merged)
+
+
+def _fit_context_to_budget(
+    tokenizer: ByteBPETokenizer,
+    context: str,
+    question: str,
+    answer: str,
+    qa_token_budget: int,
+) -> Optional[str]:
+    cur = context.strip()
+    if not cur:
+        return None
+
+    for _ in range(64):
+        c_tok = _token_count_text(tokenizer, cur)
+        q_tok = _token_count_text(tokenizer, question)
+        a_tok = _token_count_text(tokenizer, answer)
+        if (c_tok + q_tok + a_tok) < int(qa_token_budget):
+            return cur
+
+        span = find_span(cur, answer)
+        if span is None:
+            return None
+        a_start, a_end = span
+        sents = _split_sentences_with_offsets(cur)
+        if len(sents) <= 1:
+            return None
+
+        first = sents[0]
+        last = sents[-1]
+        first_contains_answer = (a_start < first[2]) and (a_end > first[1])
+        last_contains_answer = (a_start < last[2]) and (a_end > last[1])
+
+        if not last_contains_answer:
+            _, rm_start, rm_end = last
+        elif not first_contains_answer:
+            _, rm_start, rm_end = first
+        else:
+            return None
+
+        nxt = _context_with_sentence_removed(cur, rm_start, rm_end)
+        if not nxt or nxt == cur:
+            return None
+        cur = nxt
+
+    return None
+
+
 def _strip_code_fences(text: str) -> str:
     s = text.strip()
     if not s.startswith("```"):
@@ -360,6 +432,8 @@ async def _process_context(
     seed: int,
     timeout_s: int,
     run_id: str,
+    tokenizer: ByteBPETokenizer,
+    qa_token_budget: int,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Counter]:
     reason_counts: Counter = Counter()
     user_prompt = _build_generation_prompt(sample.context, max_q_per_context, answer_max_words)
@@ -546,10 +620,47 @@ async def _process_context(
             final_answer = repaired_a
 
         assert span is not None
-        a_start, a_end = span
-        final_answer = sample.context[a_start:a_end]
+        orig_a_start, orig_a_end = span
+        final_answer = sample.context[orig_a_start:orig_a_end]
+        fitted_context = _fit_context_to_budget(
+            tokenizer=tokenizer,
+            context=sample.context,
+            question=valid["question"],
+            answer=final_answer,
+            qa_token_budget=qa_token_budget,
+        )
+        if fitted_context is None:
+            reason = "qa_triplet_over_token_budget"
+            reason_counts[reason] += 1
+            rejected.append(
+                {
+                    "reason": reason,
+                    "source_doc_id": sample.source_doc_id,
+                    "source_offset": sample.source_offset,
+                    "context": sample.context,
+                    "qa_candidate": qa,
+                    "qa_token_budget": int(qa_token_budget),
+                }
+            )
+            continue
+        fitted_span = find_span(fitted_context, final_answer)
+        if fitted_span is None:
+            reason = "answer_missing_after_context_trim"
+            reason_counts[reason] += 1
+            rejected.append(
+                {
+                    "reason": reason,
+                    "source_doc_id": sample.source_doc_id,
+                    "source_offset": sample.source_offset,
+                    "context": sample.context,
+                    "trimmed_context": fitted_context,
+                    "qa_candidate": qa,
+                }
+            )
+            continue
+        a_start, a_end = fitted_span
         item = {
-            "context": sample.context,
+            "context": fitted_context,
             "question": valid["question"],
             "answer": final_answer,
             "a_start": a_start,
@@ -621,6 +732,14 @@ async def _run(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     raw_path = out_dir / "raw.jsonl"
     rej_path = out_dir / "rejected.jsonl"
+    tokenizer = ByteBPETokenizer.load(args.tokenizer)
+    q_prefix_tokens = _token_count_text(tokenizer, "\nQuestion:")
+    a_prefix_tokens = _token_count_text(tokenizer, "\nAnswer:")
+    qa_token_budget = int(args.max_seq_len) - int(args.special_tokens_reserved) - q_prefix_tokens - a_prefix_tokens
+    if qa_token_budget <= 0:
+        raise ValueError(
+            "Invalid QA token budget. Increase --max_seq_len or reduce --special_tokens_reserved."
+        )
 
     rng = random.Random(args.seed)
     contexts, input_info = _load_context_pool(Path(args.in_path), args.context_max_chars, rng)
@@ -676,6 +795,8 @@ async def _run(args: argparse.Namespace) -> int:
                 seed=seed,
                 timeout_s=args.timeout_s,
                 run_id=Path(args.out_dir).name,
+                tokenizer=tokenizer,
+                qa_token_budget=qa_token_budget,
             )
             async with lock:
                 shared["calls_completed"] += 1
@@ -749,6 +870,12 @@ async def _run(args: argparse.Namespace) -> int:
             "workers": args.workers,
             "timeout_s": args.timeout_s,
             "ollama_url": OLLAMA_URL,
+            "tokenizer": args.tokenizer,
+            "max_seq_len": int(args.max_seq_len),
+            "special_tokens_reserved": int(args.special_tokens_reserved),
+            "qa_token_budget": int(qa_token_budget),
+            "question_prefix_tokens": int(q_prefix_tokens),
+            "answer_prefix_tokens": int(a_prefix_tokens),
         },
         "git_hash": _git_hash_or_none(),
         "outputs": {
@@ -787,6 +914,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--timeout_s", type=int, default=60)
+    ap.add_argument("--tokenizer", type=str, required=True, help="Tokenizer .pt used for token-budget checks.")
+    ap.add_argument("--max_seq_len", type=int, default=256, help="Sequence length ceiling for QA budget.")
+    ap.add_argument(
+        "--special_tokens_reserved",
+        type=int,
+        default=2,
+        help="Reserved tokens (e.g., BOS/EOS) subtracted from max_seq_len.",
+    )
     return ap
 
 
@@ -802,6 +937,10 @@ def main() -> int:
         raise ValueError("--answer_max_words must be > 0")
     if args.workers <= 0:
         raise ValueError("--workers must be > 0")
+    if args.max_seq_len <= 0:
+        raise ValueError("--max_seq_len must be > 0")
+    if args.special_tokens_reserved < 0:
+        raise ValueError("--special_tokens_reserved must be >= 0")
     return asyncio.run(_run(args))
 
 

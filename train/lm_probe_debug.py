@@ -206,7 +206,26 @@ def _slice_tokens_for_grid(tokenizer, token_ids: List[int], rows: int, cols: int
     }
 
 
-@torch.no_grad()
+def _forward_with_optional_cache(
+    model: torch.nn.Module,
+    seq: torch.Tensor,
+    pad_mask: Optional[torch.Tensor],
+    use_cache: Optional[bool] = None,
+    **kwargs,
+):
+    call_kwargs: Dict[str, Any] = {"pad_mask": pad_mask, **kwargs}
+    if use_cache is not None:
+        call_kwargs["use_cache"] = bool(use_cache)
+    try:
+        return model(seq, **call_kwargs)
+    except TypeError:
+        if "use_cache" in call_kwargs:
+            call_kwargs.pop("use_cache", None)
+            return model(seq, **call_kwargs)
+        raise
+
+
+@torch.inference_mode()
 def _autoregressive_generate(
     model: torch.nn.Module,
     tokenizer,
@@ -215,6 +234,49 @@ def _autoregressive_generate(
     max_seq_len: int,
     max_new_tokens: int,
 ) -> Dict[str, Any]:
+    if hasattr(model, "generate") and callable(getattr(model, "generate")):
+        eos_id = int(getattr(tokenizer, "eos_id", -1))
+        gen_kwargs: Dict[str, Any] = {
+            "max_new_tokens": int(max_new_tokens),
+            "do_sample": False,
+            "num_beams": 1,
+            "use_cache": True,
+            "return_dict_in_generate": False,
+            "output_scores": False,
+            "output_attentions": False,
+            "output_hidden_states": False,
+            "pad_token_id": int(pad_id),
+        }
+        if eos_id >= 0:
+            gen_kwargs["eos_token_id"] = eos_id
+        seq_out = model.generate(prompt_ids, **gen_kwargs)
+        if torch.is_tensor(seq_out):
+            full_ids_t = seq_out[0]
+        else:
+            full_ids_t = seq_out.sequences[0]
+        full_token_ids = [int(x) for x in full_ids_t.detach().cpu().tolist()]
+        prompt_token_ids = [int(x) for x in prompt_ids[0].detach().cpu().tolist()]
+        gen_len = max(0, len(full_token_ids) - len(prompt_token_ids))
+        generated_ids = full_token_ids[len(prompt_token_ids):]
+        if len(prompt_token_ids) + gen_len >= int(max_seq_len):
+            stop_reason = "max_seq_len"
+        elif eos_id >= 0 and len(generated_ids) > 0 and int(generated_ids[-1]) == eos_id:
+            stop_reason = "eos"
+        else:
+            stop_reason = "max_new_tokens"
+        del seq_out, full_ids_t
+        return {
+            "prompt_token_ids": prompt_token_ids,
+            "generated_token_ids": generated_ids,
+            "full_token_ids": full_token_ids,
+            "generated_text": tokenizer.decode(generated_ids, skip_special=True) if generated_ids else "",
+            "generated_text_with_special": tokenizer.decode(generated_ids, skip_special=False) if generated_ids else "",
+            "full_text": tokenizer.decode(full_token_ids, skip_special=True),
+            "full_text_with_special": tokenizer.decode(full_token_ids, skip_special=False),
+            "stop_reason": stop_reason,
+            "max_new_tokens": int(max_new_tokens),
+        }
+
     cur = prompt_ids.clone()
     eos_id = int(getattr(tokenizer, "eos_id", -1))
     generated_ids: List[int] = []
@@ -225,17 +287,19 @@ def _autoregressive_generate(
             stop_reason = "max_seq_len"
             break
         pad_mask = cur.eq(int(pad_id))
-        logits = model(cur, pad_mask=pad_mask)
+        logits = _forward_with_optional_cache(model, cur, pad_mask=pad_mask, use_cache=True)
         next_id = int(torch.argmax(logits[:, -1, :], dim=-1).item())
         next_tok = torch.tensor([[next_id]], dtype=cur.dtype, device=cur.device)
         cur = torch.cat([cur, next_tok], dim=1)
         generated_ids.append(next_id)
+        del logits, next_tok
         if eos_id >= 0 and next_id == eos_id:
             stop_reason = "eos"
             break
 
     prompt_token_ids = prompt_ids[0].detach().cpu().tolist()
     full_token_ids = cur[0].detach().cpu().tolist()
+    del cur
 
     return {
         "prompt_token_ids": prompt_token_ids,
@@ -250,7 +314,7 @@ def _autoregressive_generate(
     }
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def run_debug_probes(
     model: torch.nn.Module,
     tokenizer,
@@ -300,18 +364,22 @@ def run_debug_probes(
             debug_layers = {int(x) for x in probe_layers}
         attn_state = None
         if capture_attn_entropy:
-            _, debug, attn_state = model(
-                input_ids,
+            _, debug, attn_state = _forward_with_optional_cache(
+                model=model,
+                seq=input_ids,
                 pad_mask=pad_mask,
+                use_cache=False,
                 return_debug=True,
                 return_attn_entropy=True,
                 debug_layers=debug_layers,
                 debug_score_layers=debug_layers,
             )
         else:
-            _, debug = model(
-                input_ids,
+            _, debug = _forward_with_optional_cache(
+                model=model,
+                seq=input_ids,
                 pad_mask=pad_mask,
+                use_cache=False,
                 return_debug=True,
                 debug_layers=debug_layers,
                 debug_score_layers=debug_layers,
@@ -500,6 +568,7 @@ def run_debug_probes(
         out_json = os.path.join(step_dir, f"probe_{probe_idx}.json")
         with open(out_json, "w", encoding="utf-8") as f:
             json.dump(probe_record, f)
+        del generation, debug, attn_state, input_ids, pad_mask
 
     if latest_attention is not None:
         latest_path = os.path.join(probe_root, "latest_attention.json")

@@ -23,7 +23,7 @@ import random
 import argparse
 import datetime
 from collections import defaultdict, deque
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -436,6 +436,157 @@ class BucketBatchSampler:
         rng.shuffle(all_batches)
         for batch in all_batches:
             yield batch
+
+
+class InfiniteBucketLoader:
+    def __init__(self, name: str, loader: DataLoader, sampler: BucketBatchSampler):
+        self.name = name
+        self.loader = loader
+        self.sampler = sampler
+        self.epoch = 0
+        self.sampler.set_epoch(self.epoch)
+        self._it = iter(self.loader)
+
+    def next_batch(self):
+        try:
+            return next(self._it)
+        except StopIteration:
+            self.epoch += 1
+            self.sampler.set_epoch(self.epoch)
+            self._it = iter(self.loader)
+            return next(self._it)
+
+
+def _normalize_bucket_weights(raw: Dict[str, float], step_ref: str) -> Dict[str, float]:
+    cleaned: Dict[str, float] = {}
+    total = 0.0
+    for name in ("distill", "wiki", "coco"):
+        val = float(raw.get(name, 0.0))
+        if val < 0.0:
+            raise ValueError(f"Mixture weights must be >=0 ({step_ref}, bucket={name}, weight={val}).")
+        cleaned[name] = val
+        total += val
+    if total <= 0.0:
+        raise ValueError(f"Mixture weights sum to 0 ({step_ref}).")
+    return {k: (v / total) for k, v in cleaned.items()}
+
+
+def parse_mix_schedule(spec: str) -> List[Dict[str, Any]]:
+    if not spec:
+        return []
+    payload: Any
+    if os.path.isfile(spec):
+        with open(spec, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    else:
+        payload = json.loads(spec)
+    if not isinstance(payload, list) or not payload:
+        raise ValueError("--mix_schedule must be a non-empty JSON list.")
+
+    out: List[Dict[str, Any]] = []
+    for i, entry in enumerate(payload):
+        if not isinstance(entry, dict):
+            raise ValueError(f"--mix_schedule entry[{i}] must be an object.")
+        if "start_step" not in entry:
+            raise ValueError(f"--mix_schedule entry[{i}] missing start_step.")
+        start_step = int(entry["start_step"])
+        if start_step < 1:
+            raise ValueError(f"--mix_schedule entry[{i}] start_step must be >=1.")
+        end_step_raw = entry.get("end_step")
+        end_step: Optional[int] = None if end_step_raw is None else int(end_step_raw)
+        if end_step is not None and end_step < start_step:
+            raise ValueError(
+                f"--mix_schedule entry[{i}] end_step must be >= start_step (got {start_step}-{end_step})."
+            )
+        weights_raw = entry.get("weights")
+        if not isinstance(weights_raw, dict):
+            raise ValueError(f"--mix_schedule entry[{i}] must include an object 'weights'.")
+        weights = _normalize_bucket_weights(weights_raw, step_ref=f"entry[{i}]")
+        out.append(
+            {
+                "start_step": start_step,
+                "end_step": end_step,
+                "weights": weights,
+            }
+        )
+
+    out.sort(key=lambda x: int(x["start_step"]))
+    return out
+
+
+def get_mix_weights_for_step(schedule: List[Dict[str, Any]], step_1based: int) -> Dict[str, float]:
+    if step_1based < 1:
+        raise ValueError("step_1based must be >= 1.")
+    active: Optional[Dict[str, Any]] = None
+    for entry in schedule:
+        start_step = int(entry["start_step"])
+        end_step = entry["end_step"]
+        if step_1based < start_step:
+            continue
+        if end_step is not None and step_1based > int(end_step):
+            continue
+        active = entry
+    if active is None:
+        raise ValueError(
+            f"No active mix schedule entry for step {step_1based}. "
+            "Ensure start/end ranges cover all training steps."
+        )
+    return dict(active["weights"])
+
+
+def validate_mix_schedule_coverage(schedule: List[Dict[str, Any]], total_steps: int) -> None:
+    if total_steps <= 0:
+        return
+    for step in (1, int(total_steps)):
+        _ = get_mix_weights_for_step(schedule, step)
+    # Spot-check boundaries for holes between adjacent entries.
+    sorted_entries = sorted(schedule, key=lambda x: int(x["start_step"]))
+    for prev, cur in zip(sorted_entries[:-1], sorted_entries[1:]):
+        prev_end = prev["end_step"]
+        cur_start = int(cur["start_step"])
+        if prev_end is None:
+            continue
+        if int(prev_end) + 1 < cur_start:
+            raise ValueError(
+                f"Mix schedule has an uncovered gap: steps {int(prev_end) + 1}-{cur_start - 1}."
+            )
+
+
+def required_mix_buckets_for_horizon(schedule: List[Dict[str, Any]], total_steps: int) -> set:
+    required = set()
+    if total_steps <= 0:
+        return required
+    lo = 1
+    hi = int(total_steps)
+    for entry in schedule:
+        start_step = int(entry["start_step"])
+        end_step = entry["end_step"]
+        end_val = hi if end_step is None else int(end_step)
+        if end_val < lo or start_step > hi:
+            continue
+        weights = entry.get("weights", {})
+        if not isinstance(weights, dict):
+            continue
+        for name, weight in weights.items():
+            if float(weight) > 0.0:
+                required.add(str(name))
+    return required
+
+
+def sample_bucket_name(weights: Dict[str, float]) -> str:
+    names = []
+    probs = []
+    for name in ("distill", "wiki", "coco"):
+        p = float(weights.get(name, 0.0))
+        if p > 0.0:
+            names.append(name)
+            probs.append(p)
+    if not names:
+        raise ValueError("No positive bucket weight in active schedule entry.")
+    p_arr = np.asarray(probs, dtype=np.float64)
+    p_arr = p_arr / p_arr.sum()
+    pick = int(np.random.choice(len(names), p=p_arr))
+    return names[pick]
 
 
 ### Scheduling
@@ -1054,7 +1205,49 @@ def _collate_shift_sanity(collate_fn: CollatePad, pad_id: int) -> None:
     assert not bool(loss_mask[input_ids == pad_id].any().item())
 
 
-@torch.no_grad()
+def _cuda_mem_stats_mib(device: str) -> Optional[Dict[str, float]]:
+    if device != "cuda" or not torch.cuda.is_available():
+        return None
+    return {
+        "allocated_mib": float(torch.cuda.memory_allocated() / (1024.0 ** 2)),
+        "reserved_mib": float(torch.cuda.memory_reserved() / (1024.0 ** 2)),
+        "max_allocated_mib": float(torch.cuda.max_memory_allocated() / (1024.0 ** 2)),
+    }
+
+
+def _log_cuda_mem(logger: Logger, device: str, scope: str, step: int, duration_s: Optional[float] = None) -> None:
+    stats = _cuda_mem_stats_mib(device=device)
+    if stats is None:
+        return
+    msg = (
+        f"CUDA_MEM step={int(step)} scope={scope} "
+        f"allocated_mib={stats['allocated_mib']:.2f} "
+        f"reserved_mib={stats['reserved_mib']:.2f} "
+        f"max_allocated_mib={stats['max_allocated_mib']:.2f}"
+    )
+    if duration_s is not None:
+        msg += f" duration_s={float(duration_s):.3f}"
+    logger.log(msg)
+
+
+def _forward_with_optional_cache(
+    model: nn.Module,
+    input_ids: torch.Tensor,
+    pad_mask: Optional[torch.Tensor],
+    use_cache: Optional[bool] = None,
+):
+    kwargs = {"pad_mask": pad_mask}
+    if use_cache is not None:
+        kwargs["use_cache"] = bool(use_cache)
+    try:
+        return model(input_ids, **kwargs)
+    except TypeError:
+        if "use_cache" in kwargs:
+            kwargs.pop("use_cache", None)
+            return model(input_ids, **kwargs)
+        raise
+
+
 def evaluate_model(
     model: nn.Module,
     loader: DataLoader,
@@ -1075,42 +1268,62 @@ def evaluate_model(
     total_entropy_sum = 0.0
     total_steps = 0
 
-    for batch in loader:
-        input_ids, target_ids, loss_mask = batch
-        input_ids = input_ids.to(device, non_blocking=pin_memory)
-        target_ids = target_ids.to(device, non_blocking=pin_memory)
-        loss_mask = loss_mask.to(device, non_blocking=pin_memory)
+    with torch.inference_mode():
+        for batch in loader:
+            input_ids, target_ids, loss_mask = batch
+            input_ids = input_ids.to(device, non_blocking=pin_memory)
+            target_ids = target_ids.to(device, non_blocking=pin_memory)
+            loss_mask = loss_mask.to(device, non_blocking=pin_memory)
 
-        logits = model(input_ids, pad_mask=input_ids.eq(pad_id))
+            logits = _forward_with_optional_cache(
+                model=model,
+                input_ids=input_ids,
+                pad_mask=input_ids.eq(pad_id),
+                use_cache=False,
+            )
 
-        flat_mask = loss_mask.reshape(-1)
-        token_count = int(flat_mask.sum().item())
-        if token_count <= 0:
-            continue
-        flat_logits = logits.reshape(-1, vocab_size)[flat_mask]
-        flat_targets = target_ids.reshape(-1)[flat_mask]
-        ce_loss_sum = F.cross_entropy(flat_logits, flat_targets, reduction="sum")
-        if z_loss_enable:
-            log_z = torch.logsumexp(flat_logits, dim=-1)
-            z_loss_sum = log_z.square().sum()
-        else:
-            z_loss_sum = ce_loss_sum.new_zeros(())
+            flat_mask = loss_mask.reshape(-1)
+            token_count = int(flat_mask.sum().item())
+            if token_count <= 0:
+                del logits, input_ids, target_ids, loss_mask, flat_mask
+                continue
+            flat_logits = logits.reshape(-1, vocab_size)[flat_mask]
+            flat_targets = target_ids.reshape(-1)[flat_mask]
+            ce_loss_sum = F.cross_entropy(flat_logits, flat_targets, reduction="sum")
+            if z_loss_enable:
+                log_z = torch.logsumexp(flat_logits, dim=-1)
+                z_loss_sum = log_z.square().sum()
+            else:
+                z_loss_sum = ce_loss_sum.new_zeros(())
 
-        log_probs = F.log_softmax(logits, dim=-1)
-        probs = log_probs.exp()
-        entropy = -(probs * log_probs).sum(dim=-1)
-        entropy_sum = float(entropy[loss_mask].sum().item())
+            flat_log_probs = F.log_softmax(flat_logits, dim=-1)
+            flat_probs = flat_log_probs.exp()
+            entropy_sum = float((-(flat_probs * flat_log_probs).sum(dim=-1)).sum().item())
 
-        total_ce_loss_sum += float(ce_loss_sum.item())
-        total_z_loss_sum += float(z_loss_sum.item())
-        total_tokens += token_count
-        total_entropy_sum += entropy_sum
-        total_steps += 1
+            total_ce_loss_sum += float(ce_loss_sum.item())
+            total_z_loss_sum += float(z_loss_sum.item())
+            total_tokens += token_count
+            total_entropy_sum += entropy_sum
+            total_steps += 1
 
-        if max_steps > 0 and total_steps >= max_steps:
-            break
-        if max_tokens > 0 and total_tokens >= max_tokens:
-            break
+            del (
+                logits,
+                flat_mask,
+                flat_logits,
+                flat_targets,
+                ce_loss_sum,
+                z_loss_sum,
+                flat_log_probs,
+                flat_probs,
+                input_ids,
+                target_ids,
+                loss_mask,
+            )
+
+            if max_steps > 0 and total_steps >= max_steps:
+                break
+            if max_tokens > 0 and total_tokens >= max_tokens:
+                break
 
     ce = total_ce_loss_sum / float(max(1, total_tokens))
     z_loss = total_z_loss_sum / float(max(1, total_tokens))
@@ -1137,6 +1350,33 @@ def main():
     parser.add_argument("--train_data", type=str, required=True)
     parser.add_argument("--val_data", type=str, default=None)
     parser.add_argument("--test_data", type=str, default=None)
+    parser.add_argument(
+        "--train_bucket_distill",
+        type=str,
+        default=None,
+        help="Optional train split path for distillation bucket (pre-tokenized).",
+    )
+    parser.add_argument(
+        "--train_bucket_wiki",
+        type=str,
+        default=None,
+        help="Optional train split path for wiki bucket (pre-tokenized). Defaults to resolved --train_data/train.",
+    )
+    parser.add_argument(
+        "--train_bucket_coco",
+        type=str,
+        default=None,
+        help="Optional train split path for coco captions bucket (pre-tokenized).",
+    )
+    parser.add_argument(
+        "--mix_schedule",
+        type=str,
+        default="",
+        help=(
+            "JSON array or path to JSON schedule. "
+            "Entries: {start_step:int>=1, end_step:int|null, weights:{distill,wiki,coco}}."
+        ),
+    )
     parser.add_argument("--tokenizer", type=str, default=None)
     parser.add_argument("--checkpoint", type=int, default=None)
 
@@ -1373,6 +1613,13 @@ def main():
     )
     parser.add_argument("--log_every", type=int, default=100)
     parser.add_argument(
+        "--debug_cuda_empty_cache",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="Debug-only: call torch.cuda.empty_cache() after eval/probe to test fragmentation effects.",
+    )
+    parser.add_argument(
         "--track_r_metrics",
         dest="track_r_metrics",
         action="store_true",
@@ -1450,7 +1697,24 @@ def main():
     train_path, val_path, test_path = _resolve_data_paths(
         args.train_data, args.val_data, args.test_data
     )
-    train_dataset = load_dataset(train_path, args.max_seq_len)
+    try:
+        mix_schedule = parse_mix_schedule(args.mix_schedule) if args.mix_schedule else []
+    except ValueError as e:
+        raise SystemExit(f"Invalid --mix_schedule: {e}")
+    mix_enabled = len(mix_schedule) > 0
+
+    bucket_train_paths: Dict[str, str] = {}
+    if mix_enabled:
+        wiki_bucket_path = args.train_bucket_wiki if args.train_bucket_wiki else train_path
+        bucket_train_paths["wiki"] = _resolve_data_paths(wiki_bucket_path, None, None)[0]
+        if args.train_bucket_distill:
+            bucket_train_paths["distill"] = _resolve_data_paths(args.train_bucket_distill, None, None)[0]
+        if args.train_bucket_coco:
+            bucket_train_paths["coco"] = _resolve_data_paths(args.train_bucket_coco, None, None)[0]
+    else:
+        bucket_train_paths["wiki"] = train_path
+
+    train_dataset = load_dataset(bucket_train_paths["wiki"], args.max_seq_len)
     train_meta = getattr(train_dataset, "meta", None) or {}
     tok_info = _load_tokenizer_info(args.tokenizer)
 
@@ -1499,6 +1763,27 @@ def main():
     if args.vocab_size <= int(max(args.pad_id, args.eos_id, args.bos_id)):
         raise SystemExit("vocab_size must be larger than special token ids.")
 
+    train_bucket_datasets: Dict[str, Dataset] = {"wiki": train_dataset}
+    train_bucket_meta: Dict[str, Dict[str, Any]] = {"wiki": train_meta}
+    for bucket_name, bucket_path in bucket_train_paths.items():
+        if bucket_name == "wiki":
+            continue
+        dataset_i = load_dataset(bucket_path, args.max_seq_len)
+        meta_i = getattr(dataset_i, "meta", None) or {}
+        train_bucket_datasets[bucket_name] = dataset_i
+        train_bucket_meta[bucket_name] = meta_i
+        for key, expected in (
+            ("vocab_size", int(args.vocab_size)),
+            ("pad_id", int(args.pad_id)),
+            ("bos_id", int(args.bos_id)),
+            ("eos_id", int(args.eos_id)),
+        ):
+            if key in meta_i and meta_i[key] is not None and int(meta_i[key]) != expected:
+                raise SystemExit(
+                    f"Bucket '{bucket_name}' has meta.{key}={meta_i[key]}, expected {expected}. "
+                    "All buckets must share tokenizer ids/vocab."
+                )
+
     probe_tokenizer = None
     probe_prompts = []
     probe_file_path = None
@@ -1513,13 +1798,13 @@ def main():
             raise SystemExit("Probe tokenizer pad_id must match training pad_id.")
         probe_file_path = resolve_probe_file_path(
             train_data_arg=args.train_data,
-            resolved_train_path=train_path,
+            resolved_train_path=bucket_train_paths["wiki"],
             override_probe_file=args.probe_file,
         )
         probe_prompts = parse_probe_prompts(probe_file_path)
         probe_layers = parse_probe_layers(args.probe_layers, total_layers=int(args.enc_layers))
 
-    fixed_len = getattr(train_dataset, "fixed_len", False)
+    fixed_len = all(getattr(ds, "fixed_len", False) for ds in train_bucket_datasets.values())
     collate_fn = CollatePad(args.max_seq_len, args.pad_id, fixed_len)
     _collate_shift_sanity(collate_fn, args.pad_id)
 
@@ -1527,17 +1812,6 @@ def main():
         active_bucket_ranges = make_bucket_ranges(args.max_seq_len, args.bucket_width)
     else:
         active_bucket_ranges = BUCKET_RANGES
-
-    bucket_ranges, bucket_indices, bucket_token_counts = build_length_buckets(
-        train_dataset, args.max_seq_len, active_bucket_ranges
-    )
-    sampler = BucketBatchSampler(
-        bucket_indices=bucket_indices,
-        bucket_token_counts=bucket_token_counts,
-        batch_size=args.batch_size,
-        seed=SEED,
-        drop_last=True,
-    )
 
     train_pin_memory = device == "cuda"
     eval_pin_memory = bool(int(args.eval_pin_memory)) and device == "cuda"
@@ -1552,7 +1826,52 @@ def main():
             loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = max(1, int(args.prefetch_factor))
 
-    train_loader = DataLoader(train_dataset, batch_sampler=sampler, **loader_kwargs)
+    train_loader: Optional[DataLoader] = None
+    sampler: Optional[BucketBatchSampler] = None
+    mix_bucket_loaders: Dict[str, InfiniteBucketLoader] = {}
+    bucket_stats_by_bucket: Dict[str, Dict[str, Any]] = {}
+
+    for bucket_name in ("distill", "wiki", "coco"):
+        dataset_i = train_bucket_datasets.get(bucket_name)
+        if dataset_i is None:
+            continue
+        ranges_i, indices_i, tok_counts_i = build_length_buckets(
+            dataset_i, args.max_seq_len, active_bucket_ranges
+        )
+        sampler_i = BucketBatchSampler(
+            bucket_indices=indices_i,
+            bucket_token_counts=tok_counts_i,
+            batch_size=args.batch_size,
+            seed=SEED + (17 * len(bucket_stats_by_bucket)),
+            drop_last=True,
+        )
+        loader_i = DataLoader(dataset_i, batch_sampler=sampler_i, **loader_kwargs)
+        bucket_stats_by_bucket[bucket_name] = {
+            "path": bucket_train_paths[bucket_name],
+            "ranges": ranges_i,
+            "indices": indices_i,
+            "token_counts": tok_counts_i,
+            "sampler": sampler_i,
+            "loader": loader_i,
+        }
+
+    if mix_enabled:
+        for name in ("distill", "wiki", "coco"):
+            stats = bucket_stats_by_bucket.get(name)
+            if stats is None:
+                continue
+            mix_bucket_loaders[name] = InfiniteBucketLoader(
+                name=name,
+                loader=stats["loader"],
+                sampler=stats["sampler"],
+            )
+        if not mix_bucket_loaders:
+            raise SystemExit("No train buckets available for mixture training.")
+    else:
+        if "wiki" not in bucket_stats_by_bucket:
+            raise SystemExit("Missing wiki train bucket.")
+        sampler = bucket_stats_by_bucket["wiki"]["sampler"]
+        train_loader = bucket_stats_by_bucket["wiki"]["loader"]
 
     if val_path is None:
         raise SystemExit("Validation data is required (provide --val_data or use dataset_root/val).")
@@ -1678,8 +1997,28 @@ def main():
             weight_decay=0.0,
         )
 
-    updates_per_epoch = max(1, math.ceil(len(train_loader) / float(max(1, int(args.grad_accum_steps)))))
+    train_microbatches_per_epoch = (
+        sum(int(info["sampler"].batches_per_epoch) for info in bucket_stats_by_bucket.values())
+        if mix_enabled
+        else int(len(train_loader))
+    )
+    updates_per_epoch = max(
+        1,
+        math.ceil(train_microbatches_per_epoch / float(max(1, int(args.grad_accum_steps)))),
+    )
     total_steps = args.max_steps if args.max_steps is not None else args.epochs * updates_per_epoch
+    if mix_enabled:
+        try:
+            validate_mix_schedule_coverage(mix_schedule, int(total_steps))
+        except ValueError as e:
+            raise SystemExit(f"Invalid --mix_schedule: {e}")
+        required_buckets = required_mix_buckets_for_horizon(mix_schedule, int(total_steps))
+        missing_required = sorted(name for name in required_buckets if name not in bucket_train_paths)
+        if missing_required:
+            raise SystemExit(
+                "Mix schedule references bucket(s) within the active training horizon but no path was provided: "
+                f"{missing_required}. Provided buckets: {sorted(bucket_train_paths.keys())}"
+            )
     warmup_steps = max(1, int(total_steps * args.warmup_ratio))
     scheduler = WarmupScheduler(opt, args.lr, warmup_steps, total_steps, schedule=args.schedule)
     row_max_norm_targets = collect_row_max_norm_targets(model) if args.row_max_norm_enable else []
@@ -1726,7 +2065,22 @@ def main():
             meta_val = train_meta.get(key)
             if meta_val is not None and int(meta_val) != int(arg_val):
                 logger.log(f"warning: meta.{key}={meta_val} != args.{key}={arg_val}")
-    logger.log(f"train_data: {train_path}")
+    logger.log(f"train_data: {bucket_train_paths['wiki']}")
+    if mix_enabled:
+        logger.log("train mixture buckets:")
+        for name in ("distill", "wiki", "coco"):
+            path = bucket_train_paths.get(name)
+            if path:
+                logger.log(f"  {name}: {path}")
+        logger.log("train mixture schedule:")
+        for entry in mix_schedule:
+            end_txt = "inf" if entry["end_step"] is None else str(entry["end_step"])
+            w = entry["weights"]
+            logger.log(
+                f"  steps {entry['start_step']}-{end_txt}: "
+                f"distill={w.get('distill', 0.0):.4f}, "
+                f"wiki={w.get('wiki', 0.0):.4f}, coco={w.get('coco', 0.0):.4f}"
+            )
     logger.log(f"val_data: {val_path}")
     logger.log(f"test_data: {test_path}")
     logger.log(
@@ -1742,14 +2096,20 @@ def main():
             f"loss_tokens={val_slice_info['tokens']}"
         )
 
-    total_bucket_tokens = float(np.sum(np.asarray(bucket_token_counts, dtype=np.float64)))
-    if total_bucket_tokens > 0:
-        logger.log("Bucket stats (range, seqs, tokens, prob):")
+    for bucket_name in ("distill", "wiki", "coco"):
+        info = bucket_stats_by_bucket.get(bucket_name)
+        if info is None:
+            continue
+        tok_counts = info["token_counts"]
+        total_bucket_tokens = float(np.sum(np.asarray(tok_counts, dtype=np.float64)))
+        if total_bucket_tokens <= 0:
+            continue
+        logger.log(f"Length-bucket stats [{bucket_name}] (range, seqs, tokens, prob):")
         for (lo, hi), indices, tok_count, prob in zip(
-            bucket_ranges,
-            bucket_indices,
-            bucket_token_counts,
-            sampler.bucket_probs.tolist(),
+            info["ranges"],
+            info["indices"],
+            tok_counts,
+            info["sampler"].bucket_probs.tolist(),
         ):
             logger.log(
                 f"  {lo:4d}-{hi:4d}: seqs={len(indices):7d} "
@@ -1888,6 +2248,8 @@ def main():
     agc_total_params_since_log = 0
     row_max_norm_affected_params_since_log = 0
     row_max_norm_total_params_since_log = 0
+    mix_bucket_batches_since_log = {k: 0 for k in ("distill", "wiki", "coco")}
+    mix_bucket_batches_total = {k: 0 for k in ("distill", "wiki", "coco")}
     running_ce_window = deque()
     running_ce_tokens = 0
     running_ce_loss_sum = 0.0
@@ -1901,7 +2263,7 @@ def main():
     log_start = time.perf_counter()
     did_sanity = False
 
-    batches_per_epoch = max(1, len(train_loader))
+    batches_per_epoch = max(1, int(train_microbatches_per_epoch))
     if resume_batch_in_epoch >= batches_per_epoch:
         resume_epoch += int(resume_batch_in_epoch // batches_per_epoch)
         resume_batch_in_epoch = int(resume_batch_in_epoch % batches_per_epoch)
@@ -1937,6 +2299,18 @@ def main():
         row_max_norm_total_params_since_log = int(
             restored_log_accum_state.get("row_max_norm_total_params_since_log", 0)
         )
+        restored_mix_batches_since_log = restored_log_accum_state.get("mix_bucket_batches_since_log", {})
+        if isinstance(restored_mix_batches_since_log, dict):
+            for name in ("distill", "wiki", "coco"):
+                v = restored_mix_batches_since_log.get(name)
+                if isinstance(v, (int, float)):
+                    mix_bucket_batches_since_log[name] = int(v)
+        restored_mix_batches_total = restored_log_accum_state.get("mix_bucket_batches_total", {})
+        if isinstance(restored_mix_batches_total, dict):
+            for name in ("distill", "wiki", "coco"):
+                v = restored_mix_batches_total.get(name)
+                if isinstance(v, (int, float)):
+                    mix_bucket_batches_total[name] = int(v)
         running_ce_tokens = int(restored_log_accum_state.get("running_ce_tokens", 0))
         running_ce_loss_sum = float(restored_log_accum_state.get("running_ce_loss_sum", 0.0))
         running_ce_list = restored_log_accum_state.get("running_ce_window", [])
@@ -1976,10 +2350,35 @@ def main():
     accum_has_grad = False
 
     for epoch in range(resume_epoch, args.epochs):
-        sampler.set_epoch(epoch)
-        for batch_idx, batch in enumerate(train_loader, start=1):
+        train_iter = None
+        if not mix_enabled:
+            if sampler is None or train_loader is None:
+                raise RuntimeError("Internal error: missing sampler/train_loader in non-mix mode.")
+            sampler.set_epoch(epoch)
+            train_iter = iter(train_loader)
+
+        for batch_idx in range(1, batches_per_epoch + 1):
             if args.max_steps is not None and global_step >= args.max_steps:
                 break
+
+            if mix_enabled:
+                micro_step_1based = (int(epoch) * int(batches_per_epoch)) + int(batch_idx)
+                sched_step_1based = (
+                    (micro_step_1based - 1) // int(max(1, int(args.grad_accum_steps)))
+                ) + 1
+                active_weights = get_mix_weights_for_step(mix_schedule, int(sched_step_1based))
+                mix_bucket_name = sample_bucket_name(active_weights)
+                bucket_loader = mix_bucket_loaders.get(mix_bucket_name)
+                if bucket_loader is None:
+                    raise RuntimeError(f"Active mix bucket '{mix_bucket_name}' is unavailable.")
+                batch = bucket_loader.next_batch()
+                mix_bucket_batches_since_log[mix_bucket_name] += 1
+                mix_bucket_batches_total[mix_bucket_name] += 1
+            else:
+                if train_iter is None:
+                    raise RuntimeError("Internal error: train iterator is not initialized.")
+                batch = next(train_iter)
+
             if epoch == resume_epoch and batch_idx <= resume_batch_in_epoch:
                 continue
 
@@ -2275,9 +2674,21 @@ def main():
                         ent_parts.append(f"{k}={avg_v:.6f}")
                     if ent_parts:
                         log_msg += ", " + ", ".join(ent_parts)
+                if mix_enabled:
+                    mix_total = sum(mix_bucket_batches_since_log.values())
+                    if mix_total > 0:
+                        mix_parts = []
+                        for name in ("distill", "wiki", "coco"):
+                            c = int(mix_bucket_batches_since_log.get(name, 0))
+                            if c <= 0:
+                                continue
+                            mix_parts.append(f"{name}:{c}/{mix_total} ({(100.0 * c / mix_total):.1f}%)")
+                        if mix_parts:
+                            log_msg += ", MixDraws[" + ", ".join(mix_parts) + "]"
                 if log_top_grad_norms:
                     log_msg += f", {format_top_grad_norms(top_grad_norms_for_log)}"
                 logger.log(log_msg)
+                _log_cuda_mem(logger=logger, device=device, scope="train_log", step=int(global_step))
 
                 log_start = time.perf_counter()
                 tokens_since_log = 0
@@ -2298,8 +2709,12 @@ def main():
                 agc_total_params_since_log = 0
                 row_max_norm_affected_params_since_log = 0
                 row_max_norm_total_params_since_log = 0
+                mix_bucket_batches_since_log = {k: 0 for k in ("distill", "wiki", "coco")}
 
             if args.eval_every_steps > 0 and global_step % args.eval_every_steps == 0:
+                if device == "cuda":
+                    torch.cuda.reset_peak_memory_stats()
+                _log_cuda_mem(logger=logger, device=device, scope="eval_start", step=int(global_step))
                 eval_t0 = time.perf_counter()
                 val_metrics = evaluate_model(
                     model=model,
@@ -2320,13 +2735,33 @@ def main():
                     f"PPL={val_metrics['ppl']:.4f} Entropy={val_metrics['entropy']:.6f} "
                     f"tokens={val_metrics['tokens']} steps={val_metrics['steps']}"
                 )
+                eval_elapsed = max(0.0, time.perf_counter() - eval_t0)
+                _log_cuda_mem(
+                    logger=logger,
+                    device=device,
+                    scope="eval_end",
+                    step=int(global_step),
+                    duration_s=eval_elapsed,
+                )
+                if bool(int(args.debug_cuda_empty_cache)) and device == "cuda":
+                    torch.cuda.empty_cache()
+                    _log_cuda_mem(
+                        logger=logger,
+                        device=device,
+                        scope="eval_after_empty_cache",
+                        step=int(global_step),
+                    )
                 # Keep training Tokens/s from being penalized by eval wall-time.
-                log_start += max(0.0, time.perf_counter() - eval_t0)
+                log_start += eval_elapsed
+                del val_metrics
 
             probe_due = int(args.run_probes) > 0 and global_step % int(args.run_probes) == 0
             if probe_due and probe_after_log_only and (global_step % int(args.log_every) != 0):
                 probe_due = False
             if probe_due:
+                if device == "cuda":
+                    torch.cuda.reset_peak_memory_stats()
+                _log_cuda_mem(logger=logger, device=device, scope="probe_start", step=int(global_step))
                 probe_t0 = time.perf_counter()
                 probe_summary = run_debug_probes(
                     model=model,
@@ -2373,8 +2808,25 @@ def main():
                     f"{' '.join(agg_items)} "
                     f"artifacts={os.path.join(LOGDIR, args.run_id, 'probe_debug')}"
                 )
+                probe_elapsed = max(0.0, time.perf_counter() - probe_t0)
+                _log_cuda_mem(
+                    logger=logger,
+                    device=device,
+                    scope="probe_end",
+                    step=int(global_step),
+                    duration_s=probe_elapsed,
+                )
+                if bool(int(args.debug_cuda_empty_cache)) and device == "cuda":
+                    torch.cuda.empty_cache()
+                    _log_cuda_mem(
+                        logger=logger,
+                        device=device,
+                        scope="probe_after_empty_cache",
+                        step=int(global_step),
+                    )
                 # Keep training Tokens/s from being penalized by probe wall-time.
-                log_start += max(0.0, time.perf_counter() - probe_t0)
+                log_start += probe_elapsed
+                del probe_summary, agg, agg_items
 
             if global_step % args.ckpt_every == 0:
                 ckpt_path = os.path.join(LOGDIR, args.run_id, f"step_{global_step}.tar")
@@ -2421,6 +2873,12 @@ def main():
                                 row_max_norm_affected_params_since_log
                             ),
                             "row_max_norm_total_params_since_log": int(row_max_norm_total_params_since_log),
+                            "mix_bucket_batches_since_log": {
+                                k: int(v) for k, v in mix_bucket_batches_since_log.items()
+                            },
+                            "mix_bucket_batches_total": {
+                                k: int(v) for k, v in mix_bucket_batches_total.items()
+                            },
                             "running_ce_tokens": int(running_ce_tokens),
                             "running_ce_loss_sum": float(running_ce_loss_sum),
                             "running_ce_window": [list(x) for x in running_ce_window],
@@ -2435,6 +2893,10 @@ def main():
         if args.max_steps is not None and global_step >= args.max_steps:
             break
 
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    _log_cuda_mem(logger=logger, device=device, scope="test_eval_start", step=int(global_step))
+    test_eval_t0 = time.perf_counter()
     test_metrics = evaluate_model(
         model=model,
         loader=test_loader,
@@ -2446,6 +2908,13 @@ def main():
         max_tokens=max(0, int(args.test_max_tokens)),
         max_steps=max(0, int(args.test_steps)),
         pin_memory=eval_pin_memory,
+    )
+    _log_cuda_mem(
+        logger=logger,
+        device=device,
+        scope="test_eval_end",
+        step=int(global_step),
+        duration_s=max(0.0, time.perf_counter() - test_eval_t0),
     )
     logger.log(
         "Test "
