@@ -1,0 +1,21 @@
+docker run --rm -it --gpus all -v "$(pwd)":/app -w /app myrepo:gpu \
+	python3 -m scripts.pretokenize_corpus \
+		--input ./data/wiki_coco/articles.jsonl \
+		--out-dir ./data/pretraining/wikicoco256_cleaned \
+		--tokenizer ./logs/mix_bpe_16k/tokenizer.pt \
+		--max_seq_len 256 \
+		--stride 128 \
+		--max_windows_per_doc 4 \
+		--window_sampling random \
+		--clean_wikipedia 1 \
+		--clean_markdown 1 \
+		--drop_list_pages 1 \
+		--drop_disambiguation_pages 1 \
+		--drop_sections_regex "(?im)^(see also|references|external links|further reading|notes|bibliography)\b" \
+		--drop_lines_regex "(?im)^(\*\s|\-\s|==+\s*|\|\s*|\{\{.*\}\}|\[\[File:|\[\[Image:)" \
+		--min_chars_after_clean 400 \
+		--log_clean_stats 1 \
+		--seed 35 \
+		--split_train 0.95 \
+		--split_val 0.04 \
+		--split_test 0.01
