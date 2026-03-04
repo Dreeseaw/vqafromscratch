@@ -15,6 +15,7 @@ docker run --rm -it --gpus all -v "$(pwd)":/app -w /app myrepo:gpu \
 		--tokenizer logs/mix_bpe_16k/tokenizer.pt \
 		--epochs=100 --warmup_ratio=0.004 \
 		--enc_layers=6 --dec_layers=6 --ff_mult=2 --d_model=384 --n_heads=6 \
+		--tie_embeddings --debug_cuda_empty_cache=1 \
 		--probe_layers=0,1,2,3,4,5 --no_activation_checkpointing \
 		--num_workers=8 --persistent_workers --prefetch_factor 8 \
 		--run_probes=1000 --probe_after_log_only --eval_every_steps=5000 \

@@ -139,8 +139,8 @@ const probeDebugDir = path.join(runDir, "probe_debug");
 const latestAttentionFile = path.join(probeDebugDir, "latest_attention.json");
 const attentionIndexFile = path.join(probeDebugDir, "attention_index.json");
 
-const DEFAULT_ATTN_GRID_CACHE_LIMIT = 1024;
-const DEFAULT_ATTN_PREWARM_LIMIT = 256;
+const DEFAULT_ATTN_GRID_CACHE_LIMIT = 0;
+const DEFAULT_ATTN_PREWARM_LIMIT = 0;
 
 const attnGridCacheIdx = args.indexOf("--attn-grid-cache");
 let attentionGridCacheLimit = DEFAULT_ATTN_GRID_CACHE_LIMIT;

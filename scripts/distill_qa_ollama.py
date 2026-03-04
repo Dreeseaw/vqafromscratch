@@ -31,7 +31,8 @@ from urllib import request as urlrequest
 
 from models.bpe_tokenizer import ByteBPETokenizer
 
-OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
+DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
+OLLAMA_URL = os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL).strip() or DEFAULT_OLLAMA_URL
 TEXT_KEYS = ("text", "context", "content", "body", "extract")
 DEFAULT_MODEL = "qwen2.5-coder:7b-instruct"
 BANNED_PHRASES = (
@@ -170,6 +171,10 @@ def find_span(context: str, answer: str) -> Optional[Tuple[int, int]]:
     start = context.find(answer)
     if start >= 0:
         return start, start + len(answer)
+    # Next: case-insensitive exact substring.
+    start_ci = context.lower().find(answer.lower())
+    if start_ci >= 0:
+        return start_ci, start_ci + len(answer)
 
     # Fallback: whitespace-normalized match with back-mapping to raw indices.
     ans_n = normalize_ws(answer)
@@ -197,7 +202,7 @@ def find_span(context: str, answer: str) -> Optional[Tuple[int, int]]:
     ctx_n = "".join(norm_chars)
     if not ctx_n:
         return None
-    pos = ctx_n.find(ans_n)
+    pos = ctx_n.lower().find(ans_n.lower())
     if pos < 0:
         return None
     end_pos = pos + len(ans_n) - 1
@@ -294,6 +299,48 @@ def _strip_code_fences(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _extract_first_json_object(text: str) -> Dict[str, Any]:
+    cleaned = _strip_code_fences(text).strip()
+    try:
+        obj = json.loads(cleaned)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass
+
+    starts = [i for i, ch in enumerate(cleaned) if ch == "{"]
+    for start in starts:
+        depth = 0
+        in_str = False
+        escaped = False
+        for idx in range(start, len(cleaned)):
+            ch = cleaned[idx]
+            if in_str:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = cleaned[start : idx + 1]
+                    try:
+                        obj = json.loads(candidate)
+                    except json.JSONDecodeError:
+                        break
+                    if isinstance(obj, dict):
+                        return obj
+                    break
+    raise ValueError("No JSON object found")
+
+
 def _build_generation_prompt(context: str, max_q_per_context: int, answer_max_words: int) -> str:
     example = {
         "qas": [
@@ -350,6 +397,7 @@ def _ollama_generate(
         "model": model,
         "system": system_prompt,
         "prompt": prompt,
+        "think": False,
         "stream": False,
         "options": {
             "temperature": temperature,
@@ -373,10 +421,7 @@ def _ollama_generate(
 
 
 def _parse_qas_json(text: str) -> Dict[str, Any]:
-    cleaned = _strip_code_fences(text)
-    obj = json.loads(cleaned)
-    if not isinstance(obj, dict):
-        raise ValueError("Top-level JSON is not an object")
+    obj = _extract_first_json_object(text)
     qas = obj.get("qas")
     if not isinstance(qas, list):
         raise ValueError("Missing list field 'qas'")
@@ -384,10 +429,7 @@ def _parse_qas_json(text: str) -> Dict[str, Any]:
 
 
 def _parse_repair_answer_json(text: str) -> str:
-    cleaned = _strip_code_fences(text)
-    obj = json.loads(cleaned)
-    if not isinstance(obj, dict):
-        raise ValueError("Repair top-level JSON is not an object")
+    obj = _extract_first_json_object(text)
     a = obj.get("a")
     if not isinstance(a, str):
         raise ValueError("Repair JSON missing string field 'a'")

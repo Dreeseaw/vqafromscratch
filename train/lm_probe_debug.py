@@ -225,6 +225,26 @@ def _forward_with_optional_cache(
         raise
 
 
+def _print_probe_invariant_failure(
+    tag: str,
+    tokenizer,
+    pad_id: int,
+    prompt: Optional[str] = None,
+    token_ids: Optional[List[int]] = None,
+    max_new_tokens: Optional[int] = None,
+) -> None:
+    bos_id = int(getattr(tokenizer, "bos_id", -1))
+    eos_id = int(getattr(tokenizer, "eos_id", -1))
+    msg = [f"[probe-invariant-failed] {tag} bos_id={bos_id} eos_id={eos_id} pad_id={int(pad_id)}"]
+    if max_new_tokens is not None:
+        msg.append(f"max_new_tokens={int(max_new_tokens)}")
+    if prompt is not None:
+        msg.append(f"prompt={prompt!r}")
+    if token_ids is not None:
+        msg.append(f"token_ids_tail={list(token_ids)[-20:]}")
+    print(" | ".join(msg))
+
+
 @torch.inference_mode()
 def _autoregressive_generate(
     model: torch.nn.Module,
@@ -281,19 +301,29 @@ def _autoregressive_generate(
     eos_id = int(getattr(tokenizer, "eos_id", -1))
     generated_ids: List[int] = []
     stop_reason = "max_new_tokens"
+    finished = torch.zeros(cur.size(0), dtype=torch.bool, device=cur.device)
 
     for _ in range(max(0, int(max_new_tokens))):
         if cur.size(1) >= int(max_seq_len):
             stop_reason = "max_seq_len"
             break
-        pad_mask = cur.eq(int(pad_id))
+        attention_mask = cur.ne(int(pad_id))
+        last_nonpad = attention_mask.long().sum(dim=1) - 1
+        if bool((last_nonpad < 0).any().item()):
+            stop_reason = "invalid_prompt"
+            break
+        pad_mask = ~attention_mask
         logits = _forward_with_optional_cache(model, cur, pad_mask=pad_mask, use_cache=True)
-        next_id = int(torch.argmax(logits[:, -1, :], dim=-1).item())
-        next_tok = torch.tensor([[next_id]], dtype=cur.dtype, device=cur.device)
+        gather_idx = last_nonpad.view(-1, 1, 1).expand(-1, 1, logits.size(-1))
+        step_logits = logits.gather(dim=1, index=gather_idx).squeeze(1)
+        next_ids = torch.argmax(step_logits, dim=-1)
+        next_tok = next_ids.view(-1, 1).to(dtype=cur.dtype, device=cur.device)
         cur = torch.cat([cur, next_tok], dim=1)
-        generated_ids.append(next_id)
-        del logits, next_tok
-        if eos_id >= 0 and next_id == eos_id:
+        generated_ids.append(int(next_ids[0].item()))
+        if eos_id >= 0:
+            finished = finished | next_ids.eq(eos_id)
+        del logits, step_logits, next_tok, gather_idx, attention_mask, last_nonpad
+        if bool(finished.all().item()):
             stop_reason = "eos"
             break
 
@@ -351,10 +381,67 @@ def run_debug_probes(
     attention_index_path = os.path.join(probe_root, "attention_index.json")
     agg_values: Dict[str, List[float]] = {}
     generation_records: List[Dict[str, Any]] = []
+    eos_id = int(getattr(tokenizer, "eos_id", -1))
+
+    try:
+        assert int(generate_max_new_tokens) > 0
+        assert int(pad_id) != eos_id
+    except AssertionError:
+        _print_probe_invariant_failure(
+            tag="run_config",
+            tokenizer=tokenizer,
+            pad_id=int(pad_id),
+            max_new_tokens=int(generate_max_new_tokens),
+        )
+        raise
+
+    if len(prompts) >= 2:
+        try:
+            ids_a = tokenizer.encode(prompts[0], add_bos=True, add_eos=False)[:max_seq_len]
+            ids_b = tokenizer.encode(prompts[1], add_bos=True, add_eos=False)[:max_seq_len]
+            t = max(int(ids_a.numel()), int(ids_b.numel()))
+            assert t > 0
+            batch_ids = torch.full((2, t), int(pad_id), dtype=torch.long)
+            if ids_a.numel() > 0:
+                batch_ids[0, : ids_a.numel()] = ids_a
+            if ids_b.numel() > 0:
+                batch_ids[1, : ids_b.numel()] = ids_b
+            attention_mask = batch_ids.ne(int(pad_id))
+            for i in range(2):
+                last_nonpad = int(attention_mask[i].sum().item()) - 1
+                assert last_nonpad >= 0
+                assert int(batch_ids[i, last_nonpad].item()) != int(pad_id)
+        except AssertionError:
+            print("[probe-invariant-failed] padded_batch_check")
+            print(f"shape input_ids={tuple(batch_ids.shape)} attention_mask={tuple(attention_mask.shape)}")
+            for i in range(2):
+                last_nonpad = int(attention_mask[i].sum().item()) - 1
+                tail_ids = batch_ids[i, -20:].tolist()
+                tail_mask = attention_mask[i, -20:].long().tolist()
+                ln_tok = int(batch_ids[i, last_nonpad].item()) if last_nonpad >= 0 else None
+                print(
+                    f"sample={i} last_nonpad={last_nonpad} tok_last_nonpad={ln_tok} tok_last={int(batch_ids[i, -1].item())} "
+                    f"tail_ids={tail_ids} tail_mask={tail_mask}"
+                )
+            raise
 
     for probe_idx, prompt in enumerate(prompts):
-        ids = tokenizer.encode(prompt, add_bos=True, add_eos=True)
+        ids = tokenizer.encode(prompt, add_bos=True, add_eos=False)
         ids = ids[:max_seq_len]
+        if probe_idx == 0:
+            try:
+                assert ids.numel() > 0
+                assert int(ids[-1].item()) != eos_id
+            except AssertionError:
+                _print_probe_invariant_failure(
+                    tag="prompt_encoding",
+                    tokenizer=tokenizer,
+                    pad_id=int(pad_id),
+                    prompt=prompt,
+                    token_ids=[int(x) for x in ids.detach().cpu().tolist()],
+                    max_new_tokens=int(generate_max_new_tokens),
+                )
+                raise
         input_ids = ids.unsqueeze(0).to(device)
         prompt_token_ids = [int(x) for x in ids.detach().cpu().tolist()]
         pad_mask = input_ids.eq(int(pad_id))
