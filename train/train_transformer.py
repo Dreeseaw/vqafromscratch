@@ -31,7 +31,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 
-from models.lm import TransformerV1, LMConfig
+from models.lm import TransformerV1, TransformerDecoderOnlyV1, LMConfig
 from train.lm_probe_debug import (
     parse_probe_layers,
     parse_probe_prompts,
@@ -892,6 +892,16 @@ def _is_attn_out_param_name(name: str) -> bool:
     return any(marker in name for marker in markers)
 
 
+def _is_dec_cross_attn_param_name(name: str) -> bool:
+    markers = (
+        "._cross_q.",
+        "._cross_kv.",
+        "._cross_out_proj.",
+        "._ls_cross_attn",
+    )
+    return any(marker in name for marker in markers)
+
+
 def _grad_split_group_for_param(name: str) -> Optional[str]:
     if name.startswith("_embed."):
         return "embed"
@@ -961,13 +971,68 @@ def build_optimizer_param_groups(
     weight_decay: float,
     tie_embeddings: bool,
     half_lr_lm_head: bool,
+    dec_cross_attn_lr_scale: float = 1.0,
 ):
+    if float(dec_cross_attn_lr_scale) <= 0.0:
+        raise ValueError("dec_cross_attn_lr_scale must be > 0.")
+
     tied_embed_param_id = id(model._embed.weight) if tie_embeddings else None
+    # Keep the default group layout unchanged for checkpoint compatibility.
+    if abs(float(dec_cross_attn_lr_scale) - 1.0) < 1e-12:
+        grouped_params: Dict[str, List[nn.Parameter]] = {
+            "main_decay": [],
+            "lm_head_no_decay": [],
+            "embed_decay": [],
+            "main_no_decay": [],
+            "embed_no_decay": [],
+        }
+
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            param_name = str(name)
+            is_embed = param_name.startswith("_embed.")
+            is_lm_head = param_name.startswith("_unembed.")
+            is_bias = param_name.endswith(".bias")
+            if is_lm_head:
+                grouped_params["lm_head_no_decay"].append(param)
+                continue
+            no_decay = is_bias or (tied_embed_param_id is not None and id(param) == tied_embed_param_id)
+            if is_embed:
+                key = "embed_no_decay" if no_decay else "embed_decay"
+            else:
+                key = "main_no_decay" if no_decay else "main_decay"
+            grouped_params[key].append(param)
+
+        out = []
+        for key in ("main_decay", "lm_head_no_decay", "embed_decay", "main_no_decay", "embed_no_decay"):
+            params = grouped_params[key]
+            if len(params) == 0:
+                continue
+            if key.startswith("embed_"):
+                lr_scale = 0.5
+            elif key == "lm_head_no_decay":
+                lr_scale = 0.125 if half_lr_lm_head else 1.0
+            else:
+                lr_scale = 1.0
+            group_weight_decay = 0.0 if key.endswith("_no_decay") or key == "embed_decay" else float(weight_decay)
+            out.append(
+                {
+                    "params": params,
+                    "weight_decay": group_weight_decay,
+                    "lr_scale": lr_scale,
+                    "lr": float(base_lr) * lr_scale,
+                }
+            )
+        return out
+
     grouped_params: Dict[str, List[nn.Parameter]] = {
-        "main_decay": [],
+        "main_decay_noncross": [],
+        "main_decay_cross": [],
         "lm_head_no_decay": [],
         "embed_decay": [],
-        "main_no_decay": [],
+        "main_no_decay_noncross": [],
+        "main_no_decay_cross": [],
         "embed_no_decay": [],
     }
 
@@ -985,11 +1050,23 @@ def build_optimizer_param_groups(
         if is_embed:
             key = "embed_no_decay" if no_decay else "embed_decay"
         else:
-            key = "main_no_decay" if no_decay else "main_decay"
+            is_dec_cross_attn = _is_dec_cross_attn_param_name(param_name)
+            if no_decay:
+                key = "main_no_decay_cross" if is_dec_cross_attn else "main_no_decay_noncross"
+            else:
+                key = "main_decay_cross" if is_dec_cross_attn else "main_decay_noncross"
         grouped_params[key].append(param)
 
     out = []
-    for key in ("main_decay", "lm_head_no_decay", "embed_decay", "main_no_decay", "embed_no_decay"):
+    for key in (
+        "main_decay_noncross",
+        "main_decay_cross",
+        "lm_head_no_decay",
+        "embed_decay",
+        "main_no_decay_noncross",
+        "main_no_decay_cross",
+        "embed_no_decay",
+    ):
         params = grouped_params[key]
         if len(params) == 0:
             continue
@@ -999,7 +1076,11 @@ def build_optimizer_param_groups(
             lr_scale = 0.125 if half_lr_lm_head else 1.0
         else:
             lr_scale = 1.0
+        if key.endswith("_cross"):
+            lr_scale *= float(dec_cross_attn_lr_scale)
         group_weight_decay = 0.0 if key.endswith("_no_decay") or key == "embed_decay" else float(weight_decay)
+        if key.startswith("main_no_decay_"):
+            group_weight_decay = 0.0
         out.append(
             {
                 "params": params,
@@ -1189,6 +1270,42 @@ def extract_attn_entropy_metrics(attn_state: Optional[dict]) -> dict:
             if not isinstance(value, (float, int)):
                 continue
             out[f"attn_entropy_{scope_key}_l{layer}"] = float(value)
+    return out
+
+
+def extract_cap_metrics(cap_state: Optional[dict]) -> dict:
+    out = {}
+    if not isinstance(cap_state, dict):
+        return out
+
+    def _add_layer_metrics(entries: Any, prefix: str, pre_key: str, post_key: str) -> None:
+        if not isinstance(entries, list):
+            return
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            layer = entry.get("layer")
+            if not isinstance(layer, int):
+                continue
+            pre_v = entry.get(pre_key)
+            post_v = entry.get(post_key)
+            if isinstance(pre_v, (float, int)):
+                out[f"cap_pre_{prefix}_l{layer}"] = float(pre_v)
+            if isinstance(post_v, (float, int)):
+                out[f"cap_post_{prefix}_l{layer}"] = float(post_v)
+
+    _add_layer_metrics(cap_state.get("encoder_layers"), "enc_attn", "attn_pre_cap", "attn_post_cap")
+    _add_layer_metrics(cap_state.get("encoder_layers"), "enc_mlp", "mlp_pre_cap", "mlp_post_cap")
+    _add_layer_metrics(cap_state.get("decoder_self_layers"), "dec_self_attn", "attn_pre_cap", "attn_post_cap")
+    _add_layer_metrics(cap_state.get("decoder_cross_layers"), "dec_cross_attn", "attn_pre_cap", "attn_post_cap")
+    _add_layer_metrics(cap_state.get("decoder_mlp_layers"), "dec_mlp", "mlp_pre_cap", "mlp_post_cap")
+
+    pre_avg = cap_state.get("pre_cap_avg")
+    post_avg = cap_state.get("post_cap_avg")
+    if isinstance(pre_avg, (float, int)):
+        out["pre_cap_avg"] = float(pre_avg)
+    if isinstance(post_avg, (float, int)):
+        out["post_cap_avg"] = float(post_avg)
     return out
 
 
@@ -1390,8 +1507,13 @@ def main():
     # model (models/lm.py)
     parser.add_argument("--d_model", type=int, default=512)
     parser.add_argument("--n_heads", type=int, default=8)
-    parser.add_argument("--enc_layers", type=int, default=4)  # must match dec_layers
-    parser.add_argument("--dec_layers", type=int, default=4)  # must match enc_layers
+    parser.add_argument("--enc_layers", type=int, default=4)  # used for encoder-decoder mode
+    parser.add_argument("--dec_layers", type=int, default=4)  # used for both modes
+    parser.add_argument(
+        "--decoder_only",
+        action="store_true",
+        help="Use decoder-only Transformer (no encoder/cross-attention path).",
+    )
     parser.add_argument("--ff_mult", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--tie_embeddings", action="store_true")
@@ -1478,6 +1600,12 @@ def main():
         "--half_lr_lm_head",
         action="store_true",
         help="Use 0.5x base LR for _unembed (LM head) parameters.",
+    )
+    parser.add_argument(
+        "--dec_cross_attn_lr_scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for decoder cross-attention parameter LR (_cross_q/_cross_kv/_cross_out_proj/_ls_cross_attn).",
     )
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["adam", "adamw"])
     parser.add_argument("--warmup_ratio", type=float, default=0.04)
@@ -1568,6 +1696,11 @@ def main():
         "--track_attn_entropy",
         action="store_true",
         help="Track mean attention entropy for encoder/self-cross decoder attention on training batches.",
+    )
+    parser.add_argument(
+        "--track_caps",
+        action="store_true",
+        help="Track pre/post cap-change norms for each layer cap event, plus model-level pre_cap_avg/post_cap_avg.",
     )
     parser.add_argument(
         "--track_train_token_entropy",
@@ -1802,7 +1935,8 @@ def main():
             override_probe_file=args.probe_file,
         )
         probe_prompts = parse_probe_prompts(probe_file_path)
-        probe_layers = parse_probe_layers(args.probe_layers, total_layers=int(args.enc_layers))
+        probe_layer_total = int(args.dec_layers) if bool(args.decoder_only) else int(args.enc_layers)
+        probe_layers = parse_probe_layers(args.probe_layers, total_layers=probe_layer_total)
 
     fixed_len = all(getattr(ds, "fixed_len", False) for ds in train_bucket_datasets.values())
     collate_fn = CollatePad(args.max_seq_len, args.pad_id, fixed_len)
@@ -1902,8 +2036,8 @@ def main():
     val_loader = DataLoader(val_eval_dataset, **eval_loader_kwargs)
     test_loader = DataLoader(test_dataset, **eval_loader_kwargs)
 
-    if args.enc_layers != args.dec_layers:
-        raise SystemExit("--enc_layers must equal --dec_layers for TransformerV1.")
+    if (not bool(args.decoder_only)) and args.enc_layers != args.dec_layers:
+        raise SystemExit("--enc_layers must equal --dec_layers for TransformerV1 (encoder-decoder mode).")
     if int(args.grad_accum_steps) <= 0:
         raise SystemExit("--grad_accum_steps must be > 0.")
     if args.grad_clip_mode == "global" and args.clip_grad <= 0:
@@ -1932,10 +2066,13 @@ def main():
         raise SystemExit("--eval_prefetch_factor must be > 0.")
     if int(args.grad_split_every) < 0:
         raise SystemExit("--grad_split_every must be >= 0.")
+    if float(args.dec_cross_attn_lr_scale) <= 0.0:
+        raise SystemExit("--dec_cross_attn_lr_scale must be > 0.")
     if args.resid_max_norm is None:
         args.resid_max_norm = math.sqrt(float(args.d_model))
     track_train_token_entropy = bool(args.track_train_token_entropy)
     track_r_metrics = bool(args.track_r_metrics)
+    track_caps = bool(args.track_caps)
     log_top_grad_norms = bool(args.log_top_grad_norms)
     effective_grad_split_every = int(args.grad_split_every) if bool(args.grad_split_logging) else 0
     probe_after_log_only = bool(args.probe_after_log_only)
@@ -1943,13 +2080,15 @@ def main():
     z_loss_coef = float(args.z_loss_coef) if z_loss_enabled else 0.0
     lr_anneal_enabled = bool(args.lr_anneal_enable)
 
+    model_layers = int(args.dec_layers) if bool(args.decoder_only) else int(args.enc_layers)
+
     cfg = LMConfig(
         vocab_size=args.vocab_size,
         embed_size=args.d_model,
         num_heads=args.n_heads,
         mlp_ratio=args.ff_mult,
         dropout=args.dropout,
-        layers=args.enc_layers,
+        layers=model_layers,
         max_seq_len=args.max_seq_len,
         tie_embeds=args.tie_embeddings,
         activation_checkpointing=args.activation_checkpointing,
@@ -1966,7 +2105,10 @@ def main():
         cap_out_mode=str(args.cap_out_mode),
         cap_keep_masked=bool(int(args.cap_keep_masked)),
     )
-    model = TransformerV1(cfg).to(device)
+    if bool(args.decoder_only):
+        model = TransformerDecoderOnlyV1(cfg).to(device)
+    else:
+        model = TransformerV1(cfg).to(device)
     r_metric_param_groups = (
         build_r_metric_param_groups(model, tie_embeddings=bool(args.tie_embeddings))
         if track_r_metrics
@@ -1984,6 +2126,7 @@ def main():
         weight_decay=float(args.weight_decay),
         tie_embeddings=bool(args.tie_embeddings),
         half_lr_lm_head=bool(args.half_lr_lm_head),
+        dec_cross_attn_lr_scale=float(args.dec_cross_attn_lr_scale),
     )
 
     if args.optimizer == "adam":
@@ -2054,6 +2197,7 @@ def main():
     logger.log(f"Run start time: {str(datetime.datetime.now())}")
     logger.log(f"Running on {device}\n")
     logger.log(f"Config: {vars(cfg)}\n")
+    logger.log(f"model topology: {'decoder_only' if bool(args.decoder_only) else 'encoder_decoder'}")
     if args.deterministic:
         logger.log("deterministic mode: enabled (may reduce throughput)")
     if train_meta:
@@ -2135,6 +2279,10 @@ def main():
     logger.log("optimizer lr scaling: _embed parameters use 0.5x base LR.")
     if args.half_lr_lm_head:
         logger.log("optimizer lr scaling: _unembed parameters use 0.5x base LR.")
+    logger.log(
+        "optimizer lr scaling: decoder cross-attn parameters "
+        f"(_cross_q/_cross_kv/_cross_out_proj/_ls_cross_attn) use {float(args.dec_cross_attn_lr_scale):.4f}x."
+    )
     if args.row_max_norm_enable:
         logger.log(
             f"row max-norm projection: on (c={args.row_max_norm_c}, targets={len(row_max_norm_targets)})"
@@ -2217,9 +2365,17 @@ def main():
             logger.log(f"warning: expected 5 probes, found {len(probe_prompts)} in {probe_file_path}")
     logger.log(f"token entropy (train hot path): {'on' if track_train_token_entropy else 'off'}")
     logger.log(f"attention entropy (train batches): {'on' if args.track_attn_entropy else 'off'}")
+    logger.log(
+        f"cap tracking (sampled only on pre-probe train steps): {'on' if track_caps else 'off'} "
+        f"(run_probes={int(args.run_probes)})"
+    )
     logger.log(f"attention entropy (probe runs): {'on' if args.probe_attn_entropy else 'off'}")
     if args.track_attn_entropy and args.activation_checkpointing:
         logger.log("note: attention entropy capture bypasses activation checkpointing on training forwards.")
+    if track_caps and args.activation_checkpointing:
+        logger.log("note: cap tracking bypasses activation checkpointing on training forwards.")
+    if track_caps and int(args.run_probes) <= 0:
+        logger.log("note: --track_caps is idle because --run_probes <= 0.")
     if args.checkpoint is not None:
         logger.log(
             f"resume checkpoint: step={global_step}, epoch={resume_epoch}, "
@@ -2244,6 +2400,7 @@ def main():
     r_group_steps_since_log = {k: 0 for k in R_METRIC_GROUP_KEYS}
     attn_entropy_sum_since_log = defaultdict(float)
     attn_entropy_count_since_log = defaultdict(int)
+    latest_cap_sample = {}
     agc_clipped_params_since_log = 0
     agc_total_params_since_log = 0
     row_max_norm_affected_params_since_log = 0
@@ -2397,10 +2554,35 @@ def main():
                 logger.log("sanity: target shift and loss-mask checks passed on first batch")
                 did_sanity = True
 
+            do_optimizer_step = (
+                (accum_micro_count + 1) >= int(args.grad_accum_steps)
+                or batch_idx >= batches_per_epoch
+            )
+            next_step = int(global_step) + 1
+            probe_due_next_step = (
+                int(args.run_probes) > 0
+                and (next_step % int(args.run_probes) == 0)
+                and (not probe_after_log_only or (next_step % int(args.log_every) == 0))
+            )
+            sample_caps_this_batch = bool(track_caps and do_optimizer_step and probe_due_next_step)
+
             step_attn_entropy = {}
-            if args.track_attn_entropy:
+            step_cap_metrics = {}
+            if args.track_attn_entropy and sample_caps_this_batch:
+                logits, attn_state, cap_state = model(
+                    input_ids,
+                    pad_mask=attn_pad_mask,
+                    return_attn_entropy=True,
+                    return_cap_stats=True,
+                )
+                step_attn_entropy = extract_attn_entropy_metrics(attn_state)
+                step_cap_metrics = extract_cap_metrics(cap_state)
+            elif args.track_attn_entropy:
                 logits, attn_state = model(input_ids, pad_mask=attn_pad_mask, return_attn_entropy=True)
                 step_attn_entropy = extract_attn_entropy_metrics(attn_state)
+            elif sample_caps_this_batch:
+                logits, cap_state = model(input_ids, pad_mask=attn_pad_mask, return_cap_stats=True)
+                step_cap_metrics = extract_cap_metrics(cap_state)
             else:
                 logits = model(input_ids, pad_mask=attn_pad_mask)
             flat_mask = loss_mask.reshape(-1)
@@ -2449,6 +2631,12 @@ def main():
                         continue
                     attn_entropy_sum_since_log[attn_key] += float(attn_value)
                     attn_entropy_count_since_log[attn_key] += 1
+                if sample_caps_this_batch:
+                    latest_cap_sample = {}
+                    for cap_key, cap_value in step_cap_metrics.items():
+                        if not math.isfinite(float(cap_value)):
+                            continue
+                        latest_cap_sample[cap_key] = float(cap_value)
                 running_ce_window.append([token_count, loss_sum_value])
                 running_ce_tokens += token_count
                 running_ce_loss_sum += loss_sum_value
@@ -2705,6 +2893,8 @@ def main():
                 r_group_steps_since_log = {k: 0 for k in R_METRIC_GROUP_KEYS}
                 attn_entropy_sum_since_log = defaultdict(float)
                 attn_entropy_count_since_log = defaultdict(int)
+                if not (int(args.run_probes) > 0 and (global_step % int(args.run_probes) == 0)):
+                    latest_cap_sample = {}
                 agc_clipped_params_since_log = 0
                 agc_total_params_since_log = 0
                 row_max_norm_affected_params_since_log = 0
@@ -2803,11 +2993,18 @@ def main():
                 ):
                     v = agg.get(k, float("nan"))
                     agg_items.append(f"{k}={v:.6f}" if isinstance(v, (int, float)) else f"{k}=nan")
+                cap_items = []
+                if track_caps and len(latest_cap_sample) > 0:
+                    for k in sorted(latest_cap_sample.keys()):
+                        cap_items.append(f"{k}={float(latest_cap_sample[k]):.6f}")
+                cap_blob = (" " + " ".join(cap_items)) if cap_items else ""
                 logger.log(
                     f"\nProbeDebugSummary Step={global_step} probes={probe_summary['num_probes']} "
                     f"{' '.join(agg_items)} "
+                    f"{cap_blob}"
                     f"artifacts={os.path.join(LOGDIR, args.run_id, 'probe_debug')}"
                 )
+                latest_cap_sample = {}
                 probe_elapsed = max(0.0, time.perf_counter() - probe_t0)
                 _log_cuda_mem(
                     logger=logger,
