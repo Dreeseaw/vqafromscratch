@@ -39,6 +39,22 @@ Transformer-based approaches
 """
 
 
+_CAUSAL_MASK_CACHE: Dict[Tuple[str, int, int, int], torch.Tensor] = {}
+
+
+def _cached_causal_mask(q_len: int, k_len: int, device: torch.device) -> torch.Tensor:
+    device_index = -1 if device.index is None else int(device.index)
+    key = (str(device.type), device_index, int(q_len), int(k_len))
+    mask = _CAUSAL_MASK_CACHE.get(key)
+    if mask is None:
+        mask = torch.triu(
+            torch.ones(q_len, k_len, device=device, dtype=torch.bool),
+            diagonal=1,
+        )[None, None, :, :]
+        _CAUSAL_MASK_CACHE[key] = mask
+    return mask
+
+
 def _masked_mean_std(values: torch.Tensor, keep_mask: Optional[torch.Tensor] = None) -> Tuple[float, float]:
     vals = values.float()
     if keep_mask is not None:
@@ -83,19 +99,13 @@ def _build_attn_masks(
     if pad_mask is not None:
         key_pad_mask = pad_mask[:, None, None, :]
 
-    if key_pad_mask is not None and not key_pad_mask.any():
-        key_pad_mask = None
-
     sdpa_causal = bool(is_causal and key_pad_mask is None)
     sdpa_mask = None
     blocked = None
 
     causal = None
     if is_causal:
-        causal = torch.triu(
-            torch.ones(q_len, k_len, device=device, dtype=torch.bool),
-            diagonal=1,
-        )[None, None, :, :]
+        causal = _cached_causal_mask(q_len=q_len, k_len=k_len, device=device)
 
     if key_pad_mask is not None:
         if is_causal:
@@ -443,13 +453,14 @@ class TransformerEncoderBlock(nn.Module):
                 valid_for_scores = valid if valid.shape == raw_scores.shape else valid.expand_as(raw_scores)
                 valid_scores = raw_scores[valid_for_scores]
                 if valid_scores.numel() > 0:
-                    debug_capture["attn_score_mean"] = float(valid_scores.mean().item())
-                    debug_capture["attn_score_std"] = float(valid_scores.std(unbiased=False).item())
-                    debug_capture["attn_score_min"] = float(valid_scores.min().item())
-                    debug_capture["attn_score_max"] = float(valid_scores.max().item())
-                    debug_capture["attn_presoftmax_std"] = float(valid_scores.std(unbiased=False).item())
-                    debug_capture["attn_presoftmax_max"] = float(valid_scores.max().item())
-                    debug_capture["attn_presoftmax_p99"] = float(torch.quantile(valid_scores, 0.99).item())
+                    valid_scores_f32 = valid_scores.float()
+                    debug_capture["attn_score_mean"] = float(valid_scores_f32.mean().item())
+                    debug_capture["attn_score_std"] = float(valid_scores_f32.std(unbiased=False).item())
+                    debug_capture["attn_score_min"] = float(valid_scores_f32.min().item())
+                    debug_capture["attn_score_max"] = float(valid_scores_f32.max().item())
+                    debug_capture["attn_presoftmax_std"] = float(valid_scores_f32.std(unbiased=False).item())
+                    debug_capture["attn_presoftmax_max"] = float(valid_scores_f32.max().item())
+                    debug_capture["attn_presoftmax_p99"] = float(torch.quantile(valid_scores_f32, 0.99).item())
                 else:
                     debug_capture["attn_score_mean"] = float("nan")
                     debug_capture["attn_score_std"] = float("nan")
@@ -702,13 +713,14 @@ class TransformerDecoderBlock(nn.Module):
                 valid_for_scores = valid if valid.shape == raw_scores.shape else valid.expand_as(raw_scores)
                 valid_scores = raw_scores[valid_for_scores]
                 if valid_scores.numel() > 0:
-                    debug_capture["attn_score_mean"] = float(valid_scores.mean().item())
-                    debug_capture["attn_score_std"] = float(valid_scores.std(unbiased=False).item())
-                    debug_capture["attn_score_min"] = float(valid_scores.min().item())
-                    debug_capture["attn_score_max"] = float(valid_scores.max().item())
-                    debug_capture["attn_presoftmax_std"] = float(valid_scores.std(unbiased=False).item())
-                    debug_capture["attn_presoftmax_max"] = float(valid_scores.max().item())
-                    debug_capture["attn_presoftmax_p99"] = float(torch.quantile(valid_scores, 0.99).item())
+                    valid_scores_f32 = valid_scores.float()
+                    debug_capture["attn_score_mean"] = float(valid_scores_f32.mean().item())
+                    debug_capture["attn_score_std"] = float(valid_scores_f32.std(unbiased=False).item())
+                    debug_capture["attn_score_min"] = float(valid_scores_f32.min().item())
+                    debug_capture["attn_score_max"] = float(valid_scores_f32.max().item())
+                    debug_capture["attn_presoftmax_std"] = float(valid_scores_f32.std(unbiased=False).item())
+                    debug_capture["attn_presoftmax_max"] = float(valid_scores_f32.max().item())
+                    debug_capture["attn_presoftmax_p99"] = float(torch.quantile(valid_scores_f32, 0.99).item())
                 else:
                     debug_capture["attn_score_mean"] = float("nan")
                     debug_capture["attn_score_std"] = float("nan")

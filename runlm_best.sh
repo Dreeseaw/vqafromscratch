@@ -9,8 +9,6 @@ fi
 shift || true
 EXTRA_ARGS=("$@")
 
-# --no_activation_checkpointing \
-
 docker run --rm -it --gpus all -v "$(pwd)":/app -w /app myrepo:gpu \
 	python -m train.train_transformer "$RUN_ID" \
 		--train_data data/pretraining/wikicoco256_cleaned \
@@ -24,7 +22,9 @@ docker run --rm -it --gpus all -v "$(pwd)":/app -w /app myrepo:gpu \
 		--epochs=100 --warmup_ratio=0.004 \
 		--enc_layers=8 --dec_layers=8 --ff_mult=2 --d_model=384 --n_heads=6 \
 		--attn_impl sdpa --sdp_backend auto --precision bf16 \
-		--probe_layers=0,1,2,3,4,5,6,7 \
 		--num_workers=8 --persistent_workers --prefetch_factor 8 \
 		--run_probes=1000 --probe_after_log_only --eval_every_steps=5000 \
+		--decoder_only --dec_layers=12 --ff_mult=2 --n_heads=8 --d_model=512 \
+		--no_activation_checkpointing --sdp_backend=flash --precision=bf16 \
+		--probe_layers=0,1,2,3,4,5,6,7,8,9,10,11 \
 		"${EXTRA_ARGS[@]}"

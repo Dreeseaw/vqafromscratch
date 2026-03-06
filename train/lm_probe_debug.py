@@ -1,5 +1,7 @@
 import json
 import os
+import inspect
+from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
@@ -214,15 +216,53 @@ def _forward_with_optional_cache(
     **kwargs,
 ):
     call_kwargs: Dict[str, Any] = {"pad_mask": pad_mask, **kwargs}
-    if use_cache is not None:
+    if use_cache is not None and _model_supports_use_cache(model):
         call_kwargs["use_cache"] = bool(use_cache)
-    try:
+    with _probe_sdpa_ctx(model=model, device=seq.device):
         return model(seq, **call_kwargs)
-    except TypeError:
-        if "use_cache" in call_kwargs:
-            call_kwargs.pop("use_cache", None)
-            return model(seq, **call_kwargs)
-        raise
+
+
+def _model_supports_use_cache(model: torch.nn.Module) -> bool:
+    forward = getattr(model, "forward", None)
+    if forward is None:
+        return False
+    try:
+        params = inspect.signature(forward).parameters
+    except (TypeError, ValueError):
+        return False
+    return "use_cache" in params
+
+
+@contextmanager
+def _probe_sdpa_ctx(model: torch.nn.Module, device: torch.device):
+    if device.type != "cuda":
+        yield
+        return
+    cfg = getattr(model, "_config", None)
+    if getattr(cfg, "attn_impl", None) != "sdpa":
+        yield
+        return
+
+    saved_modules = []
+    for module in model.modules():
+        attn_impl = getattr(module, "_attn_impl", None)
+        if attn_impl is None:
+            continue
+        saved_modules.append((module, attn_impl))
+        module._attn_impl = "eager"
+
+    saved_cfg_attn_impl = None
+    if cfg is not None and hasattr(cfg, "attn_impl"):
+        saved_cfg_attn_impl = getattr(cfg, "attn_impl")
+        cfg.attn_impl = "eager"
+
+    try:
+        yield
+    finally:
+        if saved_cfg_attn_impl is not None:
+            cfg.attn_impl = saved_cfg_attn_impl
+        for module, attn_impl in saved_modules:
+            module._attn_impl = attn_impl
 
 
 def _print_probe_invariant_failure(
@@ -260,16 +300,18 @@ def _autoregressive_generate(
             "max_new_tokens": int(max_new_tokens),
             "do_sample": False,
             "num_beams": 1,
-            "use_cache": True,
             "return_dict_in_generate": False,
             "output_scores": False,
             "output_attentions": False,
             "output_hidden_states": False,
             "pad_token_id": int(pad_id),
         }
+        if _model_supports_use_cache(model):
+            gen_kwargs["use_cache"] = True
         if eos_id >= 0:
             gen_kwargs["eos_token_id"] = eos_id
-        seq_out = model.generate(prompt_ids, **gen_kwargs)
+        with _probe_sdpa_ctx(model=model, device=prompt_ids.device):
+            seq_out = model.generate(prompt_ids, **gen_kwargs)
         if torch.is_tensor(seq_out):
             full_ids_t = seq_out[0]
         else:

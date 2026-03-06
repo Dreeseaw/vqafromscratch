@@ -192,6 +192,61 @@ function readSlice(file: string, from: number, to: number): string {
   }
 }
 
+function _sanitizeNonFiniteJson(raw: string): string {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < raw.length; ) {
+    const ch = raw[i];
+    if (inString) {
+      out += ch;
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === "\"") {
+        inString = false;
+      }
+      i += 1;
+      continue;
+    }
+    if (ch === "\"") {
+      inString = true;
+      out += ch;
+      i += 1;
+      continue;
+    }
+    if (raw.startsWith("-Infinity", i)) {
+      out += "null";
+      i += "-Infinity".length;
+      continue;
+    }
+    if (raw.startsWith("Infinity", i)) {
+      out += "null";
+      i += "Infinity".length;
+      continue;
+    }
+    if (raw.startsWith("NaN", i)) {
+      out += "null";
+      i += "NaN".length;
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out;
+}
+
+function _parseJsonFile(file: string): any {
+  const raw = fs.readFileSync(file, "utf-8");
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    if (!raw.includes("NaN") && !raw.includes("Infinity")) throw err;
+    return JSON.parse(_sanitizeNonFiniteJson(raw));
+  }
+}
+
 function _sanitizePathToken(raw: string): string {
   return String(raw || "").trim().replace(/^['"]+|['"]+$/g, "");
 }
@@ -436,7 +491,7 @@ function _loadPromptTokenIds(step: number, probeIdx: number): number[] {
     return [];
   }
   try {
-    const summary = JSON.parse(fs.readFileSync(summaryPath, "utf-8"));
+    const summary = _parseJsonFile(summaryPath);
     const probes = Array.isArray(summary?.probes) ? summary.probes : [];
     for (const probe of probes) {
       if (parseNum(probe?.probe_idx) !== probeIdx) continue;
@@ -866,7 +921,7 @@ function loadProbeRecords() {
     if (!fs.existsSync(summaryPath)) continue;
     let summary: any;
     try {
-      summary = JSON.parse(fs.readFileSync(summaryPath, "utf-8"));
+      summary = _parseJsonFile(summaryPath);
     } catch {
       continue;
     }
@@ -943,7 +998,9 @@ function loadProbeGenerations() {
     probe_idx: number;
     prompt: string;
     generated_text: string;
+    generated_text_with_special: string;
     full_text: string;
+    full_text_with_special: string;
     stop_reason: string;
     generated_token_ids: number[];
   }> = [];
@@ -954,27 +1011,55 @@ function loadProbeGenerations() {
     if (!fs.existsSync(summaryPath)) continue;
     let summary: any;
     try {
-      summary = JSON.parse(fs.readFileSync(summaryPath, "utf-8"));
+      summary = _parseJsonFile(summaryPath);
     } catch {
       continue;
     }
-    const gens = Array.isArray(summary?.generations) ? summary.generations : [];
-    for (const g of gens) {
-      const step = parseNum(g?.step);
-      const probeIdx = parseNum(g?.probe_idx);
-      if (step === null || probeIdx === null) continue;
+
+    const byProbe = new Map<string, any>();
+    const ingest = (raw: any) => {
+      const step = parseNum(raw?.step ?? summary?.step);
+      const probeIdx = parseNum(raw?.probe_idx);
+      if (step === null || probeIdx === null) return;
+      const key = `${step}:${probeIdx}`;
       probeSet.add(probeIdx);
-      records.push({
+      byProbe.set(key, {
         step,
         probe_idx: probeIdx,
-        prompt: String(g?.prompt ?? ""),
-        generated_text: String(g?.generated_text ?? ""),
-        full_text: String(g?.full_text ?? ""),
-        stop_reason: String(g?.stop_reason ?? ""),
-        generated_token_ids: Array.isArray(g?.generated_token_ids)
-          ? g.generated_token_ids.map((x: unknown) => Number(x)).filter((x: number) => Number.isFinite(x))
+        prompt: String(raw?.prompt ?? ""),
+        generated_text: String(raw?.generated_text ?? ""),
+        generated_text_with_special: String(raw?.generated_text_with_special ?? ""),
+        full_text: String(raw?.full_text ?? ""),
+        full_text_with_special: String(raw?.full_text_with_special ?? ""),
+        stop_reason: String(raw?.stop_reason ?? ""),
+        generated_token_ids: Array.isArray(raw?.generated_token_ids)
+          ? raw.generated_token_ids.map((x: unknown) => Number(x)).filter((x: number) => Number.isFinite(x))
           : [],
       });
+    };
+
+    const gens = Array.isArray(summary?.generations) ? summary.generations : [];
+    for (const g of gens) {
+      ingest(g);
+    }
+    const probes = Array.isArray(summary?.probes) ? summary.probes : [];
+    for (const probe of probes) {
+      const generation = probe?.generation && typeof probe.generation === "object" ? probe.generation : null;
+      if (!generation) continue;
+      ingest({
+        step: summary?.step,
+        probe_idx: probe?.probe_idx,
+        prompt: probe?.prompt,
+        generated_text: generation?.generated_text,
+        generated_text_with_special: generation?.generated_text_with_special,
+        full_text: generation?.full_text,
+        full_text_with_special: generation?.full_text_with_special,
+        stop_reason: generation?.stop_reason,
+        generated_token_ids: generation?.generated_token_ids,
+      });
+    }
+    for (const row of byProbe.values()) {
+      records.push(row);
     }
   }
 

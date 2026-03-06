@@ -22,6 +22,7 @@ import json
 import random
 import argparse
 import datetime
+from contextlib import nullcontext
 from collections import defaultdict, deque
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -330,10 +331,9 @@ class CollatePad:
         input_ids = tokens
         target_ids = torch.full_like(input_ids, self.pad_id)
         target_ids[:, :-1] = input_ids[:, 1:]
+        target_ids[:, 0] = self.pad_id
 
-        loss_mask = target_ids.ne(self.pad_id) & input_ids.ne(self.pad_id)
-        # Keep token-0 out of loss when using next-token shift.
-        loss_mask[:, 0] = False
+        loss_mask = target_ids.ne(self.pad_id)
         return input_ids, target_ids, loss_mask
 
 
@@ -1315,7 +1315,7 @@ def _collate_shift_sanity(collate_fn: CollatePad, pad_id: int) -> None:
         torch.tensor([21, 22], dtype=torch.long),
     ]
     input_ids, target_ids, loss_mask = collate_fn(toy)
-    assert int(target_ids[0, 0].item()) == 12
+    assert int(target_ids[0, 0].item()) == pad_id
     assert int(target_ids[0, 1].item()) == 13
     assert int(target_ids[0, 2].item()) == 14
     assert not bool(loss_mask[0, 0].item())
@@ -1365,12 +1365,28 @@ def _forward_with_optional_cache(
         raise
 
 
+def _autocast_ctx(amp_enabled: bool, amp_dtype: Optional[torch.dtype]):
+    if amp_enabled:
+        if amp_dtype is None:
+            raise ValueError("amp_dtype must be set when amp_enabled=True.")
+        return torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True)
+    return nullcontext()
+
+
+def _maybe_pad_mask(input_ids: torch.Tensor, pad_id: int, *, has_padding: bool) -> Optional[torch.Tensor]:
+    if not has_padding:
+        return None
+    return input_ids.eq(int(pad_id))
+
+
 def evaluate_model(
     model: nn.Module,
     loader: DataLoader,
     device: str,
     pad_id: int,
     vocab_size: int,
+    amp_enabled: bool = False,
+    amp_dtype: Optional[torch.dtype] = None,
     z_loss_enable: bool = False,
     z_loss_coef: float = 0.0,
     max_tokens: int = 0,
@@ -1379,6 +1395,7 @@ def evaluate_model(
 ):
     model_was_training = model.training
     model.eval()
+    loader_fixed_len = bool(getattr(getattr(loader, "dataset", None), "fixed_len", False))
     total_ce_loss_sum = 0.0
     total_z_loss_sum = 0.0
     total_tokens = 0
@@ -1388,32 +1405,40 @@ def evaluate_model(
     with torch.inference_mode():
         for batch in loader:
             input_ids, target_ids, loss_mask = batch
+            batch_has_padding = (not loader_fixed_len) and bool(input_ids.eq(int(pad_id)).any())
             input_ids = input_ids.to(device, non_blocking=pin_memory)
             target_ids = target_ids.to(device, non_blocking=pin_memory)
             loss_mask = loss_mask.to(device, non_blocking=pin_memory)
+            pad_mask = _maybe_pad_mask(input_ids, pad_id, has_padding=batch_has_padding)
+            with _autocast_ctx(amp_enabled=amp_enabled, amp_dtype=amp_dtype):
+                logits = _forward_with_optional_cache(
+                    model=model,
+                    input_ids=input_ids,
+                    pad_mask=pad_mask,
+                    use_cache=False,
+                )
 
-            logits = _forward_with_optional_cache(
-                model=model,
-                input_ids=input_ids,
-                pad_mask=input_ids.eq(pad_id),
-                use_cache=False,
-            )
-
-            flat_mask = loss_mask.reshape(-1)
+            flat_mask = target_ids.ne(pad_id).reshape(-1)
             token_count = int(flat_mask.sum().item())
             if token_count <= 0:
                 del logits, input_ids, target_ids, loss_mask, flat_mask
                 continue
-            flat_logits = logits.reshape(-1, vocab_size)[flat_mask]
+            logits_for_loss = logits.transpose(1, 2).float()
+            ce_loss_sum = F.cross_entropy(
+                logits_for_loss,
+                target_ids,
+                ignore_index=pad_id,
+                reduction="sum",
+            )
             flat_targets = target_ids.reshape(-1)[flat_mask]
-            ce_loss_sum = F.cross_entropy(flat_logits, flat_targets, reduction="sum")
+            flat_logits_f32 = logits.reshape(-1, vocab_size)[flat_mask].float()
             if z_loss_enable:
-                log_z = torch.logsumexp(flat_logits, dim=-1)
+                log_z = torch.logsumexp(flat_logits_f32, dim=-1)
                 z_loss_sum = log_z.square().sum()
             else:
                 z_loss_sum = ce_loss_sum.new_zeros(())
 
-            flat_log_probs = F.log_softmax(flat_logits, dim=-1)
+            flat_log_probs = F.log_softmax(flat_logits_f32, dim=-1)
             flat_probs = flat_log_probs.exp()
             entropy_sum = float((-(flat_probs * flat_log_probs).sum(dim=-1)).sum().item())
 
@@ -1426,10 +1451,11 @@ def evaluate_model(
             del (
                 logits,
                 flat_mask,
-                flat_logits,
                 flat_targets,
                 ce_loss_sum,
                 z_loss_sum,
+                logits_for_loss,
+                flat_logits_f32,
                 flat_log_probs,
                 flat_probs,
                 input_ids,
@@ -1516,6 +1542,13 @@ def main():
     )
     parser.add_argument("--ff_mult", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--precision",
+        type=str,
+        default="fp32",
+        choices=["fp32", "bf16", "fp16"],
+        help="Compute precision for CUDA training/eval. bf16/fp16 require CUDA.",
+    )
     parser.add_argument("--tie_embeddings", action="store_true")
     parser.add_argument("--attn_impl", type=str, default="sdpa", choices=["sdpa", "eager"])
     parser.add_argument(
@@ -2070,6 +2103,26 @@ def main():
         raise SystemExit("--dec_cross_attn_lr_scale must be > 0.")
     if args.resid_max_norm is None:
         args.resid_max_norm = math.sqrt(float(args.d_model))
+    precision = str(args.precision).lower()
+    if precision not in ("fp32", "bf16", "fp16"):
+        raise SystemExit("--precision must be one of: fp32, bf16, fp16.")
+    if precision != "fp32" and device != "cuda":
+        raise SystemExit("--precision bf16/fp16 requires CUDA.")
+    if precision == "bf16" and device == "cuda":
+        bf16_supported = False
+        if hasattr(torch.cuda, "is_bf16_supported"):
+            bf16_supported = bool(torch.cuda.is_bf16_supported())
+        if not bf16_supported:
+            raise SystemExit("Requested --precision bf16 but this CUDA device/runtime does not report bf16 support.")
+    amp_enabled = bool(device == "cuda" and precision in ("bf16", "fp16"))
+    amp_dtype = None
+    if precision == "bf16":
+        amp_dtype = torch.bfloat16
+    elif precision == "fp16":
+        amp_dtype = torch.float16
+    use_grad_scaler = bool(device == "cuda" and precision == "fp16")
+    grad_scaler = torch.cuda.amp.GradScaler(enabled=use_grad_scaler)
+
     track_train_token_entropy = bool(args.track_train_token_entropy)
     track_r_metrics = bool(args.track_r_metrics)
     track_caps = bool(args.track_caps)
@@ -2198,6 +2251,11 @@ def main():
     logger.log(f"Running on {device}\n")
     logger.log(f"Config: {vars(cfg)}\n")
     logger.log(f"model topology: {'decoder_only' if bool(args.decoder_only) else 'encoder_decoder'}")
+    logger.log(
+        f"precision: {precision} "
+        f"(autocast={'on' if amp_enabled else 'off'}, grad_scaler={'on' if use_grad_scaler else 'off'})"
+    )
+    logger.log(f"attention backend: attn_impl={args.attn_impl}, sdp_backend={args.sdp_backend}")
     if args.deterministic:
         logger.log("deterministic mode: enabled (may reduce throughput)")
     if train_meta:
@@ -2540,15 +2598,19 @@ def main():
                 continue
 
             input_ids, target_ids, loss_mask = batch
+            batch_has_padding = (not fixed_len) and bool(input_ids.eq(int(args.pad_id)).any())
             input_ids = input_ids.to(device, non_blocking=train_pin_memory)
             target_ids = target_ids.to(device, non_blocking=train_pin_memory)
             loss_mask = loss_mask.to(device, non_blocking=train_pin_memory)
-            attn_pad_mask = input_ids.eq(args.pad_id)
+            attn_pad_mask = _maybe_pad_mask(input_ids, args.pad_id, has_padding=batch_has_padding)
 
             if not did_sanity:
                 if input_ids.size(1) < 2:
                     raise AssertionError("Need at least two positions for next-token prediction.")
-                assert torch.equal(target_ids[:, :-1], input_ids[:, 1:]), "target_ids must be input_ids shifted by one"
+                assert torch.equal(
+                    target_ids[:, 1:-1],
+                    input_ids[:, 2:],
+                ), "target_ids must be input_ids shifted by one after the ignored token-0 position"
                 assert not bool(loss_mask[input_ids == args.pad_id].any().item()), "loss_mask must exclude pad positions"
                 assert not bool(loss_mask[:, 0].any().item()), "loss_mask position 0 must be False"
                 logger.log("sanity: target shift and loss-mask checks passed on first batch")
@@ -2569,31 +2631,40 @@ def main():
             step_attn_entropy = {}
             step_cap_metrics = {}
             if args.track_attn_entropy and sample_caps_this_batch:
-                logits, attn_state, cap_state = model(
-                    input_ids,
-                    pad_mask=attn_pad_mask,
-                    return_attn_entropy=True,
-                    return_cap_stats=True,
-                )
+                with _autocast_ctx(amp_enabled=amp_enabled, amp_dtype=amp_dtype):
+                    logits, attn_state, cap_state = model(
+                        input_ids,
+                        pad_mask=attn_pad_mask,
+                        return_attn_entropy=True,
+                        return_cap_stats=True,
+                    )
                 step_attn_entropy = extract_attn_entropy_metrics(attn_state)
                 step_cap_metrics = extract_cap_metrics(cap_state)
             elif args.track_attn_entropy:
-                logits, attn_state = model(input_ids, pad_mask=attn_pad_mask, return_attn_entropy=True)
+                with _autocast_ctx(amp_enabled=amp_enabled, amp_dtype=amp_dtype):
+                    logits, attn_state = model(input_ids, pad_mask=attn_pad_mask, return_attn_entropy=True)
                 step_attn_entropy = extract_attn_entropy_metrics(attn_state)
             elif sample_caps_this_batch:
-                logits, cap_state = model(input_ids, pad_mask=attn_pad_mask, return_cap_stats=True)
+                with _autocast_ctx(amp_enabled=amp_enabled, amp_dtype=amp_dtype):
+                    logits, cap_state = model(input_ids, pad_mask=attn_pad_mask, return_cap_stats=True)
                 step_cap_metrics = extract_cap_metrics(cap_state)
             else:
-                logits = model(input_ids, pad_mask=attn_pad_mask)
-            flat_mask = loss_mask.reshape(-1)
+                with _autocast_ctx(amp_enabled=amp_enabled, amp_dtype=amp_dtype):
+                    logits = model(input_ids, pad_mask=attn_pad_mask)
+            flat_mask = target_ids.ne(args.pad_id).reshape(-1)
             token_count = int(flat_mask.sum().item())
             loss_sum_value = 0.0
             if token_count > 0:
-                flat_logits = logits.reshape(-1, args.vocab_size)[flat_mask]
-                flat_targets = target_ids.reshape(-1)[flat_mask]
-                ce_loss_sum = F.cross_entropy(flat_logits, flat_targets, reduction="sum")
+                logits_for_loss = logits.transpose(1, 2).float()
+                ce_loss_sum = F.cross_entropy(
+                    logits_for_loss,
+                    target_ids,
+                    ignore_index=args.pad_id,
+                    reduction="sum",
+                )
                 if z_loss_enabled:
-                    log_z = torch.logsumexp(flat_logits, dim=-1)
+                    flat_logits_f32 = logits.reshape(-1, args.vocab_size)[flat_mask].float()
+                    log_z = torch.logsumexp(flat_logits_f32, dim=-1)
                     z_loss_sum = log_z.square().sum()
                 else:
                     z_loss_sum = ce_loss_sum.new_zeros(())
@@ -2601,7 +2672,10 @@ def main():
                 total_loss = total_loss_sum / float(token_count)
                 if not torch.isfinite(total_loss):
                     raise FloatingPointError(f"Non-finite training loss at step {global_step + 1}.")
-                total_loss_sum.backward()
+                if use_grad_scaler:
+                    grad_scaler.scale(total_loss_sum).backward()
+                else:
+                    total_loss_sum.backward()
                 accum_tokens_for_backward += token_count
                 accum_has_grad = True
 
@@ -2640,6 +2714,9 @@ def main():
                 running_ce_window.append([token_count, loss_sum_value])
                 running_ce_tokens += token_count
                 running_ce_loss_sum += loss_sum_value
+                del logits_for_loss
+                if z_loss_enabled:
+                    del flat_logits_f32
 
             while running_ce_tokens > RUNNING_CE_WINDOW_TOKENS and len(running_ce_window) > 0:
                 overflow = running_ce_tokens - RUNNING_CE_WINDOW_TOKENS
@@ -2677,9 +2754,12 @@ def main():
             for param in model.parameters():
                 if param.grad is not None:
                     param.grad.detach().mul_(grad_scale)
+            if use_grad_scaler:
+                grad_scaler.unscale_(opt)
 
             grad_split_values = None
             next_step = int(global_step) + 1
+            should_log_this_step = (next_step % int(args.log_every)) == 0
             if effective_grad_split_every > 0 and (next_step % effective_grad_split_every == 0):
                 grad_split_values = {
                     "embed": grad_norm_for_params(grad_split_param_groups.get("embed", [])),
@@ -2701,13 +2781,21 @@ def main():
                         optimizer=opt,
                     )
             else:
-                pre_grad_norm = global_grad_norm(model.parameters())
+                pre_grad_norm = float("nan")
                 r_value = float("nan")
                 r_values_by_group = {}
             if args.grad_clip_mode == "global":
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
-                post_grad_norm = global_grad_norm(model.parameters())
+                clip_pre_grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad))
+                if track_r_metrics:
+                    post_grad_norm = global_grad_norm(model.parameters()) if should_log_this_step else float("nan")
+                elif should_log_this_step:
+                    pre_grad_norm = clip_pre_grad_norm
+                    post_grad_norm = global_grad_norm(model.parameters())
+                else:
+                    post_grad_norm = float("nan")
             elif args.grad_clip_mode == "agc":
+                if not track_r_metrics and should_log_this_step:
+                    pre_grad_norm = global_grad_norm(model.parameters())
                 clipped_count, total_count = adaptive_clip_grad_(
                     model.parameters(),
                     clip_factor=args.agc_clip_factor,
@@ -2715,13 +2803,19 @@ def main():
                 )
                 agc_clipped_params_since_log += clipped_count
                 agc_total_params_since_log += total_count
-                post_grad_norm = global_grad_norm(model.parameters())
+                post_grad_norm = global_grad_norm(model.parameters()) if should_log_this_step else float("nan")
             else:
+                if not track_r_metrics and should_log_this_step:
+                    pre_grad_norm = global_grad_norm(model.parameters())
                 post_grad_norm = pre_grad_norm
             top_grad_norms_for_log = []
-            if log_top_grad_norms and (global_step + 1) % args.log_every == 0:
+            if log_top_grad_norms and should_log_this_step:
                 top_grad_norms_for_log = topk_grad_norms(model.named_parameters(), k=5)
-            opt.step()
+            if use_grad_scaler:
+                grad_scaler.step(opt)
+                grad_scaler.update()
+            else:
+                opt.step()
             if args.row_max_norm_enable:
                 affected_param_count, total_param_count = apply_row_max_norm_projection_(
                     row_max_norm_targets, c=float(args.row_max_norm_c)
@@ -2775,10 +2869,12 @@ def main():
                             f"new_lrs={[f'{x:.6e}' for x in updated_lrs]}"
                         )
 
-            pre_grad_norm_sum_since_log += pre_grad_norm
-            pre_grad_norm_steps_since_log += 1
-            post_grad_norm_sum_since_log += post_grad_norm
-            post_grad_norm_steps_since_log += 1
+            if math.isfinite(pre_grad_norm):
+                pre_grad_norm_sum_since_log += pre_grad_norm
+                pre_grad_norm_steps_since_log += 1
+            if math.isfinite(post_grad_norm):
+                post_grad_norm_sum_since_log += post_grad_norm
+                post_grad_norm_steps_since_log += 1
             if track_r_metrics and math.isfinite(r_value):
                 r_sum_since_log += r_value
                 r_steps_since_log += 1
@@ -2912,6 +3008,8 @@ def main():
                     device=device,
                     pad_id=args.pad_id,
                     vocab_size=args.vocab_size,
+                    amp_enabled=amp_enabled,
+                    amp_dtype=amp_dtype,
                     z_loss_enable=z_loss_enabled,
                     z_loss_coef=z_loss_coef,
                     max_tokens=0,
@@ -3100,6 +3198,8 @@ def main():
         device=device,
         pad_id=args.pad_id,
         vocab_size=args.vocab_size,
+        amp_enabled=amp_enabled,
+        amp_dtype=amp_dtype,
         z_loss_enable=z_loss_enabled,
         z_loss_coef=z_loss_coef,
         max_tokens=max(0, int(args.test_max_tokens)),

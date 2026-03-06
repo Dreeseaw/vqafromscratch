@@ -135,36 +135,5 @@ This writes split datasets under `./data/wiki_tok_256/train`, `./data/wiki_tok_2
 
 Train LM with periodic validation and final test:
 ```bash
-python3 -m train.train_transformer lm_256_run \
-    --train_data ./data/wiki_tok_256 \
-    --tokenizer ./logs/mix_bpe_16k/tokenizer.pt \
-    --max_seq_len 256 \
-    --eval_every_steps 1000 \
-    --val_max_tokens 200000
-```
-
-Enable z-loss regularization (on top of CE):
-```bash
-python3 -m train.train_transformer lm_256_run \
-    --train_data ./data/wiki_tok_256 \
-    --tokenizer ./logs/mix_bpe_16k/tokenizer.pt \
-    --z_loss_enable \
-    --z_loss_coef 1e-4
-```
-
-Enable LR annealing (EWMA plateau):
-```bash
-python3 -m train.train_transformer lm_256_run \
-    --train_data ./data/wiki_tok_256 \
-    --tokenizer ./logs/mix_bpe_16k/tokenizer.pt \
-    --lr_anneal_enable
-```
-
-Enable LayerScale on residual branches:
-```bash
-python3 -m train.train_transformer lm_256_run \
-    --train_data ./data/wiki_tok_256 \
-    --tokenizer ./logs/mix_bpe_16k/tokenizer.pt \
-    --layerscale \
-    --layerscale_init 1e-5
+./runlm_best.sh runid1
 ```
