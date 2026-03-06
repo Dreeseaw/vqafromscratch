@@ -3,7 +3,7 @@ language modeling components of vqa
 """
 import sys
 import math
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -37,6 +37,22 @@ class RNN(nn.Module):
 """
 Transformer-based approaches
 """
+
+
+_CAUSAL_MASK_CACHE: Dict[Tuple[str, int, int, int], torch.Tensor] = {}
+
+
+def _cached_causal_mask(q_len: int, k_len: int, device: torch.device) -> torch.Tensor:
+    device_index = -1 if device.index is None else int(device.index)
+    key = (str(device.type), device_index, int(q_len), int(k_len))
+    mask = _CAUSAL_MASK_CACHE.get(key)
+    if mask is None:
+        mask = torch.triu(
+            torch.ones(q_len, k_len, device=device, dtype=torch.bool),
+            diagonal=1,
+        )[None, None, :, :]
+        _CAUSAL_MASK_CACHE[key] = mask
+    return mask
 
 
 def _masked_mean_std(values: torch.Tensor, keep_mask: Optional[torch.Tensor] = None) -> Tuple[float, float]:
@@ -83,19 +99,13 @@ def _build_attn_masks(
     if pad_mask is not None:
         key_pad_mask = pad_mask[:, None, None, :]
 
-    if key_pad_mask is not None and not key_pad_mask.any():
-        key_pad_mask = None
-
     sdpa_causal = bool(is_causal and key_pad_mask is None)
     sdpa_mask = None
     blocked = None
 
     causal = None
     if is_causal:
-        causal = torch.triu(
-            torch.ones(q_len, k_len, device=device, dtype=torch.bool),
-            diagonal=1,
-        )[None, None, :, :]
+        causal = _cached_causal_mask(q_len=q_len, k_len=k_len, device=device)
 
     if key_pad_mask is not None:
         if is_causal:
@@ -176,6 +186,29 @@ def cap_vector_norm(
         scales = torch.where(mask, scales, torch.ones_like(scales))
 
     return x * scales.to(dtype=x.dtype)
+
+
+def _cap_norm_mean(
+    x: torch.Tensor,
+    mode: str,
+    keep_mask: Optional[torch.Tensor] = None,
+) -> float:
+    if mode == "token_global" and x.ndim == 4:
+        reduce_dims = (-2, -1)
+    else:
+        reduce_dims = (-1,)
+    norms = torch.linalg.vector_norm(x.detach().float(), ord=2, dim=reduce_dims)
+    if keep_mask is not None:
+        mask = keep_mask.to(device=norms.device, dtype=torch.bool)
+        while mask.dim() < norms.dim():
+            mask = mask.unsqueeze(-1)
+        mask = mask.expand_as(norms)
+        vals = norms[mask]
+    else:
+        vals = norms.reshape(-1)
+    if vals.numel() <= 0:
+        return float("nan")
+    return float(vals.mean().item())
 
 
 class LMConfig:
@@ -420,13 +453,14 @@ class TransformerEncoderBlock(nn.Module):
                 valid_for_scores = valid if valid.shape == raw_scores.shape else valid.expand_as(raw_scores)
                 valid_scores = raw_scores[valid_for_scores]
                 if valid_scores.numel() > 0:
-                    debug_capture["attn_score_mean"] = float(valid_scores.mean().item())
-                    debug_capture["attn_score_std"] = float(valid_scores.std(unbiased=False).item())
-                    debug_capture["attn_score_min"] = float(valid_scores.min().item())
-                    debug_capture["attn_score_max"] = float(valid_scores.max().item())
-                    debug_capture["attn_presoftmax_std"] = float(valid_scores.std(unbiased=False).item())
-                    debug_capture["attn_presoftmax_max"] = float(valid_scores.max().item())
-                    debug_capture["attn_presoftmax_p99"] = float(torch.quantile(valid_scores, 0.99).item())
+                    valid_scores_f32 = valid_scores.float()
+                    debug_capture["attn_score_mean"] = float(valid_scores_f32.mean().item())
+                    debug_capture["attn_score_std"] = float(valid_scores_f32.std(unbiased=False).item())
+                    debug_capture["attn_score_min"] = float(valid_scores_f32.min().item())
+                    debug_capture["attn_score_max"] = float(valid_scores_f32.max().item())
+                    debug_capture["attn_presoftmax_std"] = float(valid_scores_f32.std(unbiased=False).item())
+                    debug_capture["attn_presoftmax_max"] = float(valid_scores_f32.max().item())
+                    debug_capture["attn_presoftmax_p99"] = float(torch.quantile(valid_scores_f32, 0.99).item())
                 else:
                     debug_capture["attn_score_mean"] = float("nan")
                     debug_capture["attn_score_std"] = float("nan")
@@ -500,6 +534,7 @@ class TransformerEncoderBlock(nn.Module):
         debug_capture: Optional[Dict[str, Any]] = None,
         capture_attn_scores: bool = False,
         entropy_capture: Optional[Dict[str, Any]] = None,
+        cap_capture: Optional[Dict[str, Any]] = None,
     ):
         """
             x: [B, S, E] tensor
@@ -531,12 +566,16 @@ class TransformerEncoderBlock(nn.Module):
         h = h.transpose(1, 2).contiguous().view(B, S, E)
         attn_out = _apply_layerscale(self._out_proj(h), self._ls_attn)
         attn_keep_mask = (~pad_mask) if (pad_mask is not None and self._cap_keep_masked) else None
+        if cap_capture is not None:
+            cap_capture["attn_pre_cap"] = _cap_norm_mean(attn_out, mode=self._cap_out_mode, keep_mask=attn_keep_mask)
         attn_out = cap_vector_norm(
             attn_out,
             self._cap_attn_out_norm,
             keep_mask=attn_keep_mask,
             mode=self._cap_out_mode,
         )
+        if cap_capture is not None:
+            cap_capture["attn_post_cap"] = _cap_norm_mean(attn_out, mode=self._cap_out_mode, keep_mask=attn_keep_mask)
         x = x_residual + self._resid_dropout(attn_out)
         if self._resid_max_norm > 0.0:
             x = clamp_residual(x, self._resid_max_norm)
@@ -545,12 +584,16 @@ class TransformerEncoderBlock(nn.Module):
         x = _rms_norm_last_dim(x, eps=self._rmsnorm_eps)
         mlp_out = _apply_layerscale(self._mlp(x), self._ls_mlp)
         mlp_keep_mask = (~pad_mask) if (pad_mask is not None and self._cap_keep_masked) else None
+        if cap_capture is not None:
+            cap_capture["mlp_pre_cap"] = _cap_norm_mean(mlp_out, mode=self._cap_out_mode, keep_mask=mlp_keep_mask)
         mlp_out = cap_vector_norm(
             mlp_out,
             self._cap_mlp_out_norm,
             keep_mask=mlp_keep_mask,
             mode=self._cap_out_mode,
         )
+        if cap_capture is not None:
+            cap_capture["mlp_post_cap"] = _cap_norm_mean(mlp_out, mode=self._cap_out_mode, keep_mask=mlp_keep_mask)
         x = x_residual + self._mlp_dropout(mlp_out)
         if self._resid_max_norm > 0.0:
             x = clamp_residual(x, self._resid_max_norm)
@@ -670,13 +713,14 @@ class TransformerDecoderBlock(nn.Module):
                 valid_for_scores = valid if valid.shape == raw_scores.shape else valid.expand_as(raw_scores)
                 valid_scores = raw_scores[valid_for_scores]
                 if valid_scores.numel() > 0:
-                    debug_capture["attn_score_mean"] = float(valid_scores.mean().item())
-                    debug_capture["attn_score_std"] = float(valid_scores.std(unbiased=False).item())
-                    debug_capture["attn_score_min"] = float(valid_scores.min().item())
-                    debug_capture["attn_score_max"] = float(valid_scores.max().item())
-                    debug_capture["attn_presoftmax_std"] = float(valid_scores.std(unbiased=False).item())
-                    debug_capture["attn_presoftmax_max"] = float(valid_scores.max().item())
-                    debug_capture["attn_presoftmax_p99"] = float(torch.quantile(valid_scores, 0.99).item())
+                    valid_scores_f32 = valid_scores.float()
+                    debug_capture["attn_score_mean"] = float(valid_scores_f32.mean().item())
+                    debug_capture["attn_score_std"] = float(valid_scores_f32.std(unbiased=False).item())
+                    debug_capture["attn_score_min"] = float(valid_scores_f32.min().item())
+                    debug_capture["attn_score_max"] = float(valid_scores_f32.max().item())
+                    debug_capture["attn_presoftmax_std"] = float(valid_scores_f32.std(unbiased=False).item())
+                    debug_capture["attn_presoftmax_max"] = float(valid_scores_f32.max().item())
+                    debug_capture["attn_presoftmax_p99"] = float(torch.quantile(valid_scores_f32, 0.99).item())
                 else:
                     debug_capture["attn_score_mean"] = float("nan")
                     debug_capture["attn_score_std"] = float("nan")
@@ -755,6 +799,9 @@ class TransformerDecoderBlock(nn.Module):
         capture_cross_attn_scores: bool = False,
         self_entropy_capture: Optional[Dict[str, Any]] = None,
         cross_entropy_capture: Optional[Dict[str, Any]] = None,
+        self_cap_capture: Optional[Dict[str, Any]] = None,
+        cross_cap_capture: Optional[Dict[str, Any]] = None,
+        mlp_cap_capture: Optional[Dict[str, Any]] = None,
     ):
         """
             x: [B, S, E] tensor
@@ -787,12 +834,20 @@ class TransformerDecoderBlock(nn.Module):
         h1 = h1.transpose(1, 2).contiguous().view(B, S, E)
         self_attn_out = _apply_layerscale(self._self_out_proj(h1), self._ls_self_attn)
         self_keep_mask = (~self_pad_mask) if (self_pad_mask is not None and self._cap_keep_masked) else None
+        if self_cap_capture is not None:
+            self_cap_capture["attn_pre_cap"] = _cap_norm_mean(
+                self_attn_out, mode=self._cap_out_mode, keep_mask=self_keep_mask
+            )
         self_attn_out = cap_vector_norm(
             self_attn_out,
             self._cap_attn_out_norm,
             keep_mask=self_keep_mask,
             mode=self._cap_out_mode,
         )
+        if self_cap_capture is not None:
+            self_cap_capture["attn_post_cap"] = _cap_norm_mean(
+                self_attn_out, mode=self._cap_out_mode, keep_mask=self_keep_mask
+            )
         x = x_residual + self._resid_dropout(self_attn_out)
         if self._resid_max_norm > 0.0:
             x = clamp_residual(x, self._resid_max_norm)
@@ -825,12 +880,20 @@ class TransformerDecoderBlock(nn.Module):
         )
         h2 = h2.transpose(1, 2).contiguous().view(B, S, E)
         cross_attn_out = _apply_layerscale(self._cross_out_proj(h2), self._ls_cross_attn)
+        if cross_cap_capture is not None:
+            cross_cap_capture["attn_pre_cap"] = _cap_norm_mean(
+                cross_attn_out, mode=self._cap_out_mode, keep_mask=self_keep_mask
+            )
         cross_attn_out = cap_vector_norm(
             cross_attn_out,
             self._cap_attn_out_norm,
             keep_mask=self_keep_mask,
             mode=self._cap_out_mode,
         )
+        if cross_cap_capture is not None:
+            cross_cap_capture["attn_post_cap"] = _cap_norm_mean(
+                cross_attn_out, mode=self._cap_out_mode, keep_mask=self_keep_mask
+            )
         x = x_residual + self._resid_dropout(cross_attn_out)
         if self._resid_max_norm > 0.0:
             x = clamp_residual(x, self._resid_max_norm)
@@ -838,16 +901,206 @@ class TransformerDecoderBlock(nn.Module):
         x_residual = x
         x = _rms_norm_last_dim(x, eps=self._rmsnorm_eps)
         mlp_out = _apply_layerscale(self._mlp(x), self._ls_mlp)
+        if mlp_cap_capture is not None:
+            mlp_cap_capture["mlp_pre_cap"] = _cap_norm_mean(mlp_out, mode=self._cap_out_mode, keep_mask=self_keep_mask)
         mlp_out = cap_vector_norm(
             mlp_out,
             self._cap_mlp_out_norm,
             keep_mask=self_keep_mask,
             mode=self._cap_out_mode,
         )
+        if mlp_cap_capture is not None:
+            mlp_cap_capture["mlp_post_cap"] = _cap_norm_mean(mlp_out, mode=self._cap_out_mode, keep_mask=self_keep_mask)
         x = x_residual + self._mlp_dropout(mlp_out)
         if self._resid_max_norm > 0.0:
             x = clamp_residual(x, self._resid_max_norm)
         return x
+
+
+class TransformerDecoderOnlyV1(nn.Module):
+    def __init__(self, config: LMConfig):
+        super().__init__()
+        self._config = config
+        self._logit_softcap = float(getattr(config, "logit_softcap", 0.0))
+        self._embed = nn.Embedding(config.vocab_size, config.embed_size)
+        self._embed_dropout = nn.Dropout(float(getattr(config, "dropout", 0.1)))
+        self._rope = RotaryEmbedding(config.embed_size // config.num_heads, max_len=config.max_seq_len)
+        # Reuse the encoder-style block (self-attn + MLP, causal mode enabled at call site).
+        self._dec_blocks = nn.ModuleList([TransformerEncoderBlock(config, i) for i in range(config.layers)])
+        self._unembed = nn.Linear(config.embed_size, config.vocab_size, bias=False)
+        if config.tie_embeds:
+            with torch.no_grad():
+                self._embed.weight.mul_(config.embed_size ** -0.5)
+            self._unembed.weight = self._embed.weight
+
+    def _lm_head(self, h: torch.Tensor) -> torch.Tensor:
+        logits = self._unembed(h)
+        if self._logit_softcap > 0.0:
+            cap = self._logit_softcap
+            logits = cap * torch.tanh(logits / cap)
+        return logits
+
+    def _decode_only(
+        self,
+        x: torch.Tensor,
+        pad_mask=None,
+        is_causal: bool = True,
+        debug_state: Optional[Dict[str, Any]] = None,
+        metric_state: Optional[Dict[str, Any]] = None,
+        cap_state: Optional[Dict[str, Any]] = None,
+        debug_layers: Optional[set] = None,
+        debug_score_layers: Optional[set] = None,
+    ) -> torch.Tensor:
+        for i, block in enumerate(self._dec_blocks):
+            layer_debug = None
+            layer_metrics = None
+            layer_cap = None
+            capture_scores = bool(debug_score_layers is not None and i in debug_score_layers)
+            if debug_state is not None:
+                include_debug = debug_layers is None or i in debug_layers
+                if include_debug:
+                    layer_debug = {"layer": i}
+                    debug_state["decoder_self_layers"].append(layer_debug)
+            if metric_state is not None:
+                layer_metrics = {"layer": i}
+                metric_state["decoder_self_layers"].append(layer_metrics)
+            if cap_state is not None:
+                layer_cap = {"layer": i}
+            if (
+                self.training
+                and getattr(self._config, "activation_checkpointing", False)
+                and x.requires_grad
+                and debug_state is None
+                and metric_state is None
+                and cap_state is None
+            ):
+                x = checkpoint(
+                    lambda x_in: block(x_in, pad_mask=pad_mask, rope=self._rope, is_causal=is_causal),
+                    x,
+                    use_reentrant=False,
+                )
+            else:
+                x = block(
+                    x,
+                    pad_mask=pad_mask,
+                    rope=self._rope,
+                    is_causal=is_causal,
+                    debug_capture=layer_debug,
+                    capture_attn_scores=capture_scores,
+                    entropy_capture=layer_metrics,
+                    cap_capture=layer_cap,
+                )
+            if cap_state is not None and layer_cap is not None:
+                attn_cap = {"layer": i}
+                mlp_cap = {"layer": i}
+                if "attn_pre_cap" in layer_cap:
+                    attn_cap["attn_pre_cap"] = layer_cap["attn_pre_cap"]
+                if "attn_post_cap" in layer_cap:
+                    attn_cap["attn_post_cap"] = layer_cap["attn_post_cap"]
+                if "mlp_pre_cap" in layer_cap:
+                    mlp_cap["mlp_pre_cap"] = layer_cap["mlp_pre_cap"]
+                if "mlp_post_cap" in layer_cap:
+                    mlp_cap["mlp_post_cap"] = layer_cap["mlp_post_cap"]
+                cap_state["decoder_self_layers"].append(attn_cap)
+                cap_state["decoder_mlp_layers"].append(mlp_cap)
+            if debug_state is not None:
+                if i == 0:
+                    debug_state["hidden"]["dec_l0"] = x.detach()
+                if i == len(self._dec_blocks) - 1:
+                    debug_state["hidden"]["dec_last"] = x.detach()
+        return x
+
+    def forward(
+        self,
+        seq: torch.Tensor,
+        pad_mask=None,
+        return_debug: bool = False,
+        return_attn_entropy: bool = False,
+        return_cap_stats: bool = False,
+        debug_layers: Optional[set] = None,
+        debug_score_layers: Optional[set] = None,
+    ):
+        (B, S) = seq.shape
+        if pad_mask is not None:
+            pad_mask = pad_mask.to(device=seq.device, dtype=torch.bool)
+        causal_lm = bool(getattr(self._config, "causal_lm", True))
+        embeds = self._embed_dropout(self._embed(seq))
+        debug_state = None
+        metric_state = None
+        cap_state = None
+        debug_layers_set = None if debug_layers is None else {int(x) for x in debug_layers}
+        debug_score_layers_set = None if debug_score_layers is None else {int(x) for x in debug_score_layers}
+        if return_debug:
+            if debug_layers_set is None:
+                debug_layers_set = set(range(len(self._dec_blocks)))
+            if debug_score_layers_set is None:
+                last_layer = max(0, len(self._dec_blocks) - 1)
+                debug_score_layers_set = {0, last_layer}
+            debug_state = {
+                "encoder_layers": [],
+                "decoder_self_layers": [],
+                "decoder_cross_layers": [],
+                "hidden": {
+                    "embed": embeds.detach(),
+                },
+            }
+        if return_attn_entropy:
+            metric_state = {
+                "encoder_layers": [],
+                "decoder_self_layers": [],
+                "decoder_cross_layers": [],
+            }
+        if return_cap_stats:
+            cap_state = {
+                "encoder_layers": [],
+                "decoder_self_layers": [],
+                "decoder_cross_layers": [],
+                "decoder_mlp_layers": [],
+            }
+
+        out = self._decode_only(
+            embeds,
+            pad_mask=pad_mask,
+            is_causal=causal_lm,
+            debug_state=debug_state,
+            metric_state=metric_state,
+            cap_state=cap_state,
+            debug_layers=debug_layers_set,
+            debug_score_layers=debug_score_layers_set,
+        )
+        logits = self._lm_head(out)
+        if cap_state is not None:
+            pre_vals: List[float] = []
+            post_vals: List[float] = []
+            for scope_name in ("encoder_layers", "decoder_self_layers", "decoder_cross_layers", "decoder_mlp_layers"):
+                entries = cap_state.get(scope_name, [])
+                if not isinstance(entries, list):
+                    continue
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    for key, val in entry.items():
+                        if not isinstance(val, (float, int)):
+                            continue
+                        fv = float(val)
+                        if not math.isfinite(fv):
+                            continue
+                        if key.endswith("_pre_cap"):
+                            pre_vals.append(fv)
+                        elif key.endswith("_post_cap"):
+                            post_vals.append(fv)
+            cap_state["pre_cap_avg"] = float(sum(pre_vals) / len(pre_vals)) if pre_vals else float("nan")
+            cap_state["post_cap_avg"] = float(sum(post_vals) / len(post_vals)) if post_vals else float("nan")
+        out_parts = [logits]
+        if return_debug:
+            out_parts.append(debug_state)
+        if return_attn_entropy:
+            out_parts.append(metric_state)
+        if return_cap_stats:
+            out_parts.append(cap_state)
+        if len(out_parts) > 1:
+            return tuple(out_parts)
+        return logits
 
 
 class TransformerV1(nn.Module):
@@ -887,6 +1140,7 @@ class TransformerV1(nn.Module):
         is_causal: bool = False,
         debug_state: Optional[Dict[str, Any]] = None,
         metric_state: Optional[Dict[str, Any]] = None,
+        cap_state: Optional[Dict[str, Any]] = None,
         debug_layers: Optional[set] = None,
         debug_score_layers: Optional[set] = None,
     ) -> torch.Tensor:
@@ -899,6 +1153,7 @@ class TransformerV1(nn.Module):
         for i, block in enumerate(self._enc_blocks):
             layer_debug = None
             layer_metrics = None
+            layer_cap = None
             capture_scores = bool(debug_score_layers is not None and i in debug_score_layers)
             if debug_state is not None:
                 include_debug = debug_layers is None or i in debug_layers
@@ -908,12 +1163,16 @@ class TransformerV1(nn.Module):
             if metric_state is not None:
                 layer_metrics = {"layer": i}
                 metric_state["encoder_layers"].append(layer_metrics)
+            if cap_state is not None:
+                layer_cap = {"layer": i}
+                cap_state["encoder_layers"].append(layer_cap)
             if (
                 self.training
                 and getattr(self._config, "activation_checkpointing", False)
                 and x.requires_grad
                 and debug_state is None
                 and metric_state is None
+                and cap_state is None
             ):
                 x = checkpoint(
                     lambda x_in: block(x_in, pad_mask=pad_mask, rope=self._rope, is_causal=is_causal),
@@ -929,6 +1188,7 @@ class TransformerV1(nn.Module):
                     debug_capture=layer_debug,
                     capture_attn_scores=capture_scores,
                     entropy_capture=layer_metrics,
+                    cap_capture=layer_cap,
                 )
             if debug_state is not None:
                 if i == 0:
@@ -947,6 +1207,7 @@ class TransformerV1(nn.Module):
         cross_is_causal: bool = False,
         debug_state: Optional[Dict[str, Any]] = None,
         metric_state: Optional[Dict[str, Any]] = None,
+        cap_state: Optional[Dict[str, Any]] = None,
         debug_layers: Optional[set] = None,
         debug_score_layers: Optional[set] = None,
     ) -> torch.Tensor:
@@ -963,6 +1224,9 @@ class TransformerV1(nn.Module):
             cross_layer_debug = None
             self_layer_metrics = None
             cross_layer_metrics = None
+            self_layer_cap = None
+            cross_layer_cap = None
+            mlp_layer_cap = None
             capture_scores = bool(debug_score_layers is not None and i in debug_score_layers)
             if debug_state is not None:
                 include_debug = debug_layers is None or i in debug_layers
@@ -976,12 +1240,20 @@ class TransformerV1(nn.Module):
                 cross_layer_metrics = {"layer": i}
                 metric_state["decoder_self_layers"].append(self_layer_metrics)
                 metric_state["decoder_cross_layers"].append(cross_layer_metrics)
+            if cap_state is not None:
+                self_layer_cap = {"layer": i}
+                cross_layer_cap = {"layer": i}
+                mlp_layer_cap = {"layer": i}
+                cap_state["decoder_self_layers"].append(self_layer_cap)
+                cap_state["decoder_cross_layers"].append(cross_layer_cap)
+                cap_state["decoder_mlp_layers"].append(mlp_layer_cap)
             if (
                 self.training
                 and getattr(self._config, "activation_checkpointing", False)
                 and x.requires_grad
                 and debug_state is None
                 and metric_state is None
+                and cap_state is None
             ):
                 x = checkpoint(
                     lambda x_in, kv_in: block(
@@ -1010,6 +1282,9 @@ class TransformerV1(nn.Module):
                     capture_cross_attn_scores=capture_scores,
                     self_entropy_capture=self_layer_metrics,
                     cross_entropy_capture=cross_layer_metrics,
+                    self_cap_capture=self_layer_cap,
+                    cross_cap_capture=cross_layer_cap,
+                    mlp_cap_capture=mlp_layer_cap,
                 )
             if debug_state is not None:
                 if i == 0:
@@ -1024,6 +1299,7 @@ class TransformerV1(nn.Module):
         pad_mask=None,
         return_debug: bool = False,
         return_attn_entropy: bool = False,
+        return_cap_stats: bool = False,
         debug_layers: Optional[set] = None,
         debug_score_layers: Optional[set] = None,
     ):
@@ -1037,6 +1313,7 @@ class TransformerV1(nn.Module):
         embeds = self._embed_dropout(self._embed(seq))
         debug_state = None
         metric_state = None
+        cap_state = None
         debug_layers_set = None if debug_layers is None else {int(x) for x in debug_layers}
         debug_score_layers_set = None if debug_score_layers is None else {int(x) for x in debug_score_layers}
         if return_debug:
@@ -1059,6 +1336,13 @@ class TransformerV1(nn.Module):
                 "decoder_self_layers": [],
                 "decoder_cross_layers": [],
             }
+        if return_cap_stats:
+            cap_state = {
+                "encoder_layers": [],
+                "decoder_self_layers": [],
+                "decoder_cross_layers": [],
+                "decoder_mlp_layers": [],
+            }
 
         kv_cache = self._encode(
             embeds,
@@ -1066,6 +1350,7 @@ class TransformerV1(nn.Module):
             is_causal=causal_lm,
             debug_state=debug_state,
             metric_state=metric_state,
+            cap_state=cap_state,
             debug_layers=debug_layers_set,
             debug_score_layers=debug_score_layers_set,
         )
@@ -1077,16 +1362,42 @@ class TransformerV1(nn.Module):
             cross_is_causal=causal_lm,
             debug_state=debug_state,
             metric_state=metric_state,
+            cap_state=cap_state,
             debug_layers=debug_layers_set,
             debug_score_layers=debug_score_layers_set,
         )
         logits = self._lm_head(out)
-        if return_debug and return_attn_entropy:
-            return logits, debug_state, metric_state
+        if cap_state is not None:
+            pre_vals: List[float] = []
+            post_vals: List[float] = []
+            for scope_name in ("encoder_layers", "decoder_self_layers", "decoder_cross_layers", "decoder_mlp_layers"):
+                entries = cap_state.get(scope_name, [])
+                if not isinstance(entries, list):
+                    continue
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    for key, val in entry.items():
+                        if not isinstance(val, (float, int)):
+                            continue
+                        fv = float(val)
+                        if not math.isfinite(fv):
+                            continue
+                        if key.endswith("_pre_cap"):
+                            pre_vals.append(fv)
+                        elif key.endswith("_post_cap"):
+                            post_vals.append(fv)
+            cap_state["pre_cap_avg"] = float(sum(pre_vals) / len(pre_vals)) if pre_vals else float("nan")
+            cap_state["post_cap_avg"] = float(sum(post_vals) / len(post_vals)) if post_vals else float("nan")
+        out_parts = [logits]
         if return_debug:
-            return logits, debug_state
+            out_parts.append(debug_state)
         if return_attn_entropy:
-            return logits, metric_state
+            out_parts.append(metric_state)
+        if return_cap_stats:
+            out_parts.append(cap_state)
+        if len(out_parts) > 1:
+            return tuple(out_parts)
         return logits
 
 

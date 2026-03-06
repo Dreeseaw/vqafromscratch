@@ -342,6 +342,11 @@
       font-size: 0.8rem;
     }
 
+    .gen-text {
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
     .grad-list {
       margin-top: 8px;
       display: grid;
@@ -1570,7 +1575,7 @@
     }
 
     function drawStats() {
-      const GLOBAL_CE_MIN = 5.950318;
+      const GLOBAL_CE_MIN = 3.818118;
       const startTimeLabel = (() => {
         const startedMsRaw = state.runTiming?.startedAtMs;
         const ms = typeof startedMsRaw === "number" ? startedMsRaw : Number.NaN;
@@ -2091,6 +2096,39 @@
       }
     }
 
+    function hasVisibleGenerationText(text) {
+      return String(text || "").replace(/\s+/g, "").length > 0;
+    }
+
+    function formatWhitespaceOnlyText(text) {
+      const s = String(text || "");
+      if (!s) return "";
+      return `[whitespace-only] ${JSON.stringify(s)}`;
+    }
+
+    function formatGenerationText(text) {
+      const s = String(text || "");
+      if (!s) return "";
+      if (hasVisibleGenerationText(s)) return s;
+      return formatWhitespaceOnlyText(s);
+    }
+
+    function displayGenerationText(row) {
+      const generated = formatGenerationText(row.generated_text);
+      if (generated) return generated;
+      const special = formatGenerationText(row.generated_text_with_special);
+      if (special) return special;
+      if (Array.isArray(row.generated_token_ids) && row.generated_token_ids.length > 0) {
+        return `[token_ids] ${row.generated_token_ids.join(" ")}`;
+      }
+      return "(empty generation)";
+    }
+
+    function displayFullText(row) {
+      const full = formatGenerationText(row.full_text_with_special || row.full_text || "");
+      return full || "(empty full text)";
+    }
+
     function drawGenerations() {
       const root = els.genList;
       if (!root) return;
@@ -2117,12 +2155,22 @@
         header.className = "attn-meta";
         header.textContent = `step ${row.step} | probe ${row.probe_idx} | stop=${row.stop_reason}`;
         const prompt = document.createElement("div");
+        prompt.className = "gen-text";
         prompt.textContent = `prompt: ${row.prompt}`;
         const gen = document.createElement("div");
-        gen.textContent = `generated: ${row.generated_text}`;
+        gen.className = "gen-text";
+        gen.textContent = `generated: ${displayGenerationText(row)}`;
+        const full = document.createElement("div");
+        full.className = "gen-text attn-meta";
+        full.textContent = `full: ${displayFullText(row)}`;
+        const tokens = document.createElement("div");
+        tokens.className = "attn-meta";
+        tokens.textContent = `generated_token_ids: ${Array.isArray(row.generated_token_ids) && row.generated_token_ids.length > 0 ? row.generated_token_ids.join(" ") : "(none)"}`;
         item.appendChild(header);
         item.appendChild(prompt);
         item.appendChild(gen);
+        item.appendChild(full);
+        item.appendChild(tokens);
         root.appendChild(item);
       }
     }

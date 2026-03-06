@@ -1,5 +1,7 @@
 import json
 import os
+import inspect
+from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
@@ -206,7 +208,84 @@ def _slice_tokens_for_grid(tokenizer, token_ids: List[int], rows: int, cols: int
     }
 
 
-@torch.no_grad()
+def _forward_with_optional_cache(
+    model: torch.nn.Module,
+    seq: torch.Tensor,
+    pad_mask: Optional[torch.Tensor],
+    use_cache: Optional[bool] = None,
+    **kwargs,
+):
+    call_kwargs: Dict[str, Any] = {"pad_mask": pad_mask, **kwargs}
+    if use_cache is not None and _model_supports_use_cache(model):
+        call_kwargs["use_cache"] = bool(use_cache)
+    with _probe_sdpa_ctx(model=model, device=seq.device):
+        return model(seq, **call_kwargs)
+
+
+def _model_supports_use_cache(model: torch.nn.Module) -> bool:
+    forward = getattr(model, "forward", None)
+    if forward is None:
+        return False
+    try:
+        params = inspect.signature(forward).parameters
+    except (TypeError, ValueError):
+        return False
+    return "use_cache" in params
+
+
+@contextmanager
+def _probe_sdpa_ctx(model: torch.nn.Module, device: torch.device):
+    if device.type != "cuda":
+        yield
+        return
+    cfg = getattr(model, "_config", None)
+    if getattr(cfg, "attn_impl", None) != "sdpa":
+        yield
+        return
+
+    saved_modules = []
+    for module in model.modules():
+        attn_impl = getattr(module, "_attn_impl", None)
+        if attn_impl is None:
+            continue
+        saved_modules.append((module, attn_impl))
+        module._attn_impl = "eager"
+
+    saved_cfg_attn_impl = None
+    if cfg is not None and hasattr(cfg, "attn_impl"):
+        saved_cfg_attn_impl = getattr(cfg, "attn_impl")
+        cfg.attn_impl = "eager"
+
+    try:
+        yield
+    finally:
+        if saved_cfg_attn_impl is not None:
+            cfg.attn_impl = saved_cfg_attn_impl
+        for module, attn_impl in saved_modules:
+            module._attn_impl = attn_impl
+
+
+def _print_probe_invariant_failure(
+    tag: str,
+    tokenizer,
+    pad_id: int,
+    prompt: Optional[str] = None,
+    token_ids: Optional[List[int]] = None,
+    max_new_tokens: Optional[int] = None,
+) -> None:
+    bos_id = int(getattr(tokenizer, "bos_id", -1))
+    eos_id = int(getattr(tokenizer, "eos_id", -1))
+    msg = [f"[probe-invariant-failed] {tag} bos_id={bos_id} eos_id={eos_id} pad_id={int(pad_id)}"]
+    if max_new_tokens is not None:
+        msg.append(f"max_new_tokens={int(max_new_tokens)}")
+    if prompt is not None:
+        msg.append(f"prompt={prompt!r}")
+    if token_ids is not None:
+        msg.append(f"token_ids_tail={list(token_ids)[-20:]}")
+    print(" | ".join(msg))
+
+
+@torch.inference_mode()
 def _autoregressive_generate(
     model: torch.nn.Module,
     tokenizer,
@@ -215,27 +294,84 @@ def _autoregressive_generate(
     max_seq_len: int,
     max_new_tokens: int,
 ) -> Dict[str, Any]:
+    if hasattr(model, "generate") and callable(getattr(model, "generate")):
+        eos_id = int(getattr(tokenizer, "eos_id", -1))
+        gen_kwargs: Dict[str, Any] = {
+            "max_new_tokens": int(max_new_tokens),
+            "do_sample": False,
+            "num_beams": 1,
+            "return_dict_in_generate": False,
+            "output_scores": False,
+            "output_attentions": False,
+            "output_hidden_states": False,
+            "pad_token_id": int(pad_id),
+        }
+        if _model_supports_use_cache(model):
+            gen_kwargs["use_cache"] = True
+        if eos_id >= 0:
+            gen_kwargs["eos_token_id"] = eos_id
+        with _probe_sdpa_ctx(model=model, device=prompt_ids.device):
+            seq_out = model.generate(prompt_ids, **gen_kwargs)
+        if torch.is_tensor(seq_out):
+            full_ids_t = seq_out[0]
+        else:
+            full_ids_t = seq_out.sequences[0]
+        full_token_ids = [int(x) for x in full_ids_t.detach().cpu().tolist()]
+        prompt_token_ids = [int(x) for x in prompt_ids[0].detach().cpu().tolist()]
+        gen_len = max(0, len(full_token_ids) - len(prompt_token_ids))
+        generated_ids = full_token_ids[len(prompt_token_ids):]
+        if len(prompt_token_ids) + gen_len >= int(max_seq_len):
+            stop_reason = "max_seq_len"
+        elif eos_id >= 0 and len(generated_ids) > 0 and int(generated_ids[-1]) == eos_id:
+            stop_reason = "eos"
+        else:
+            stop_reason = "max_new_tokens"
+        del seq_out, full_ids_t
+        return {
+            "prompt_token_ids": prompt_token_ids,
+            "generated_token_ids": generated_ids,
+            "full_token_ids": full_token_ids,
+            "generated_text": tokenizer.decode(generated_ids, skip_special=True) if generated_ids else "",
+            "generated_text_with_special": tokenizer.decode(generated_ids, skip_special=False) if generated_ids else "",
+            "full_text": tokenizer.decode(full_token_ids, skip_special=True),
+            "full_text_with_special": tokenizer.decode(full_token_ids, skip_special=False),
+            "stop_reason": stop_reason,
+            "max_new_tokens": int(max_new_tokens),
+        }
+
     cur = prompt_ids.clone()
     eos_id = int(getattr(tokenizer, "eos_id", -1))
     generated_ids: List[int] = []
     stop_reason = "max_new_tokens"
+    finished = torch.zeros(cur.size(0), dtype=torch.bool, device=cur.device)
 
     for _ in range(max(0, int(max_new_tokens))):
         if cur.size(1) >= int(max_seq_len):
             stop_reason = "max_seq_len"
             break
-        pad_mask = cur.eq(int(pad_id))
-        logits = model(cur, pad_mask=pad_mask)
-        next_id = int(torch.argmax(logits[:, -1, :], dim=-1).item())
-        next_tok = torch.tensor([[next_id]], dtype=cur.dtype, device=cur.device)
+        attention_mask = cur.ne(int(pad_id))
+        last_nonpad = attention_mask.long().sum(dim=1) - 1
+        if bool((last_nonpad < 0).any().item()):
+            stop_reason = "invalid_prompt"
+            break
+        pad_mask = ~attention_mask
+        logits = _forward_with_optional_cache(model, cur, pad_mask=pad_mask, use_cache=True)
+        gather_idx = last_nonpad.view(-1, 1, 1).expand(-1, 1, logits.size(-1))
+        step_logits = logits.gather(dim=1, index=gather_idx).squeeze(1)
+        next_ids = torch.argmax(step_logits, dim=-1)
+        next_tok = next_ids.view(-1, 1).to(dtype=cur.dtype, device=cur.device)
         cur = torch.cat([cur, next_tok], dim=1)
-        generated_ids.append(next_id)
-        if eos_id >= 0 and next_id == eos_id:
+        generated_ids.append(int(next_ids[0].item()))
+        if eos_id >= 0:
+            finished = finished | next_ids.eq(eos_id)
+        del logits, step_logits, next_tok, gather_idx, attention_mask, last_nonpad
+        if bool(finished.all().item()):
             stop_reason = "eos"
             break
 
     prompt_token_ids = prompt_ids[0].detach().cpu().tolist()
     full_token_ids = cur[0].detach().cpu().tolist()
+    del cur
 
     return {
         "prompt_token_ids": prompt_token_ids,
@@ -250,7 +386,7 @@ def _autoregressive_generate(
     }
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def run_debug_probes(
     model: torch.nn.Module,
     tokenizer,
@@ -287,10 +423,67 @@ def run_debug_probes(
     attention_index_path = os.path.join(probe_root, "attention_index.json")
     agg_values: Dict[str, List[float]] = {}
     generation_records: List[Dict[str, Any]] = []
+    eos_id = int(getattr(tokenizer, "eos_id", -1))
+
+    try:
+        assert int(generate_max_new_tokens) > 0
+        assert int(pad_id) != eos_id
+    except AssertionError:
+        _print_probe_invariant_failure(
+            tag="run_config",
+            tokenizer=tokenizer,
+            pad_id=int(pad_id),
+            max_new_tokens=int(generate_max_new_tokens),
+        )
+        raise
+
+    if len(prompts) >= 2:
+        try:
+            ids_a = tokenizer.encode(prompts[0], add_bos=True, add_eos=False)[:max_seq_len]
+            ids_b = tokenizer.encode(prompts[1], add_bos=True, add_eos=False)[:max_seq_len]
+            t = max(int(ids_a.numel()), int(ids_b.numel()))
+            assert t > 0
+            batch_ids = torch.full((2, t), int(pad_id), dtype=torch.long)
+            if ids_a.numel() > 0:
+                batch_ids[0, : ids_a.numel()] = ids_a
+            if ids_b.numel() > 0:
+                batch_ids[1, : ids_b.numel()] = ids_b
+            attention_mask = batch_ids.ne(int(pad_id))
+            for i in range(2):
+                last_nonpad = int(attention_mask[i].sum().item()) - 1
+                assert last_nonpad >= 0
+                assert int(batch_ids[i, last_nonpad].item()) != int(pad_id)
+        except AssertionError:
+            print("[probe-invariant-failed] padded_batch_check")
+            print(f"shape input_ids={tuple(batch_ids.shape)} attention_mask={tuple(attention_mask.shape)}")
+            for i in range(2):
+                last_nonpad = int(attention_mask[i].sum().item()) - 1
+                tail_ids = batch_ids[i, -20:].tolist()
+                tail_mask = attention_mask[i, -20:].long().tolist()
+                ln_tok = int(batch_ids[i, last_nonpad].item()) if last_nonpad >= 0 else None
+                print(
+                    f"sample={i} last_nonpad={last_nonpad} tok_last_nonpad={ln_tok} tok_last={int(batch_ids[i, -1].item())} "
+                    f"tail_ids={tail_ids} tail_mask={tail_mask}"
+                )
+            raise
 
     for probe_idx, prompt in enumerate(prompts):
-        ids = tokenizer.encode(prompt, add_bos=True, add_eos=True)
+        ids = tokenizer.encode(prompt, add_bos=True, add_eos=False)
         ids = ids[:max_seq_len]
+        if probe_idx == 0:
+            try:
+                assert ids.numel() > 0
+                assert int(ids[-1].item()) != eos_id
+            except AssertionError:
+                _print_probe_invariant_failure(
+                    tag="prompt_encoding",
+                    tokenizer=tokenizer,
+                    pad_id=int(pad_id),
+                    prompt=prompt,
+                    token_ids=[int(x) for x in ids.detach().cpu().tolist()],
+                    max_new_tokens=int(generate_max_new_tokens),
+                )
+                raise
         input_ids = ids.unsqueeze(0).to(device)
         prompt_token_ids = [int(x) for x in ids.detach().cpu().tolist()]
         pad_mask = input_ids.eq(int(pad_id))
@@ -300,18 +493,22 @@ def run_debug_probes(
             debug_layers = {int(x) for x in probe_layers}
         attn_state = None
         if capture_attn_entropy:
-            _, debug, attn_state = model(
-                input_ids,
+            _, debug, attn_state = _forward_with_optional_cache(
+                model=model,
+                seq=input_ids,
                 pad_mask=pad_mask,
+                use_cache=False,
                 return_debug=True,
                 return_attn_entropy=True,
                 debug_layers=debug_layers,
                 debug_score_layers=debug_layers,
             )
         else:
-            _, debug = model(
-                input_ids,
+            _, debug = _forward_with_optional_cache(
+                model=model,
+                seq=input_ids,
                 pad_mask=pad_mask,
+                use_cache=False,
                 return_debug=True,
                 debug_layers=debug_layers,
                 debug_score_layers=debug_layers,
@@ -500,6 +697,7 @@ def run_debug_probes(
         out_json = os.path.join(step_dir, f"probe_{probe_idx}.json")
         with open(out_json, "w", encoding="utf-8") as f:
             json.dump(probe_record, f)
+        del generation, debug, attn_state, input_ids, pad_mask
 
     if latest_attention is not None:
         latest_path = os.path.join(probe_root, "latest_attention.json")

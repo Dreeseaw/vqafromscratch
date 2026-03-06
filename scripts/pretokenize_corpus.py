@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
+"""
+This script streams text docs, cleans Wikipedia/Markdown cruft, tokenizes paragraphs,
+  and writes fixed-length token shards for train/val/test. It generates sliding-window
+  candidates per doc but caps each doc to max_windows_per_doc via deterministic sampling
+  (random, first_k, or uniform_spread) to reduce long-doc overweighting. It also logs per-
+  doc clean/window stats plus end-of-run dataset diagnostics.
+"""
 from __future__ import annotations
 
 import argparse
+from collections import Counter, defaultdict
 import gzip
 import hashlib
 import html
@@ -24,14 +32,19 @@ except Exception:  # pragma: no cover - optional speedup
     _orjson = None
 
 
-TAG_RE = re.compile(r"<[^>\n]+>")
 WIKI_LINK_WITH_PIPE_RE = re.compile(r"\[\[([^\]|]+)\|([^\]]+)\]\]")
 WIKI_LINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 WIKI_HEADING_RE = re.compile(r"={2,}([^=]+)={2,}")
 WIKI_BOLD_ITALIC_RE = re.compile(r"'{2,}")
 WIKI_TEMPLATE_RE = re.compile(r"\{\{[^{}\n]*\}\}")
+WIKI_CITATION_RE = re.compile(r"\[(?:\d+|citation needed|clarification needed)\]", flags=re.IGNORECASE)
 WORD_RE = re.compile(r"\S+")
 PARA_SPLIT_RE = re.compile(r"(?:\n\s*){2,}")
+CODE_FENCE_RE = re.compile(r"```.*?```", flags=re.DOTALL)
+INLINE_CODE_RE = re.compile(r"`([^`]*)`")
+MD_HEADER_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s+")
+BLOCKQUOTE_RE = re.compile(r"(?m)^\s{0,3}>\s?")
+HTML_TAG_RE = re.compile(r"<[^>\n]+>")
 
 
 def _json_loads(line: str) -> Dict:
@@ -70,15 +83,44 @@ def _strip_wiki_markup(text: str) -> str:
     return text
 
 
-def clean_text(text: str, normalization: str) -> str:
+@dataclass(frozen=True)
+class CleaningConfig:
+    clean_wikipedia: bool
+    clean_markdown: bool
+    drop_list_pages: bool
+    drop_disambiguation_pages: bool
+    drop_sections_regex: str
+    drop_lines_regex: str
+    min_chars_after_clean: int
+
+
+@dataclass
+class DocStats:
+    original_chars: int
+    cleaned_chars: int
+    num_candidate_windows: int
+    num_sampled_windows: int
+    dropped_reason: str = ""
+
+
+@dataclass
+class DocProcessResult:
+    doc_hash: Optional[str]
+    seqs: List[Sequence[int]]
+    stats: DocStats
+
+
+def _normalize_and_strip_basic(text: str, normalization: str) -> str:
     if normalization and normalization.upper() != "OFF":
         text = unicodedata.normalize(normalization.upper(), text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = TAG_RE.sub(" ", text)
+    text = HTML_TAG_RE.sub(" ", text)
     text = html.unescape(text)
-    text = _strip_wiki_markup(text)
     text = text.replace("\t", " ")
+    return text
 
+
+def _collapse_whitespace_lines(text: str) -> str:
     lines = []
     for line in text.split("\n"):
         line = re.sub(r"[ \t]+", " ", line).strip()
@@ -86,6 +128,94 @@ def clean_text(text: str, normalization: str) -> str:
     text = "\n".join(lines)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def clean_text_wikipedia(
+    raw: str,
+    *,
+    title_hint: str = "",
+    drop_sections_regex: str = r"(?im)^(see also|references|external links|further reading|notes|bibliography)\b",
+    drop_lines_regex: str = r"(?im)^(\*\s|\-\s|==+\s*|\|\s*|\{\{.*\}\}|\[\[File:|\[\[Image:)",
+    drop_list_pages: bool = True,
+    drop_disambiguation_pages: bool = True,
+    bullet_ratio_threshold: float = 0.20,
+) -> Tuple[str, Optional[str]]:
+    text = raw
+    lower_title = title_hint.strip().lower()
+    if drop_list_pages and lower_title.startswith("list of "):
+        return "", "wiki_list_page_title"
+    if drop_disambiguation_pages and "(disambiguation)" in text[:2000].lower():
+        return "", "wiki_disambiguation_marker"
+
+    lines = text.splitlines()
+    non_empty_lines = [ln for ln in lines if ln.strip()]
+    if non_empty_lines:
+        bullet_lines = sum(1 for ln in non_empty_lines if ln.lstrip().startswith(("*", "•")))
+        if (bullet_lines / float(len(non_empty_lines))) > float(bullet_ratio_threshold):
+            return "", "wiki_bullet_list_page"
+
+    tail_cut_re = re.compile(drop_sections_regex, flags=re.IGNORECASE | re.MULTILINE)
+    cut_idx = None
+    for m in re.finditer(r"(?m)^\s*(?:={2,}\s*([^=\n]+?)\s*={2,}|#{1,6}\s+([^\n]+))\s*$", text):
+        heading = (m.group(1) or m.group(2) or "").strip()
+        if heading and tail_cut_re.match(heading):
+            cut_idx = m.start()
+            break
+    if cut_idx is not None:
+        text = text[:cut_idx]
+
+    text = _strip_wiki_markup(text)
+    text = WIKI_CITATION_RE.sub("", text)
+
+    line_drop_re = re.compile(drop_lines_regex)
+    cleaned_lines: List[str] = []
+    for line in text.splitlines():
+        low = line.lower()
+        if line_drop_re.search(line):
+            continue
+        if ("{{" in line or "}}" in line or "|" in line) and ("infobox" in low or "navbox" in low):
+            continue
+        cleaned_lines.append(line)
+    text = "\n".join(cleaned_lines)
+    text = re.sub(r"\{\{.*?\}\}", " ", text, flags=re.DOTALL)
+    text = re.sub(r"\[\[\s*(?:File|Image):[^\]]+\]\]", " ", text, flags=re.IGNORECASE)
+    return _collapse_whitespace_lines(text), None
+
+
+def clean_text_markdown(raw: str) -> str:
+    text = raw
+    text = CODE_FENCE_RE.sub(" ", text)
+    text = INLINE_CODE_RE.sub(r"\1", text)
+    text = MD_HEADER_RE.sub("", text)
+    text = BLOCKQUOTE_RE.sub("", text)
+    text = re.sub(r"(?m)^\s*(?:[\*\-•]|\d+[.)])\s+", "", text)
+    text = HTML_TAG_RE.sub(" ", text)
+    return _collapse_whitespace_lines(text)
+
+
+def clean_text(
+    text: str,
+    normalization: str,
+    *,
+    cleaning: CleaningConfig,
+    title_hint: str = "",
+) -> Tuple[str, Optional[str]]:
+    text = _normalize_and_strip_basic(text, normalization)
+    drop_reason = None
+    if cleaning.clean_wikipedia:
+        text, drop_reason = clean_text_wikipedia(
+            text,
+            title_hint=title_hint,
+            drop_sections_regex=cleaning.drop_sections_regex,
+            drop_lines_regex=cleaning.drop_lines_regex,
+            drop_list_pages=cleaning.drop_list_pages,
+            drop_disambiguation_pages=cleaning.drop_disambiguation_pages,
+        )
+        if drop_reason is not None:
+            return "", drop_reason
+    if cleaning.clean_markdown:
+        text = clean_text_markdown(text)
+    return _collapse_whitespace_lines(text), None
 
 def _count_words(text: str) -> int:
     return len(WORD_RE.findall(text))
@@ -157,20 +287,69 @@ def _pack_paragraph_ids(
     return packed
 
 
-def _window_tokens(ids: Sequence[int], window_len: int, stride: int) -> List[List[int]]:
+def get_candidate_windows(ids: Sequence[int], window_len: int, stride: int) -> List[int]:
     if window_len <= 0:
         raise ValueError("window_len must be > 0")
     if stride <= 0:
         raise ValueError("stride must be > 0")
     n = len(ids)
     if n <= window_len:
-        return [list(int(x) for x in ids)]
+        return [0]
     last_start = n - window_len
     starts = list(range(0, last_start + 1, stride))
     if not starts:
         starts = [0]
     if starts[-1] != last_start:
         starts.append(last_start)
+    return starts
+
+
+def sample_window_starts(
+    candidates: Sequence[int],
+    max_windows_per_doc: int,
+    mode: str,
+    rng: np.random.Generator,
+) -> List[int]:
+    starts = list(int(x) for x in candidates)
+    if not starts:
+        return []
+    if max_windows_per_doc <= 0:
+        return []
+    if len(starts) <= max_windows_per_doc:
+        return starts
+    k = int(max_windows_per_doc)
+    if mode == "first_k":
+        return starts[:k]
+    if mode == "uniform_spread":
+        m = len(starts)
+        if k == 1:
+            return [starts[(m - 1) // 2]]
+        picks = [int((i * (m - 1)) // (k - 1)) for i in range(k)]
+        out: List[int] = []
+        last = -1
+        for idx in picks:
+            if idx != last:
+                out.append(starts[idx])
+                last = idx
+        if len(out) < k:
+            for idx in range(m):
+                val = starts[idx]
+                if val not in out:
+                    out.append(val)
+                if len(out) >= k:
+                    break
+        return out[:k]
+    if mode == "random":
+        choice = rng.choice(len(starts), size=k, replace=False)
+        sel = sorted(int(x) for x in choice.tolist())
+        return [starts[i] for i in sel]
+    raise ValueError(f"Unknown window sampling mode: {mode}")
+
+
+def _window_tokens(ids: Sequence[int], starts: Sequence[int], window_len: int) -> List[List[int]]:
+    n = len(ids)
+    if n <= window_len:
+        return [list(int(x) for x in ids)]
     windows = [list(int(x) for x in ids[s : s + window_len]) for s in starts]
     for seq in windows:
         if len(seq) != window_len:
@@ -602,6 +781,7 @@ def _build_encode_fn(tokenizer):
 
 def _process_doc_impl(
     encode_fn,
+    doc_id: str,
     text: str,
     normalization: str,
     max_seq_len: int,
@@ -613,14 +793,72 @@ def _process_doc_impl(
     add_eos: bool,
     bos_id: Optional[int],
     eos_id: Optional[int],
-) -> Optional[Tuple[Optional[str], List[Sequence[int]]]]:
-    cleaned = clean_text(text, normalization)
+    cleaning: CleaningConfig,
+    max_windows_per_doc: int,
+    window_sampling: str,
+    global_seed: int,
+) -> DocProcessResult:
+    original_chars = len(text)
+    title_hint = ""
+    if "::" in doc_id:
+        title_hint = doc_id.rsplit("::", 1)[-1]
+    cleaned, dropped_reason = clean_text(
+        text,
+        normalization,
+        cleaning=cleaning,
+        title_hint=title_hint,
+    )
+    cleaned_chars = len(cleaned)
+    if dropped_reason is not None:
+        return DocProcessResult(
+            doc_hash=None,
+            seqs=[],
+            stats=DocStats(
+                original_chars=original_chars,
+                cleaned_chars=0,
+                num_candidate_windows=0,
+                num_sampled_windows=0,
+                dropped_reason=dropped_reason,
+            ),
+        )
     if not cleaned:
-        return None
+        return DocProcessResult(
+            doc_hash=None,
+            seqs=[],
+            stats=DocStats(
+                original_chars=original_chars,
+                cleaned_chars=cleaned_chars,
+                num_candidate_windows=0,
+                num_sampled_windows=0,
+                dropped_reason="empty_after_clean",
+            ),
+        )
+    if cleaned_chars < cleaning.min_chars_after_clean:
+        return DocProcessResult(
+            doc_hash=None,
+            seqs=[],
+            stats=DocStats(
+                original_chars=original_chars,
+                cleaned_chars=cleaned_chars,
+                num_candidate_windows=0,
+                num_sampled_windows=0,
+                dropped_reason="too_short_after_clean",
+            ),
+        )
     doc_hash = _hash_text(cleaned) if dedup_docs else None
     paragraphs = _split_paragraphs(cleaned)
     if not paragraphs:
-        return None
+        return DocProcessResult(
+            doc_hash=doc_hash,
+            seqs=[],
+            stats=DocStats(
+                original_chars=original_chars,
+                cleaned_chars=cleaned_chars,
+                num_candidate_windows=0,
+                num_sampled_windows=0,
+                dropped_reason="no_paragraphs_after_clean",
+            ),
+        )
     content_max_len = max_seq_len
     if add_bos:
         content_max_len -= 1
@@ -635,7 +873,17 @@ def _process_doc_impl(
         if ids:
             para_ids.append([int(x) for x in ids])
     if not para_ids:
-        return None
+        return DocProcessResult(
+            doc_hash=doc_hash,
+            seqs=[],
+            stats=DocStats(
+                original_chars=original_chars,
+                cleaned_chars=cleaned_chars,
+                num_candidate_windows=0,
+                num_sampled_windows=0,
+                dropped_reason="no_tokens_after_clean",
+            ),
+        )
 
     segments = _pack_paragraph_ids(
         paragraph_ids=para_ids,
@@ -643,12 +891,54 @@ def _process_doc_impl(
         segment_token_cap=segment_token_cap,
     )
 
-    seqs: List[Sequence[int]] = []
+    segment_with_candidates: List[Tuple[List[int], List[int]]] = []
+    num_candidates = 0
     for segment_ids in segments:
         ids = list(int(x) for x in segment_ids)
         if add_eos:
             ids.append(int(eos_id))
-        windows = _window_tokens(ids, content_max_len, stride)
+        starts = get_candidate_windows(ids, content_max_len, stride)
+        segment_with_candidates.append((ids, starts))
+        num_candidates += len(starts)
+
+    if num_candidates <= 0:
+        return DocProcessResult(
+            doc_hash=doc_hash,
+            seqs=[],
+            stats=DocStats(
+                original_chars=original_chars,
+                cleaned_chars=cleaned_chars,
+                num_candidate_windows=0,
+                num_sampled_windows=0,
+                dropped_reason="no_candidate_windows",
+            ),
+        )
+
+    key = f"{doc_id}|{global_seed}"
+    digest = hashlib.sha1(key.encode("utf-8")).digest()
+    doc_seed = int.from_bytes(digest[:8], byteorder="big", signed=False) & 0xFFFFFFFF
+    rng = np.random.default_rng(doc_seed)
+
+    global_candidates: List[Tuple[int, int]] = []
+    for seg_idx, (_ids, starts) in enumerate(segment_with_candidates):
+        for s in starts:
+            global_candidates.append((seg_idx, int(s)))
+    sampled_flat = sample_window_starts(
+        candidates=list(range(len(global_candidates))),
+        max_windows_per_doc=max_windows_per_doc,
+        mode=window_sampling,
+        rng=rng,
+    )
+    sampled_global = [global_candidates[i] for i in sampled_flat]
+
+    selected_by_segment: Dict[int, List[int]] = defaultdict(list)
+    for seg_idx, st in sampled_global:
+        selected_by_segment[seg_idx].append(st)
+
+    seqs: List[Sequence[int]] = []
+    for seg_idx, starts in selected_by_segment.items():
+        ids = segment_with_candidates[seg_idx][0]
+        windows = _window_tokens(ids, starts=sorted(starts), window_len=content_max_len)
         for window in windows:
             out = list(window)
             if add_bos:
@@ -656,9 +946,17 @@ def _process_doc_impl(
             if len(out) > max_seq_len:
                 raise AssertionError("Window length exceeded max_seq_len.")
             seqs.append(out)
-    if not seqs:
-        return None
-    return doc_hash, seqs
+    return DocProcessResult(
+        doc_hash=doc_hash,
+        seqs=seqs,
+        stats=DocStats(
+            original_chars=original_chars,
+            cleaned_chars=cleaned_chars,
+            num_candidate_windows=num_candidates,
+            num_sampled_windows=len(seqs),
+            dropped_reason="" if seqs else "no_sampled_windows",
+        ),
+    )
 
 
 _WORKER_ENCODE = None
@@ -676,6 +974,10 @@ def _worker_init(
     add_eos: bool,
     bos_id: Optional[int],
     eos_id: Optional[int],
+    cleaning: CleaningConfig,
+    max_windows_per_doc: int,
+    window_sampling: str,
+    global_seed: int,
 ) -> None:
     global _WORKER_ENCODE, _WORKER_CFG
     _WORKER_ENCODE = _build_encode_fn(_load_tokenizer(tokenizer_spec))
@@ -691,6 +993,10 @@ def _worker_init(
         "add_eos": add_eos,
         "bos_id": bos_id,
         "eos_id": eos_id,
+        "cleaning": cleaning,
+        "max_windows_per_doc": max_windows_per_doc,
+        "window_sampling": window_sampling,
+        "global_seed": global_seed,
     }
     try:  # reduce oversubscription if tokenizer uses torch
         import torch
@@ -702,12 +1008,13 @@ def _worker_init(
 
 def _worker_process_doc(
     payload: Tuple[str, str, Optional[int]]
-) -> Tuple[str, Optional[Tuple[Optional[str], List[Sequence[int]]]]]:
+) -> Tuple[str, DocProcessResult]:
     if _WORKER_ENCODE is None:
         raise RuntimeError("Worker tokenizer not initialized.")
     doc_id, text, _wc = payload
     result = _process_doc_impl(
         _WORKER_ENCODE,
+        doc_id=doc_id,
         text=text,
         normalization=str(_WORKER_CFG["normalization"]),
         max_seq_len=int(_WORKER_CFG["max_seq_len"]),
@@ -719,6 +1026,10 @@ def _worker_process_doc(
         add_eos=bool(_WORKER_CFG["add_eos"]),
         bos_id=_WORKER_CFG["bos_id"],
         eos_id=_WORKER_CFG["eos_id"],
+        cleaning=_WORKER_CFG["cleaning"],  # type: ignore[arg-type]
+        max_windows_per_doc=int(_WORKER_CFG["max_windows_per_doc"]),
+        window_sampling=str(_WORKER_CFG["window_sampling"]),
+        global_seed=int(_WORKER_CFG["global_seed"]),
     )
     return doc_id, result
 
@@ -867,6 +1178,21 @@ def _write_split_manifest_json(
         json.dump(payload, f, indent=2)
 
 
+def _self_test_clean_text_wikipedia() -> None:
+    sample = (
+        "Intro paragraph.\n\n"
+        "Useful fact here [1].\n\n"
+        "== References ==\n"
+        "* [1] citation\n"
+        "tail text that should be removed"
+    )
+    cleaned, reason = clean_text_wikipedia(sample)
+    if reason is not None:
+        raise AssertionError(f"clean_text_wikipedia dropped self-test unexpectedly: {reason}")
+    if "References" in cleaned or "tail text that should be removed" in cleaned:
+        raise AssertionError("clean_text_wikipedia self-test failed: references tail was not removed.")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Pre-tokenize and review a large text corpus for encoder-decoder training."
@@ -884,6 +1210,13 @@ def main() -> None:
     ap.add_argument("--tokenizer", required=True, help="Tokenizer .pt path or module:attr.")
     ap.add_argument("--max-seq-len", "--max_seq_len", dest="max_seq_len", type=int, default=256)
     ap.add_argument("--stride", type=int, default=64)
+    ap.add_argument("--window_stride", type=int, default=None)
+    ap.add_argument("--max_windows_per_doc", type=int, default=3)
+    ap.add_argument(
+        "--window_sampling",
+        choices=["random", "first_k", "uniform_spread"],
+        default="random",
+    )
     ap.add_argument(
         "--segment-token-cap",
         type=int,
@@ -922,6 +1255,23 @@ def main() -> None:
         choices=["NFC", "NFKC", "OFF"],
         default="NFKC",
     )
+    ap.add_argument("--clean_wikipedia", type=int, choices=[0, 1], default=1)
+    ap.add_argument("--clean_markdown", type=int, choices=[0, 1], default=1)
+    ap.add_argument("--drop_list_pages", type=int, choices=[0, 1], default=1)
+    ap.add_argument("--drop_disambiguation_pages", type=int, choices=[0, 1], default=1)
+    ap.add_argument(
+        "--drop_sections_regex",
+        type=str,
+        default=r"(?im)^(see also|references|external links|further reading|notes|bibliography)\b",
+    )
+    ap.add_argument(
+        "--drop_lines_regex",
+        type=str,
+        default=r"(?im)^(\*\s|\-\s|==+\s*|\|\s*|\{\{.*\}\}|\[\[File:|\[\[Image:)",
+    )
+    ap.add_argument("--min_chars_after_clean", type=int, default=400)
+    ap.add_argument("--log_clean_stats", type=int, choices=[0, 1], default=1)
+    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument(
         "--drop-last-window",
         action="store_true",
@@ -954,11 +1304,19 @@ def main() -> None:
     )
 
     args = ap.parse_args()
+    _self_test_clean_text_wikipedia()
+
+    if args.window_stride is not None:
+        args.stride = int(args.window_stride)
 
     if args.max_seq_len <= 0:
         raise SystemExit("--max-seq-len must be > 0")
     if args.stride <= 0:
         raise SystemExit("--stride must be > 0")
+    if args.max_windows_per_doc <= 0:
+        raise SystemExit("--max_windows_per_doc must be > 0")
+    if args.min_chars_after_clean < 0:
+        raise SystemExit("--min_chars_after_clean must be >= 0")
     if args.segment_token_cap <= 0:
         raise SystemExit("--segment-token-cap must be > 0")
     if args.workers < 1:
@@ -1018,8 +1376,20 @@ def main() -> None:
         "max_seq_len": args.max_seq_len,
         "content_max_len": content_max_len,
         "stride": args.stride,
+        "window_stride": args.stride,
+        "max_windows_per_doc": args.max_windows_per_doc,
+        "window_sampling": args.window_sampling,
         "segment_token_cap": args.segment_token_cap,
         "normalization": args.normalization,
+        "clean_wikipedia": bool(args.clean_wikipedia),
+        "clean_markdown": bool(args.clean_markdown),
+        "drop_list_pages": bool(args.drop_list_pages),
+        "drop_disambiguation_pages": bool(args.drop_disambiguation_pages),
+        "drop_sections_regex": args.drop_sections_regex,
+        "drop_lines_regex": args.drop_lines_regex,
+        "min_chars_after_clean": int(args.min_chars_after_clean),
+        "log_clean_stats": bool(args.log_clean_stats),
+        "seed": int(args.seed),
         "dedup_docs": bool(args.dedup_docs),
         "dedup_seqs": bool(args.dedup_seqs),
         "text_key": args.text_key,
@@ -1042,6 +1412,21 @@ def main() -> None:
         if int(pad_id) >= vocab_size or int(eos_id) >= vocab_size:
             raise SystemExit("PAD/EOS ids must be within tokenizer vocab size.")
     _write_meta(out_dir, meta)
+    cleaning_cfg = CleaningConfig(
+        clean_wikipedia=bool(args.clean_wikipedia),
+        clean_markdown=bool(args.clean_markdown),
+        drop_list_pages=bool(args.drop_list_pages),
+        drop_disambiguation_pages=bool(args.drop_disambiguation_pages),
+        drop_sections_regex=args.drop_sections_regex,
+        drop_lines_regex=args.drop_lines_regex,
+        min_chars_after_clean=int(args.min_chars_after_clean),
+    )
+    clean_stats_path = os.path.join(out_dir, "clean_stats.jsonl")
+    clean_stats_f = (
+        open(clean_stats_path, "w", encoding="utf-8")
+        if bool(args.log_clean_stats)
+        else None
+    )
 
     doc_hashes: set = set()
     seq_hashes: set = set()
@@ -1111,6 +1496,10 @@ def main() -> None:
     dup_seqs = 0
     empty_docs = 0
     doc_to_split: Dict[str, str] = {}
+    dropped_docs_by_reason: Counter[str] = Counter()
+    total_clean_ratio = 0.0
+    clean_ratio_docs = 0
+    sampled_windows_hist: Counter[int] = Counter()
 
     if vocab_size is not None:
         token_counts = np.zeros(vocab_size, dtype=np.int64)
@@ -1148,6 +1537,23 @@ def main() -> None:
 
     words_seen = 0
 
+    def _log_clean_stats(doc_id: str, stats: DocStats, dropped_reason: str) -> None:
+        if clean_stats_f is None:
+            return
+        clean_stats_f.write(
+            json.dumps(
+                {
+                    "doc_id": doc_id,
+                    "original_chars": int(stats.original_chars),
+                    "cleaned_chars": int(stats.cleaned_chars),
+                    "num_candidate_windows": int(stats.num_candidate_windows),
+                    "num_sampled_windows": int(stats.num_sampled_windows),
+                    "dropped_reason": dropped_reason,
+                }
+            )
+            + "\n"
+        )
+
     def _doc_iter() -> Iterator[Tuple[str, str, Optional[int]]]:
         nonlocal raw_docs, words_seen
         for spec in inputs:
@@ -1167,23 +1573,35 @@ def main() -> None:
                     words_seen += _count_words(doc)
                 yield doc_id, doc, wc
 
-    def _consume_result(
-        doc_id: str,
-        result: Optional[Tuple[Optional[str], List[Sequence[int]]]],
-    ) -> None:
-        nonlocal empty_docs, dup_docs, dup_seqs, total_docs, total_seqs, total_tokens, seqs_at_max, token_counts, token_counter, last_log_t, last_docs, last_seqs, last_tokens
-        if result is None:
-            empty_docs += 1
+    def _consume_result(doc_id: str, result: DocProcessResult) -> None:
+        nonlocal empty_docs, dup_docs, dup_seqs, total_docs, total_seqs, total_tokens, seqs_at_max, token_counts, token_counter, last_log_t, last_docs, last_seqs, last_tokens, total_clean_ratio, clean_ratio_docs
+        sampled_windows_hist[int(result.stats.num_sampled_windows)] += 1
+        if result.stats.original_chars > 0:
+            total_clean_ratio += float(result.stats.cleaned_chars) / float(result.stats.original_chars)
+            clean_ratio_docs += 1
+        if result.stats.dropped_reason:
+            dropped_docs_by_reason[result.stats.dropped_reason] += 1
+            if result.stats.dropped_reason == "empty_after_clean":
+                empty_docs += 1
+            _log_clean_stats(doc_id, result.stats, result.stats.dropped_reason)
             return
 
-        doc_hash, doc_seqs = result
+        doc_hash = result.doc_hash
+        doc_seqs = result.seqs
         if args.dedup_docs and doc_hash is not None:
             if doc_hash in doc_hashes:
                 dup_docs += 1
+                dropped_docs_by_reason["dedup_doc_hash"] += 1
+                _log_clean_stats(doc_id, result.stats, "dedup_doc_hash")
                 return
             doc_hashes.add(doc_hash)
             if doc_hash_f is not None:
                 doc_hash_f.write(doc_hash + "\n")
+
+        if not doc_seqs:
+            dropped_docs_by_reason["no_sampled_windows"] += 1
+            _log_clean_stats(doc_id, result.stats, "no_sampled_windows")
+            return
 
         split_name = _assign_split(
             doc_id,
@@ -1243,6 +1661,10 @@ def main() -> None:
             split_docs[split_name] += 1
             if len(split_sample_doc_ids[split_name]) < 8:
                 split_sample_doc_ids[split_name].append(doc_id)
+            _log_clean_stats(doc_id, result.stats, "")
+        else:
+            dropped_docs_by_reason["all_sampled_windows_deduped"] += 1
+            _log_clean_stats(doc_id, result.stats, "all_sampled_windows_deduped")
         now = time.perf_counter()
         should_log = False
         if args.log_every and total_docs % args.log_every == 0:
@@ -1284,6 +1706,7 @@ def main() -> None:
         for doc_id, doc, _wc in _doc_iter():
             result = _process_doc_impl(
                 encode_fn,
+                doc_id=doc_id,
                 text=doc,
                 normalization=args.normalization,
                 max_seq_len=args.max_seq_len,
@@ -1295,6 +1718,10 @@ def main() -> None:
                 add_eos=args.add_eos,
                 bos_id=bos_id,
                 eos_id=eos_id,
+                cleaning=cleaning_cfg,
+                max_windows_per_doc=args.max_windows_per_doc,
+                window_sampling=args.window_sampling,
+                global_seed=args.seed,
             )
             _consume_result(doc_id, result)
     else:
@@ -1313,6 +1740,10 @@ def main() -> None:
                 args.add_eos,
                 bos_id,
                 eos_id,
+                cleaning_cfg,
+                args.max_windows_per_doc,
+                args.window_sampling,
+                args.seed,
             ),
         ) as pool:
             for doc_id, result in pool.imap(
@@ -1348,10 +1779,13 @@ def main() -> None:
         doc_hash_f.close()
     if seq_hash_f is not None:
         seq_hash_f.close()
+    if clean_stats_f is not None:
+        clean_stats_f.close()
 
     print("\n=== Dataset Health Check ===")
     print(f"Input files: {len(inputs)}")
     print(f"Raw docs seen: {raw_docs}")
+    print(f"Total docs in: {raw_docs}")
     print(f"Docs kept: {total_docs}")
     print(f"Docs dropped (dup): {dup_docs}")
     print(f"Docs dropped (empty): {empty_docs}")
@@ -1368,6 +1802,18 @@ def main() -> None:
     if total_words_est > 0:
         print(f"Estimated total words (from '{args.word_count_key}'): {total_words_est}")
         print(f"Words seen: {words_seen}")
+    if dropped_docs_by_reason:
+        print("Dropped docs by reason:")
+        for reason in sorted(dropped_docs_by_reason.keys()):
+            print(f"  {reason}: {int(dropped_docs_by_reason[reason])}")
+    if clean_ratio_docs > 0:
+        print(f"Average clean ratio (cleaned/original chars): {total_clean_ratio / clean_ratio_docs:.4f}")
+    if sampled_windows_hist:
+        print("Sampled windows per doc histogram:")
+        for n_windows in sorted(sampled_windows_hist.keys()):
+            print(f"  {n_windows}: {int(sampled_windows_hist[n_windows])}")
+    if clean_stats_f is not None:
+        print(f"Clean stats log: {clean_stats_path}")
 
     if total_seqs > 0:
         frac_max = 100.0 * seqs_at_max / total_seqs

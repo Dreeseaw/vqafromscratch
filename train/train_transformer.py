@@ -22,8 +22,9 @@ import json
 import random
 import argparse
 import datetime
+from contextlib import nullcontext
 from collections import defaultdict, deque
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -31,7 +32,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 
-from models.lm import TransformerV1, LMConfig
+from models.lm import TransformerV1, TransformerDecoderOnlyV1, LMConfig
 from train.lm_probe_debug import (
     parse_probe_layers,
     parse_probe_prompts,
@@ -330,10 +331,9 @@ class CollatePad:
         input_ids = tokens
         target_ids = torch.full_like(input_ids, self.pad_id)
         target_ids[:, :-1] = input_ids[:, 1:]
+        target_ids[:, 0] = self.pad_id
 
-        loss_mask = target_ids.ne(self.pad_id) & input_ids.ne(self.pad_id)
-        # Keep token-0 out of loss when using next-token shift.
-        loss_mask[:, 0] = False
+        loss_mask = target_ids.ne(self.pad_id)
         return input_ids, target_ids, loss_mask
 
 
@@ -436,6 +436,157 @@ class BucketBatchSampler:
         rng.shuffle(all_batches)
         for batch in all_batches:
             yield batch
+
+
+class InfiniteBucketLoader:
+    def __init__(self, name: str, loader: DataLoader, sampler: BucketBatchSampler):
+        self.name = name
+        self.loader = loader
+        self.sampler = sampler
+        self.epoch = 0
+        self.sampler.set_epoch(self.epoch)
+        self._it = iter(self.loader)
+
+    def next_batch(self):
+        try:
+            return next(self._it)
+        except StopIteration:
+            self.epoch += 1
+            self.sampler.set_epoch(self.epoch)
+            self._it = iter(self.loader)
+            return next(self._it)
+
+
+def _normalize_bucket_weights(raw: Dict[str, float], step_ref: str) -> Dict[str, float]:
+    cleaned: Dict[str, float] = {}
+    total = 0.0
+    for name in ("distill", "wiki", "coco"):
+        val = float(raw.get(name, 0.0))
+        if val < 0.0:
+            raise ValueError(f"Mixture weights must be >=0 ({step_ref}, bucket={name}, weight={val}).")
+        cleaned[name] = val
+        total += val
+    if total <= 0.0:
+        raise ValueError(f"Mixture weights sum to 0 ({step_ref}).")
+    return {k: (v / total) for k, v in cleaned.items()}
+
+
+def parse_mix_schedule(spec: str) -> List[Dict[str, Any]]:
+    if not spec:
+        return []
+    payload: Any
+    if os.path.isfile(spec):
+        with open(spec, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    else:
+        payload = json.loads(spec)
+    if not isinstance(payload, list) or not payload:
+        raise ValueError("--mix_schedule must be a non-empty JSON list.")
+
+    out: List[Dict[str, Any]] = []
+    for i, entry in enumerate(payload):
+        if not isinstance(entry, dict):
+            raise ValueError(f"--mix_schedule entry[{i}] must be an object.")
+        if "start_step" not in entry:
+            raise ValueError(f"--mix_schedule entry[{i}] missing start_step.")
+        start_step = int(entry["start_step"])
+        if start_step < 1:
+            raise ValueError(f"--mix_schedule entry[{i}] start_step must be >=1.")
+        end_step_raw = entry.get("end_step")
+        end_step: Optional[int] = None if end_step_raw is None else int(end_step_raw)
+        if end_step is not None and end_step < start_step:
+            raise ValueError(
+                f"--mix_schedule entry[{i}] end_step must be >= start_step (got {start_step}-{end_step})."
+            )
+        weights_raw = entry.get("weights")
+        if not isinstance(weights_raw, dict):
+            raise ValueError(f"--mix_schedule entry[{i}] must include an object 'weights'.")
+        weights = _normalize_bucket_weights(weights_raw, step_ref=f"entry[{i}]")
+        out.append(
+            {
+                "start_step": start_step,
+                "end_step": end_step,
+                "weights": weights,
+            }
+        )
+
+    out.sort(key=lambda x: int(x["start_step"]))
+    return out
+
+
+def get_mix_weights_for_step(schedule: List[Dict[str, Any]], step_1based: int) -> Dict[str, float]:
+    if step_1based < 1:
+        raise ValueError("step_1based must be >= 1.")
+    active: Optional[Dict[str, Any]] = None
+    for entry in schedule:
+        start_step = int(entry["start_step"])
+        end_step = entry["end_step"]
+        if step_1based < start_step:
+            continue
+        if end_step is not None and step_1based > int(end_step):
+            continue
+        active = entry
+    if active is None:
+        raise ValueError(
+            f"No active mix schedule entry for step {step_1based}. "
+            "Ensure start/end ranges cover all training steps."
+        )
+    return dict(active["weights"])
+
+
+def validate_mix_schedule_coverage(schedule: List[Dict[str, Any]], total_steps: int) -> None:
+    if total_steps <= 0:
+        return
+    for step in (1, int(total_steps)):
+        _ = get_mix_weights_for_step(schedule, step)
+    # Spot-check boundaries for holes between adjacent entries.
+    sorted_entries = sorted(schedule, key=lambda x: int(x["start_step"]))
+    for prev, cur in zip(sorted_entries[:-1], sorted_entries[1:]):
+        prev_end = prev["end_step"]
+        cur_start = int(cur["start_step"])
+        if prev_end is None:
+            continue
+        if int(prev_end) + 1 < cur_start:
+            raise ValueError(
+                f"Mix schedule has an uncovered gap: steps {int(prev_end) + 1}-{cur_start - 1}."
+            )
+
+
+def required_mix_buckets_for_horizon(schedule: List[Dict[str, Any]], total_steps: int) -> set:
+    required = set()
+    if total_steps <= 0:
+        return required
+    lo = 1
+    hi = int(total_steps)
+    for entry in schedule:
+        start_step = int(entry["start_step"])
+        end_step = entry["end_step"]
+        end_val = hi if end_step is None else int(end_step)
+        if end_val < lo or start_step > hi:
+            continue
+        weights = entry.get("weights", {})
+        if not isinstance(weights, dict):
+            continue
+        for name, weight in weights.items():
+            if float(weight) > 0.0:
+                required.add(str(name))
+    return required
+
+
+def sample_bucket_name(weights: Dict[str, float]) -> str:
+    names = []
+    probs = []
+    for name in ("distill", "wiki", "coco"):
+        p = float(weights.get(name, 0.0))
+        if p > 0.0:
+            names.append(name)
+            probs.append(p)
+    if not names:
+        raise ValueError("No positive bucket weight in active schedule entry.")
+    p_arr = np.asarray(probs, dtype=np.float64)
+    p_arr = p_arr / p_arr.sum()
+    pick = int(np.random.choice(len(names), p=p_arr))
+    return names[pick]
 
 
 ### Scheduling
@@ -741,6 +892,16 @@ def _is_attn_out_param_name(name: str) -> bool:
     return any(marker in name for marker in markers)
 
 
+def _is_dec_cross_attn_param_name(name: str) -> bool:
+    markers = (
+        "._cross_q.",
+        "._cross_kv.",
+        "._cross_out_proj.",
+        "._ls_cross_attn",
+    )
+    return any(marker in name for marker in markers)
+
+
 def _grad_split_group_for_param(name: str) -> Optional[str]:
     if name.startswith("_embed."):
         return "embed"
@@ -810,13 +971,68 @@ def build_optimizer_param_groups(
     weight_decay: float,
     tie_embeddings: bool,
     half_lr_lm_head: bool,
+    dec_cross_attn_lr_scale: float = 1.0,
 ):
+    if float(dec_cross_attn_lr_scale) <= 0.0:
+        raise ValueError("dec_cross_attn_lr_scale must be > 0.")
+
     tied_embed_param_id = id(model._embed.weight) if tie_embeddings else None
+    # Keep the default group layout unchanged for checkpoint compatibility.
+    if abs(float(dec_cross_attn_lr_scale) - 1.0) < 1e-12:
+        grouped_params: Dict[str, List[nn.Parameter]] = {
+            "main_decay": [],
+            "lm_head_no_decay": [],
+            "embed_decay": [],
+            "main_no_decay": [],
+            "embed_no_decay": [],
+        }
+
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            param_name = str(name)
+            is_embed = param_name.startswith("_embed.")
+            is_lm_head = param_name.startswith("_unembed.")
+            is_bias = param_name.endswith(".bias")
+            if is_lm_head:
+                grouped_params["lm_head_no_decay"].append(param)
+                continue
+            no_decay = is_bias or (tied_embed_param_id is not None and id(param) == tied_embed_param_id)
+            if is_embed:
+                key = "embed_no_decay" if no_decay else "embed_decay"
+            else:
+                key = "main_no_decay" if no_decay else "main_decay"
+            grouped_params[key].append(param)
+
+        out = []
+        for key in ("main_decay", "lm_head_no_decay", "embed_decay", "main_no_decay", "embed_no_decay"):
+            params = grouped_params[key]
+            if len(params) == 0:
+                continue
+            if key.startswith("embed_"):
+                lr_scale = 0.5
+            elif key == "lm_head_no_decay":
+                lr_scale = 0.125 if half_lr_lm_head else 1.0
+            else:
+                lr_scale = 1.0
+            group_weight_decay = 0.0 if key.endswith("_no_decay") or key == "embed_decay" else float(weight_decay)
+            out.append(
+                {
+                    "params": params,
+                    "weight_decay": group_weight_decay,
+                    "lr_scale": lr_scale,
+                    "lr": float(base_lr) * lr_scale,
+                }
+            )
+        return out
+
     grouped_params: Dict[str, List[nn.Parameter]] = {
-        "main_decay": [],
+        "main_decay_noncross": [],
+        "main_decay_cross": [],
         "lm_head_no_decay": [],
         "embed_decay": [],
-        "main_no_decay": [],
+        "main_no_decay_noncross": [],
+        "main_no_decay_cross": [],
         "embed_no_decay": [],
     }
 
@@ -834,11 +1050,23 @@ def build_optimizer_param_groups(
         if is_embed:
             key = "embed_no_decay" if no_decay else "embed_decay"
         else:
-            key = "main_no_decay" if no_decay else "main_decay"
+            is_dec_cross_attn = _is_dec_cross_attn_param_name(param_name)
+            if no_decay:
+                key = "main_no_decay_cross" if is_dec_cross_attn else "main_no_decay_noncross"
+            else:
+                key = "main_decay_cross" if is_dec_cross_attn else "main_decay_noncross"
         grouped_params[key].append(param)
 
     out = []
-    for key in ("main_decay", "lm_head_no_decay", "embed_decay", "main_no_decay", "embed_no_decay"):
+    for key in (
+        "main_decay_noncross",
+        "main_decay_cross",
+        "lm_head_no_decay",
+        "embed_decay",
+        "main_no_decay_noncross",
+        "main_no_decay_cross",
+        "embed_no_decay",
+    ):
         params = grouped_params[key]
         if len(params) == 0:
             continue
@@ -848,7 +1076,11 @@ def build_optimizer_param_groups(
             lr_scale = 0.125 if half_lr_lm_head else 1.0
         else:
             lr_scale = 1.0
+        if key.endswith("_cross"):
+            lr_scale *= float(dec_cross_attn_lr_scale)
         group_weight_decay = 0.0 if key.endswith("_no_decay") or key == "embed_decay" else float(weight_decay)
+        if key.startswith("main_no_decay_"):
+            group_weight_decay = 0.0
         out.append(
             {
                 "params": params,
@@ -1041,26 +1273,120 @@ def extract_attn_entropy_metrics(attn_state: Optional[dict]) -> dict:
     return out
 
 
+def extract_cap_metrics(cap_state: Optional[dict]) -> dict:
+    out = {}
+    if not isinstance(cap_state, dict):
+        return out
+
+    def _add_layer_metrics(entries: Any, prefix: str, pre_key: str, post_key: str) -> None:
+        if not isinstance(entries, list):
+            return
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            layer = entry.get("layer")
+            if not isinstance(layer, int):
+                continue
+            pre_v = entry.get(pre_key)
+            post_v = entry.get(post_key)
+            if isinstance(pre_v, (float, int)):
+                out[f"cap_pre_{prefix}_l{layer}"] = float(pre_v)
+            if isinstance(post_v, (float, int)):
+                out[f"cap_post_{prefix}_l{layer}"] = float(post_v)
+
+    _add_layer_metrics(cap_state.get("encoder_layers"), "enc_attn", "attn_pre_cap", "attn_post_cap")
+    _add_layer_metrics(cap_state.get("encoder_layers"), "enc_mlp", "mlp_pre_cap", "mlp_post_cap")
+    _add_layer_metrics(cap_state.get("decoder_self_layers"), "dec_self_attn", "attn_pre_cap", "attn_post_cap")
+    _add_layer_metrics(cap_state.get("decoder_cross_layers"), "dec_cross_attn", "attn_pre_cap", "attn_post_cap")
+    _add_layer_metrics(cap_state.get("decoder_mlp_layers"), "dec_mlp", "mlp_pre_cap", "mlp_post_cap")
+
+    pre_avg = cap_state.get("pre_cap_avg")
+    post_avg = cap_state.get("post_cap_avg")
+    if isinstance(pre_avg, (float, int)):
+        out["pre_cap_avg"] = float(pre_avg)
+    if isinstance(post_avg, (float, int)):
+        out["post_cap_avg"] = float(post_avg)
+    return out
+
+
 def _collate_shift_sanity(collate_fn: CollatePad, pad_id: int) -> None:
     toy = [
         torch.tensor([11, 12, 13, 14], dtype=torch.long),
         torch.tensor([21, 22], dtype=torch.long),
     ]
     input_ids, target_ids, loss_mask = collate_fn(toy)
-    assert int(target_ids[0, 0].item()) == 12
+    assert int(target_ids[0, 0].item()) == pad_id
     assert int(target_ids[0, 1].item()) == 13
     assert int(target_ids[0, 2].item()) == 14
     assert not bool(loss_mask[0, 0].item())
     assert not bool(loss_mask[input_ids == pad_id].any().item())
 
 
-@torch.no_grad()
+def _cuda_mem_stats_mib(device: str) -> Optional[Dict[str, float]]:
+    if device != "cuda" or not torch.cuda.is_available():
+        return None
+    return {
+        "allocated_mib": float(torch.cuda.memory_allocated() / (1024.0 ** 2)),
+        "reserved_mib": float(torch.cuda.memory_reserved() / (1024.0 ** 2)),
+        "max_allocated_mib": float(torch.cuda.max_memory_allocated() / (1024.0 ** 2)),
+    }
+
+
+def _log_cuda_mem(logger: Logger, device: str, scope: str, step: int, duration_s: Optional[float] = None) -> None:
+    stats = _cuda_mem_stats_mib(device=device)
+    if stats is None:
+        return
+    msg = (
+        f"CUDA_MEM step={int(step)} scope={scope} "
+        f"allocated_mib={stats['allocated_mib']:.2f} "
+        f"reserved_mib={stats['reserved_mib']:.2f} "
+        f"max_allocated_mib={stats['max_allocated_mib']:.2f}"
+    )
+    if duration_s is not None:
+        msg += f" duration_s={float(duration_s):.3f}"
+    logger.log(msg)
+
+
+def _forward_with_optional_cache(
+    model: nn.Module,
+    input_ids: torch.Tensor,
+    pad_mask: Optional[torch.Tensor],
+    use_cache: Optional[bool] = None,
+):
+    kwargs = {"pad_mask": pad_mask}
+    if use_cache is not None:
+        kwargs["use_cache"] = bool(use_cache)
+    try:
+        return model(input_ids, **kwargs)
+    except TypeError:
+        if "use_cache" in kwargs:
+            kwargs.pop("use_cache", None)
+            return model(input_ids, **kwargs)
+        raise
+
+
+def _autocast_ctx(amp_enabled: bool, amp_dtype: Optional[torch.dtype]):
+    if amp_enabled:
+        if amp_dtype is None:
+            raise ValueError("amp_dtype must be set when amp_enabled=True.")
+        return torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True)
+    return nullcontext()
+
+
+def _maybe_pad_mask(input_ids: torch.Tensor, pad_id: int, *, has_padding: bool) -> Optional[torch.Tensor]:
+    if not has_padding:
+        return None
+    return input_ids.eq(int(pad_id))
+
+
 def evaluate_model(
     model: nn.Module,
     loader: DataLoader,
     device: str,
     pad_id: int,
     vocab_size: int,
+    amp_enabled: bool = False,
+    amp_dtype: Optional[torch.dtype] = None,
     z_loss_enable: bool = False,
     z_loss_coef: float = 0.0,
     max_tokens: int = 0,
@@ -1069,48 +1395,78 @@ def evaluate_model(
 ):
     model_was_training = model.training
     model.eval()
+    loader_fixed_len = bool(getattr(getattr(loader, "dataset", None), "fixed_len", False))
     total_ce_loss_sum = 0.0
     total_z_loss_sum = 0.0
     total_tokens = 0
     total_entropy_sum = 0.0
     total_steps = 0
 
-    for batch in loader:
-        input_ids, target_ids, loss_mask = batch
-        input_ids = input_ids.to(device, non_blocking=pin_memory)
-        target_ids = target_ids.to(device, non_blocking=pin_memory)
-        loss_mask = loss_mask.to(device, non_blocking=pin_memory)
+    with torch.inference_mode():
+        for batch in loader:
+            input_ids, target_ids, loss_mask = batch
+            batch_has_padding = (not loader_fixed_len) and bool(input_ids.eq(int(pad_id)).any())
+            input_ids = input_ids.to(device, non_blocking=pin_memory)
+            target_ids = target_ids.to(device, non_blocking=pin_memory)
+            loss_mask = loss_mask.to(device, non_blocking=pin_memory)
+            pad_mask = _maybe_pad_mask(input_ids, pad_id, has_padding=batch_has_padding)
+            with _autocast_ctx(amp_enabled=amp_enabled, amp_dtype=amp_dtype):
+                logits = _forward_with_optional_cache(
+                    model=model,
+                    input_ids=input_ids,
+                    pad_mask=pad_mask,
+                    use_cache=False,
+                )
 
-        logits = model(input_ids, pad_mask=input_ids.eq(pad_id))
+            flat_mask = target_ids.ne(pad_id).reshape(-1)
+            token_count = int(flat_mask.sum().item())
+            if token_count <= 0:
+                del logits, input_ids, target_ids, loss_mask, flat_mask
+                continue
+            logits_for_loss = logits.transpose(1, 2).float()
+            ce_loss_sum = F.cross_entropy(
+                logits_for_loss,
+                target_ids,
+                ignore_index=pad_id,
+                reduction="sum",
+            )
+            flat_targets = target_ids.reshape(-1)[flat_mask]
+            flat_logits_f32 = logits.reshape(-1, vocab_size)[flat_mask].float()
+            if z_loss_enable:
+                log_z = torch.logsumexp(flat_logits_f32, dim=-1)
+                z_loss_sum = log_z.square().sum()
+            else:
+                z_loss_sum = ce_loss_sum.new_zeros(())
 
-        flat_mask = loss_mask.reshape(-1)
-        token_count = int(flat_mask.sum().item())
-        if token_count <= 0:
-            continue
-        flat_logits = logits.reshape(-1, vocab_size)[flat_mask]
-        flat_targets = target_ids.reshape(-1)[flat_mask]
-        ce_loss_sum = F.cross_entropy(flat_logits, flat_targets, reduction="sum")
-        if z_loss_enable:
-            log_z = torch.logsumexp(flat_logits, dim=-1)
-            z_loss_sum = log_z.square().sum()
-        else:
-            z_loss_sum = ce_loss_sum.new_zeros(())
+            flat_log_probs = F.log_softmax(flat_logits_f32, dim=-1)
+            flat_probs = flat_log_probs.exp()
+            entropy_sum = float((-(flat_probs * flat_log_probs).sum(dim=-1)).sum().item())
 
-        log_probs = F.log_softmax(logits, dim=-1)
-        probs = log_probs.exp()
-        entropy = -(probs * log_probs).sum(dim=-1)
-        entropy_sum = float(entropy[loss_mask].sum().item())
+            total_ce_loss_sum += float(ce_loss_sum.item())
+            total_z_loss_sum += float(z_loss_sum.item())
+            total_tokens += token_count
+            total_entropy_sum += entropy_sum
+            total_steps += 1
 
-        total_ce_loss_sum += float(ce_loss_sum.item())
-        total_z_loss_sum += float(z_loss_sum.item())
-        total_tokens += token_count
-        total_entropy_sum += entropy_sum
-        total_steps += 1
+            del (
+                logits,
+                flat_mask,
+                flat_targets,
+                ce_loss_sum,
+                z_loss_sum,
+                logits_for_loss,
+                flat_logits_f32,
+                flat_log_probs,
+                flat_probs,
+                input_ids,
+                target_ids,
+                loss_mask,
+            )
 
-        if max_steps > 0 and total_steps >= max_steps:
-            break
-        if max_tokens > 0 and total_tokens >= max_tokens:
-            break
+            if max_steps > 0 and total_steps >= max_steps:
+                break
+            if max_tokens > 0 and total_tokens >= max_tokens:
+                break
 
     ce = total_ce_loss_sum / float(max(1, total_tokens))
     z_loss = total_z_loss_sum / float(max(1, total_tokens))
@@ -1137,6 +1493,33 @@ def main():
     parser.add_argument("--train_data", type=str, required=True)
     parser.add_argument("--val_data", type=str, default=None)
     parser.add_argument("--test_data", type=str, default=None)
+    parser.add_argument(
+        "--train_bucket_distill",
+        type=str,
+        default=None,
+        help="Optional train split path for distillation bucket (pre-tokenized).",
+    )
+    parser.add_argument(
+        "--train_bucket_wiki",
+        type=str,
+        default=None,
+        help="Optional train split path for wiki bucket (pre-tokenized). Defaults to resolved --train_data/train.",
+    )
+    parser.add_argument(
+        "--train_bucket_coco",
+        type=str,
+        default=None,
+        help="Optional train split path for coco captions bucket (pre-tokenized).",
+    )
+    parser.add_argument(
+        "--mix_schedule",
+        type=str,
+        default="",
+        help=(
+            "JSON array or path to JSON schedule. "
+            "Entries: {start_step:int>=1, end_step:int|null, weights:{distill,wiki,coco}}."
+        ),
+    )
     parser.add_argument("--tokenizer", type=str, default=None)
     parser.add_argument("--checkpoint", type=int, default=None)
 
@@ -1150,10 +1533,22 @@ def main():
     # model (models/lm.py)
     parser.add_argument("--d_model", type=int, default=512)
     parser.add_argument("--n_heads", type=int, default=8)
-    parser.add_argument("--enc_layers", type=int, default=4)  # must match dec_layers
-    parser.add_argument("--dec_layers", type=int, default=4)  # must match enc_layers
+    parser.add_argument("--enc_layers", type=int, default=4)  # used for encoder-decoder mode
+    parser.add_argument("--dec_layers", type=int, default=4)  # used for both modes
+    parser.add_argument(
+        "--decoder_only",
+        action="store_true",
+        help="Use decoder-only Transformer (no encoder/cross-attention path).",
+    )
     parser.add_argument("--ff_mult", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--precision",
+        type=str,
+        default="fp32",
+        choices=["fp32", "bf16", "fp16"],
+        help="Compute precision for CUDA training/eval. bf16/fp16 require CUDA.",
+    )
     parser.add_argument("--tie_embeddings", action="store_true")
     parser.add_argument("--attn_impl", type=str, default="sdpa", choices=["sdpa", "eager"])
     parser.add_argument(
@@ -1238,6 +1633,12 @@ def main():
         "--half_lr_lm_head",
         action="store_true",
         help="Use 0.5x base LR for _unembed (LM head) parameters.",
+    )
+    parser.add_argument(
+        "--dec_cross_attn_lr_scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for decoder cross-attention parameter LR (_cross_q/_cross_kv/_cross_out_proj/_ls_cross_attn).",
     )
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["adam", "adamw"])
     parser.add_argument("--warmup_ratio", type=float, default=0.04)
@@ -1330,6 +1731,11 @@ def main():
         help="Track mean attention entropy for encoder/self-cross decoder attention on training batches.",
     )
     parser.add_argument(
+        "--track_caps",
+        action="store_true",
+        help="Track pre/post cap-change norms for each layer cap event, plus model-level pre_cap_avg/post_cap_avg.",
+    )
+    parser.add_argument(
         "--track_train_token_entropy",
         dest="track_train_token_entropy",
         action="store_true",
@@ -1372,6 +1778,13 @@ def main():
         help="Use pinned host memory for eval DataLoaders (0/1).",
     )
     parser.add_argument("--log_every", type=int, default=100)
+    parser.add_argument(
+        "--debug_cuda_empty_cache",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="Debug-only: call torch.cuda.empty_cache() after eval/probe to test fragmentation effects.",
+    )
     parser.add_argument(
         "--track_r_metrics",
         dest="track_r_metrics",
@@ -1450,7 +1863,24 @@ def main():
     train_path, val_path, test_path = _resolve_data_paths(
         args.train_data, args.val_data, args.test_data
     )
-    train_dataset = load_dataset(train_path, args.max_seq_len)
+    try:
+        mix_schedule = parse_mix_schedule(args.mix_schedule) if args.mix_schedule else []
+    except ValueError as e:
+        raise SystemExit(f"Invalid --mix_schedule: {e}")
+    mix_enabled = len(mix_schedule) > 0
+
+    bucket_train_paths: Dict[str, str] = {}
+    if mix_enabled:
+        wiki_bucket_path = args.train_bucket_wiki if args.train_bucket_wiki else train_path
+        bucket_train_paths["wiki"] = _resolve_data_paths(wiki_bucket_path, None, None)[0]
+        if args.train_bucket_distill:
+            bucket_train_paths["distill"] = _resolve_data_paths(args.train_bucket_distill, None, None)[0]
+        if args.train_bucket_coco:
+            bucket_train_paths["coco"] = _resolve_data_paths(args.train_bucket_coco, None, None)[0]
+    else:
+        bucket_train_paths["wiki"] = train_path
+
+    train_dataset = load_dataset(bucket_train_paths["wiki"], args.max_seq_len)
     train_meta = getattr(train_dataset, "meta", None) or {}
     tok_info = _load_tokenizer_info(args.tokenizer)
 
@@ -1499,6 +1929,27 @@ def main():
     if args.vocab_size <= int(max(args.pad_id, args.eos_id, args.bos_id)):
         raise SystemExit("vocab_size must be larger than special token ids.")
 
+    train_bucket_datasets: Dict[str, Dataset] = {"wiki": train_dataset}
+    train_bucket_meta: Dict[str, Dict[str, Any]] = {"wiki": train_meta}
+    for bucket_name, bucket_path in bucket_train_paths.items():
+        if bucket_name == "wiki":
+            continue
+        dataset_i = load_dataset(bucket_path, args.max_seq_len)
+        meta_i = getattr(dataset_i, "meta", None) or {}
+        train_bucket_datasets[bucket_name] = dataset_i
+        train_bucket_meta[bucket_name] = meta_i
+        for key, expected in (
+            ("vocab_size", int(args.vocab_size)),
+            ("pad_id", int(args.pad_id)),
+            ("bos_id", int(args.bos_id)),
+            ("eos_id", int(args.eos_id)),
+        ):
+            if key in meta_i and meta_i[key] is not None and int(meta_i[key]) != expected:
+                raise SystemExit(
+                    f"Bucket '{bucket_name}' has meta.{key}={meta_i[key]}, expected {expected}. "
+                    "All buckets must share tokenizer ids/vocab."
+                )
+
     probe_tokenizer = None
     probe_prompts = []
     probe_file_path = None
@@ -1513,13 +1964,14 @@ def main():
             raise SystemExit("Probe tokenizer pad_id must match training pad_id.")
         probe_file_path = resolve_probe_file_path(
             train_data_arg=args.train_data,
-            resolved_train_path=train_path,
+            resolved_train_path=bucket_train_paths["wiki"],
             override_probe_file=args.probe_file,
         )
         probe_prompts = parse_probe_prompts(probe_file_path)
-        probe_layers = parse_probe_layers(args.probe_layers, total_layers=int(args.enc_layers))
+        probe_layer_total = int(args.dec_layers) if bool(args.decoder_only) else int(args.enc_layers)
+        probe_layers = parse_probe_layers(args.probe_layers, total_layers=probe_layer_total)
 
-    fixed_len = getattr(train_dataset, "fixed_len", False)
+    fixed_len = all(getattr(ds, "fixed_len", False) for ds in train_bucket_datasets.values())
     collate_fn = CollatePad(args.max_seq_len, args.pad_id, fixed_len)
     _collate_shift_sanity(collate_fn, args.pad_id)
 
@@ -1527,17 +1979,6 @@ def main():
         active_bucket_ranges = make_bucket_ranges(args.max_seq_len, args.bucket_width)
     else:
         active_bucket_ranges = BUCKET_RANGES
-
-    bucket_ranges, bucket_indices, bucket_token_counts = build_length_buckets(
-        train_dataset, args.max_seq_len, active_bucket_ranges
-    )
-    sampler = BucketBatchSampler(
-        bucket_indices=bucket_indices,
-        bucket_token_counts=bucket_token_counts,
-        batch_size=args.batch_size,
-        seed=SEED,
-        drop_last=True,
-    )
 
     train_pin_memory = device == "cuda"
     eval_pin_memory = bool(int(args.eval_pin_memory)) and device == "cuda"
@@ -1552,7 +1993,52 @@ def main():
             loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = max(1, int(args.prefetch_factor))
 
-    train_loader = DataLoader(train_dataset, batch_sampler=sampler, **loader_kwargs)
+    train_loader: Optional[DataLoader] = None
+    sampler: Optional[BucketBatchSampler] = None
+    mix_bucket_loaders: Dict[str, InfiniteBucketLoader] = {}
+    bucket_stats_by_bucket: Dict[str, Dict[str, Any]] = {}
+
+    for bucket_name in ("distill", "wiki", "coco"):
+        dataset_i = train_bucket_datasets.get(bucket_name)
+        if dataset_i is None:
+            continue
+        ranges_i, indices_i, tok_counts_i = build_length_buckets(
+            dataset_i, args.max_seq_len, active_bucket_ranges
+        )
+        sampler_i = BucketBatchSampler(
+            bucket_indices=indices_i,
+            bucket_token_counts=tok_counts_i,
+            batch_size=args.batch_size,
+            seed=SEED + (17 * len(bucket_stats_by_bucket)),
+            drop_last=True,
+        )
+        loader_i = DataLoader(dataset_i, batch_sampler=sampler_i, **loader_kwargs)
+        bucket_stats_by_bucket[bucket_name] = {
+            "path": bucket_train_paths[bucket_name],
+            "ranges": ranges_i,
+            "indices": indices_i,
+            "token_counts": tok_counts_i,
+            "sampler": sampler_i,
+            "loader": loader_i,
+        }
+
+    if mix_enabled:
+        for name in ("distill", "wiki", "coco"):
+            stats = bucket_stats_by_bucket.get(name)
+            if stats is None:
+                continue
+            mix_bucket_loaders[name] = InfiniteBucketLoader(
+                name=name,
+                loader=stats["loader"],
+                sampler=stats["sampler"],
+            )
+        if not mix_bucket_loaders:
+            raise SystemExit("No train buckets available for mixture training.")
+    else:
+        if "wiki" not in bucket_stats_by_bucket:
+            raise SystemExit("Missing wiki train bucket.")
+        sampler = bucket_stats_by_bucket["wiki"]["sampler"]
+        train_loader = bucket_stats_by_bucket["wiki"]["loader"]
 
     if val_path is None:
         raise SystemExit("Validation data is required (provide --val_data or use dataset_root/val).")
@@ -1583,8 +2069,8 @@ def main():
     val_loader = DataLoader(val_eval_dataset, **eval_loader_kwargs)
     test_loader = DataLoader(test_dataset, **eval_loader_kwargs)
 
-    if args.enc_layers != args.dec_layers:
-        raise SystemExit("--enc_layers must equal --dec_layers for TransformerV1.")
+    if (not bool(args.decoder_only)) and args.enc_layers != args.dec_layers:
+        raise SystemExit("--enc_layers must equal --dec_layers for TransformerV1 (encoder-decoder mode).")
     if int(args.grad_accum_steps) <= 0:
         raise SystemExit("--grad_accum_steps must be > 0.")
     if args.grad_clip_mode == "global" and args.clip_grad <= 0:
@@ -1613,10 +2099,33 @@ def main():
         raise SystemExit("--eval_prefetch_factor must be > 0.")
     if int(args.grad_split_every) < 0:
         raise SystemExit("--grad_split_every must be >= 0.")
+    if float(args.dec_cross_attn_lr_scale) <= 0.0:
+        raise SystemExit("--dec_cross_attn_lr_scale must be > 0.")
     if args.resid_max_norm is None:
         args.resid_max_norm = math.sqrt(float(args.d_model))
+    precision = str(args.precision).lower()
+    if precision not in ("fp32", "bf16", "fp16"):
+        raise SystemExit("--precision must be one of: fp32, bf16, fp16.")
+    if precision != "fp32" and device != "cuda":
+        raise SystemExit("--precision bf16/fp16 requires CUDA.")
+    if precision == "bf16" and device == "cuda":
+        bf16_supported = False
+        if hasattr(torch.cuda, "is_bf16_supported"):
+            bf16_supported = bool(torch.cuda.is_bf16_supported())
+        if not bf16_supported:
+            raise SystemExit("Requested --precision bf16 but this CUDA device/runtime does not report bf16 support.")
+    amp_enabled = bool(device == "cuda" and precision in ("bf16", "fp16"))
+    amp_dtype = None
+    if precision == "bf16":
+        amp_dtype = torch.bfloat16
+    elif precision == "fp16":
+        amp_dtype = torch.float16
+    use_grad_scaler = bool(device == "cuda" and precision == "fp16")
+    grad_scaler = torch.cuda.amp.GradScaler(enabled=use_grad_scaler)
+
     track_train_token_entropy = bool(args.track_train_token_entropy)
     track_r_metrics = bool(args.track_r_metrics)
+    track_caps = bool(args.track_caps)
     log_top_grad_norms = bool(args.log_top_grad_norms)
     effective_grad_split_every = int(args.grad_split_every) if bool(args.grad_split_logging) else 0
     probe_after_log_only = bool(args.probe_after_log_only)
@@ -1624,13 +2133,15 @@ def main():
     z_loss_coef = float(args.z_loss_coef) if z_loss_enabled else 0.0
     lr_anneal_enabled = bool(args.lr_anneal_enable)
 
+    model_layers = int(args.dec_layers) if bool(args.decoder_only) else int(args.enc_layers)
+
     cfg = LMConfig(
         vocab_size=args.vocab_size,
         embed_size=args.d_model,
         num_heads=args.n_heads,
         mlp_ratio=args.ff_mult,
         dropout=args.dropout,
-        layers=args.enc_layers,
+        layers=model_layers,
         max_seq_len=args.max_seq_len,
         tie_embeds=args.tie_embeddings,
         activation_checkpointing=args.activation_checkpointing,
@@ -1647,7 +2158,10 @@ def main():
         cap_out_mode=str(args.cap_out_mode),
         cap_keep_masked=bool(int(args.cap_keep_masked)),
     )
-    model = TransformerV1(cfg).to(device)
+    if bool(args.decoder_only):
+        model = TransformerDecoderOnlyV1(cfg).to(device)
+    else:
+        model = TransformerV1(cfg).to(device)
     r_metric_param_groups = (
         build_r_metric_param_groups(model, tie_embeddings=bool(args.tie_embeddings))
         if track_r_metrics
@@ -1665,6 +2179,7 @@ def main():
         weight_decay=float(args.weight_decay),
         tie_embeddings=bool(args.tie_embeddings),
         half_lr_lm_head=bool(args.half_lr_lm_head),
+        dec_cross_attn_lr_scale=float(args.dec_cross_attn_lr_scale),
     )
 
     if args.optimizer == "adam":
@@ -1678,8 +2193,28 @@ def main():
             weight_decay=0.0,
         )
 
-    updates_per_epoch = max(1, math.ceil(len(train_loader) / float(max(1, int(args.grad_accum_steps)))))
+    train_microbatches_per_epoch = (
+        sum(int(info["sampler"].batches_per_epoch) for info in bucket_stats_by_bucket.values())
+        if mix_enabled
+        else int(len(train_loader))
+    )
+    updates_per_epoch = max(
+        1,
+        math.ceil(train_microbatches_per_epoch / float(max(1, int(args.grad_accum_steps)))),
+    )
     total_steps = args.max_steps if args.max_steps is not None else args.epochs * updates_per_epoch
+    if mix_enabled:
+        try:
+            validate_mix_schedule_coverage(mix_schedule, int(total_steps))
+        except ValueError as e:
+            raise SystemExit(f"Invalid --mix_schedule: {e}")
+        required_buckets = required_mix_buckets_for_horizon(mix_schedule, int(total_steps))
+        missing_required = sorted(name for name in required_buckets if name not in bucket_train_paths)
+        if missing_required:
+            raise SystemExit(
+                "Mix schedule references bucket(s) within the active training horizon but no path was provided: "
+                f"{missing_required}. Provided buckets: {sorted(bucket_train_paths.keys())}"
+            )
     warmup_steps = max(1, int(total_steps * args.warmup_ratio))
     scheduler = WarmupScheduler(opt, args.lr, warmup_steps, total_steps, schedule=args.schedule)
     row_max_norm_targets = collect_row_max_norm_targets(model) if args.row_max_norm_enable else []
@@ -1715,6 +2250,12 @@ def main():
     logger.log(f"Run start time: {str(datetime.datetime.now())}")
     logger.log(f"Running on {device}\n")
     logger.log(f"Config: {vars(cfg)}\n")
+    logger.log(f"model topology: {'decoder_only' if bool(args.decoder_only) else 'encoder_decoder'}")
+    logger.log(
+        f"precision: {precision} "
+        f"(autocast={'on' if amp_enabled else 'off'}, grad_scaler={'on' if use_grad_scaler else 'off'})"
+    )
+    logger.log(f"attention backend: attn_impl={args.attn_impl}, sdp_backend={args.sdp_backend}")
     if args.deterministic:
         logger.log("deterministic mode: enabled (may reduce throughput)")
     if train_meta:
@@ -1726,7 +2267,22 @@ def main():
             meta_val = train_meta.get(key)
             if meta_val is not None and int(meta_val) != int(arg_val):
                 logger.log(f"warning: meta.{key}={meta_val} != args.{key}={arg_val}")
-    logger.log(f"train_data: {train_path}")
+    logger.log(f"train_data: {bucket_train_paths['wiki']}")
+    if mix_enabled:
+        logger.log("train mixture buckets:")
+        for name in ("distill", "wiki", "coco"):
+            path = bucket_train_paths.get(name)
+            if path:
+                logger.log(f"  {name}: {path}")
+        logger.log("train mixture schedule:")
+        for entry in mix_schedule:
+            end_txt = "inf" if entry["end_step"] is None else str(entry["end_step"])
+            w = entry["weights"]
+            logger.log(
+                f"  steps {entry['start_step']}-{end_txt}: "
+                f"distill={w.get('distill', 0.0):.4f}, "
+                f"wiki={w.get('wiki', 0.0):.4f}, coco={w.get('coco', 0.0):.4f}"
+            )
     logger.log(f"val_data: {val_path}")
     logger.log(f"test_data: {test_path}")
     logger.log(
@@ -1742,14 +2298,20 @@ def main():
             f"loss_tokens={val_slice_info['tokens']}"
         )
 
-    total_bucket_tokens = float(np.sum(np.asarray(bucket_token_counts, dtype=np.float64)))
-    if total_bucket_tokens > 0:
-        logger.log("Bucket stats (range, seqs, tokens, prob):")
+    for bucket_name in ("distill", "wiki", "coco"):
+        info = bucket_stats_by_bucket.get(bucket_name)
+        if info is None:
+            continue
+        tok_counts = info["token_counts"]
+        total_bucket_tokens = float(np.sum(np.asarray(tok_counts, dtype=np.float64)))
+        if total_bucket_tokens <= 0:
+            continue
+        logger.log(f"Length-bucket stats [{bucket_name}] (range, seqs, tokens, prob):")
         for (lo, hi), indices, tok_count, prob in zip(
-            bucket_ranges,
-            bucket_indices,
-            bucket_token_counts,
-            sampler.bucket_probs.tolist(),
+            info["ranges"],
+            info["indices"],
+            tok_counts,
+            info["sampler"].bucket_probs.tolist(),
         ):
             logger.log(
                 f"  {lo:4d}-{hi:4d}: seqs={len(indices):7d} "
@@ -1775,6 +2337,10 @@ def main():
     logger.log("optimizer lr scaling: _embed parameters use 0.5x base LR.")
     if args.half_lr_lm_head:
         logger.log("optimizer lr scaling: _unembed parameters use 0.5x base LR.")
+    logger.log(
+        "optimizer lr scaling: decoder cross-attn parameters "
+        f"(_cross_q/_cross_kv/_cross_out_proj/_ls_cross_attn) use {float(args.dec_cross_attn_lr_scale):.4f}x."
+    )
     if args.row_max_norm_enable:
         logger.log(
             f"row max-norm projection: on (c={args.row_max_norm_c}, targets={len(row_max_norm_targets)})"
@@ -1857,9 +2423,17 @@ def main():
             logger.log(f"warning: expected 5 probes, found {len(probe_prompts)} in {probe_file_path}")
     logger.log(f"token entropy (train hot path): {'on' if track_train_token_entropy else 'off'}")
     logger.log(f"attention entropy (train batches): {'on' if args.track_attn_entropy else 'off'}")
+    logger.log(
+        f"cap tracking (sampled only on pre-probe train steps): {'on' if track_caps else 'off'} "
+        f"(run_probes={int(args.run_probes)})"
+    )
     logger.log(f"attention entropy (probe runs): {'on' if args.probe_attn_entropy else 'off'}")
     if args.track_attn_entropy and args.activation_checkpointing:
         logger.log("note: attention entropy capture bypasses activation checkpointing on training forwards.")
+    if track_caps and args.activation_checkpointing:
+        logger.log("note: cap tracking bypasses activation checkpointing on training forwards.")
+    if track_caps and int(args.run_probes) <= 0:
+        logger.log("note: --track_caps is idle because --run_probes <= 0.")
     if args.checkpoint is not None:
         logger.log(
             f"resume checkpoint: step={global_step}, epoch={resume_epoch}, "
@@ -1884,10 +2458,13 @@ def main():
     r_group_steps_since_log = {k: 0 for k in R_METRIC_GROUP_KEYS}
     attn_entropy_sum_since_log = defaultdict(float)
     attn_entropy_count_since_log = defaultdict(int)
+    latest_cap_sample = {}
     agc_clipped_params_since_log = 0
     agc_total_params_since_log = 0
     row_max_norm_affected_params_since_log = 0
     row_max_norm_total_params_since_log = 0
+    mix_bucket_batches_since_log = {k: 0 for k in ("distill", "wiki", "coco")}
+    mix_bucket_batches_total = {k: 0 for k in ("distill", "wiki", "coco")}
     running_ce_window = deque()
     running_ce_tokens = 0
     running_ce_loss_sum = 0.0
@@ -1901,7 +2478,7 @@ def main():
     log_start = time.perf_counter()
     did_sanity = False
 
-    batches_per_epoch = max(1, len(train_loader))
+    batches_per_epoch = max(1, int(train_microbatches_per_epoch))
     if resume_batch_in_epoch >= batches_per_epoch:
         resume_epoch += int(resume_batch_in_epoch // batches_per_epoch)
         resume_batch_in_epoch = int(resume_batch_in_epoch % batches_per_epoch)
@@ -1937,6 +2514,18 @@ def main():
         row_max_norm_total_params_since_log = int(
             restored_log_accum_state.get("row_max_norm_total_params_since_log", 0)
         )
+        restored_mix_batches_since_log = restored_log_accum_state.get("mix_bucket_batches_since_log", {})
+        if isinstance(restored_mix_batches_since_log, dict):
+            for name in ("distill", "wiki", "coco"):
+                v = restored_mix_batches_since_log.get(name)
+                if isinstance(v, (int, float)):
+                    mix_bucket_batches_since_log[name] = int(v)
+        restored_mix_batches_total = restored_log_accum_state.get("mix_bucket_batches_total", {})
+        if isinstance(restored_mix_batches_total, dict):
+            for name in ("distill", "wiki", "coco"):
+                v = restored_mix_batches_total.get(name)
+                if isinstance(v, (int, float)):
+                    mix_bucket_batches_total[name] = int(v)
         running_ce_tokens = int(restored_log_accum_state.get("running_ce_tokens", 0))
         running_ce_loss_sum = float(restored_log_accum_state.get("running_ce_loss_sum", 0.0))
         running_ce_list = restored_log_accum_state.get("running_ce_window", [])
@@ -1976,43 +2565,106 @@ def main():
     accum_has_grad = False
 
     for epoch in range(resume_epoch, args.epochs):
-        sampler.set_epoch(epoch)
-        for batch_idx, batch in enumerate(train_loader, start=1):
+        train_iter = None
+        if not mix_enabled:
+            if sampler is None or train_loader is None:
+                raise RuntimeError("Internal error: missing sampler/train_loader in non-mix mode.")
+            sampler.set_epoch(epoch)
+            train_iter = iter(train_loader)
+
+        for batch_idx in range(1, batches_per_epoch + 1):
             if args.max_steps is not None and global_step >= args.max_steps:
                 break
+
+            if mix_enabled:
+                micro_step_1based = (int(epoch) * int(batches_per_epoch)) + int(batch_idx)
+                sched_step_1based = (
+                    (micro_step_1based - 1) // int(max(1, int(args.grad_accum_steps)))
+                ) + 1
+                active_weights = get_mix_weights_for_step(mix_schedule, int(sched_step_1based))
+                mix_bucket_name = sample_bucket_name(active_weights)
+                bucket_loader = mix_bucket_loaders.get(mix_bucket_name)
+                if bucket_loader is None:
+                    raise RuntimeError(f"Active mix bucket '{mix_bucket_name}' is unavailable.")
+                batch = bucket_loader.next_batch()
+                mix_bucket_batches_since_log[mix_bucket_name] += 1
+                mix_bucket_batches_total[mix_bucket_name] += 1
+            else:
+                if train_iter is None:
+                    raise RuntimeError("Internal error: train iterator is not initialized.")
+                batch = next(train_iter)
+
             if epoch == resume_epoch and batch_idx <= resume_batch_in_epoch:
                 continue
 
             input_ids, target_ids, loss_mask = batch
+            batch_has_padding = (not fixed_len) and bool(input_ids.eq(int(args.pad_id)).any())
             input_ids = input_ids.to(device, non_blocking=train_pin_memory)
             target_ids = target_ids.to(device, non_blocking=train_pin_memory)
             loss_mask = loss_mask.to(device, non_blocking=train_pin_memory)
-            attn_pad_mask = input_ids.eq(args.pad_id)
+            attn_pad_mask = _maybe_pad_mask(input_ids, args.pad_id, has_padding=batch_has_padding)
 
             if not did_sanity:
                 if input_ids.size(1) < 2:
                     raise AssertionError("Need at least two positions for next-token prediction.")
-                assert torch.equal(target_ids[:, :-1], input_ids[:, 1:]), "target_ids must be input_ids shifted by one"
+                assert torch.equal(
+                    target_ids[:, 1:-1],
+                    input_ids[:, 2:],
+                ), "target_ids must be input_ids shifted by one after the ignored token-0 position"
                 assert not bool(loss_mask[input_ids == args.pad_id].any().item()), "loss_mask must exclude pad positions"
                 assert not bool(loss_mask[:, 0].any().item()), "loss_mask position 0 must be False"
                 logger.log("sanity: target shift and loss-mask checks passed on first batch")
                 did_sanity = True
 
+            do_optimizer_step = (
+                (accum_micro_count + 1) >= int(args.grad_accum_steps)
+                or batch_idx >= batches_per_epoch
+            )
+            next_step = int(global_step) + 1
+            probe_due_next_step = (
+                int(args.run_probes) > 0
+                and (next_step % int(args.run_probes) == 0)
+                and (not probe_after_log_only or (next_step % int(args.log_every) == 0))
+            )
+            sample_caps_this_batch = bool(track_caps and do_optimizer_step and probe_due_next_step)
+
             step_attn_entropy = {}
-            if args.track_attn_entropy:
-                logits, attn_state = model(input_ids, pad_mask=attn_pad_mask, return_attn_entropy=True)
+            step_cap_metrics = {}
+            if args.track_attn_entropy and sample_caps_this_batch:
+                with _autocast_ctx(amp_enabled=amp_enabled, amp_dtype=amp_dtype):
+                    logits, attn_state, cap_state = model(
+                        input_ids,
+                        pad_mask=attn_pad_mask,
+                        return_attn_entropy=True,
+                        return_cap_stats=True,
+                    )
                 step_attn_entropy = extract_attn_entropy_metrics(attn_state)
+                step_cap_metrics = extract_cap_metrics(cap_state)
+            elif args.track_attn_entropy:
+                with _autocast_ctx(amp_enabled=amp_enabled, amp_dtype=amp_dtype):
+                    logits, attn_state = model(input_ids, pad_mask=attn_pad_mask, return_attn_entropy=True)
+                step_attn_entropy = extract_attn_entropy_metrics(attn_state)
+            elif sample_caps_this_batch:
+                with _autocast_ctx(amp_enabled=amp_enabled, amp_dtype=amp_dtype):
+                    logits, cap_state = model(input_ids, pad_mask=attn_pad_mask, return_cap_stats=True)
+                step_cap_metrics = extract_cap_metrics(cap_state)
             else:
-                logits = model(input_ids, pad_mask=attn_pad_mask)
-            flat_mask = loss_mask.reshape(-1)
+                with _autocast_ctx(amp_enabled=amp_enabled, amp_dtype=amp_dtype):
+                    logits = model(input_ids, pad_mask=attn_pad_mask)
+            flat_mask = target_ids.ne(args.pad_id).reshape(-1)
             token_count = int(flat_mask.sum().item())
             loss_sum_value = 0.0
             if token_count > 0:
-                flat_logits = logits.reshape(-1, args.vocab_size)[flat_mask]
-                flat_targets = target_ids.reshape(-1)[flat_mask]
-                ce_loss_sum = F.cross_entropy(flat_logits, flat_targets, reduction="sum")
+                logits_for_loss = logits.transpose(1, 2).float()
+                ce_loss_sum = F.cross_entropy(
+                    logits_for_loss,
+                    target_ids,
+                    ignore_index=args.pad_id,
+                    reduction="sum",
+                )
                 if z_loss_enabled:
-                    log_z = torch.logsumexp(flat_logits, dim=-1)
+                    flat_logits_f32 = logits.reshape(-1, args.vocab_size)[flat_mask].float()
+                    log_z = torch.logsumexp(flat_logits_f32, dim=-1)
                     z_loss_sum = log_z.square().sum()
                 else:
                     z_loss_sum = ce_loss_sum.new_zeros(())
@@ -2020,7 +2672,10 @@ def main():
                 total_loss = total_loss_sum / float(token_count)
                 if not torch.isfinite(total_loss):
                     raise FloatingPointError(f"Non-finite training loss at step {global_step + 1}.")
-                total_loss_sum.backward()
+                if use_grad_scaler:
+                    grad_scaler.scale(total_loss_sum).backward()
+                else:
+                    total_loss_sum.backward()
                 accum_tokens_for_backward += token_count
                 accum_has_grad = True
 
@@ -2050,9 +2705,18 @@ def main():
                         continue
                     attn_entropy_sum_since_log[attn_key] += float(attn_value)
                     attn_entropy_count_since_log[attn_key] += 1
+                if sample_caps_this_batch:
+                    latest_cap_sample = {}
+                    for cap_key, cap_value in step_cap_metrics.items():
+                        if not math.isfinite(float(cap_value)):
+                            continue
+                        latest_cap_sample[cap_key] = float(cap_value)
                 running_ce_window.append([token_count, loss_sum_value])
                 running_ce_tokens += token_count
                 running_ce_loss_sum += loss_sum_value
+                del logits_for_loss
+                if z_loss_enabled:
+                    del flat_logits_f32
 
             while running_ce_tokens > RUNNING_CE_WINDOW_TOKENS and len(running_ce_window) > 0:
                 overflow = running_ce_tokens - RUNNING_CE_WINDOW_TOKENS
@@ -2090,9 +2754,12 @@ def main():
             for param in model.parameters():
                 if param.grad is not None:
                     param.grad.detach().mul_(grad_scale)
+            if use_grad_scaler:
+                grad_scaler.unscale_(opt)
 
             grad_split_values = None
             next_step = int(global_step) + 1
+            should_log_this_step = (next_step % int(args.log_every)) == 0
             if effective_grad_split_every > 0 and (next_step % effective_grad_split_every == 0):
                 grad_split_values = {
                     "embed": grad_norm_for_params(grad_split_param_groups.get("embed", [])),
@@ -2114,13 +2781,21 @@ def main():
                         optimizer=opt,
                     )
             else:
-                pre_grad_norm = global_grad_norm(model.parameters())
+                pre_grad_norm = float("nan")
                 r_value = float("nan")
                 r_values_by_group = {}
             if args.grad_clip_mode == "global":
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
-                post_grad_norm = global_grad_norm(model.parameters())
+                clip_pre_grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad))
+                if track_r_metrics:
+                    post_grad_norm = global_grad_norm(model.parameters()) if should_log_this_step else float("nan")
+                elif should_log_this_step:
+                    pre_grad_norm = clip_pre_grad_norm
+                    post_grad_norm = global_grad_norm(model.parameters())
+                else:
+                    post_grad_norm = float("nan")
             elif args.grad_clip_mode == "agc":
+                if not track_r_metrics and should_log_this_step:
+                    pre_grad_norm = global_grad_norm(model.parameters())
                 clipped_count, total_count = adaptive_clip_grad_(
                     model.parameters(),
                     clip_factor=args.agc_clip_factor,
@@ -2128,13 +2803,19 @@ def main():
                 )
                 agc_clipped_params_since_log += clipped_count
                 agc_total_params_since_log += total_count
-                post_grad_norm = global_grad_norm(model.parameters())
+                post_grad_norm = global_grad_norm(model.parameters()) if should_log_this_step else float("nan")
             else:
+                if not track_r_metrics and should_log_this_step:
+                    pre_grad_norm = global_grad_norm(model.parameters())
                 post_grad_norm = pre_grad_norm
             top_grad_norms_for_log = []
-            if log_top_grad_norms and (global_step + 1) % args.log_every == 0:
+            if log_top_grad_norms and should_log_this_step:
                 top_grad_norms_for_log = topk_grad_norms(model.named_parameters(), k=5)
-            opt.step()
+            if use_grad_scaler:
+                grad_scaler.step(opt)
+                grad_scaler.update()
+            else:
+                opt.step()
             if args.row_max_norm_enable:
                 affected_param_count, total_param_count = apply_row_max_norm_projection_(
                     row_max_norm_targets, c=float(args.row_max_norm_c)
@@ -2188,10 +2869,12 @@ def main():
                             f"new_lrs={[f'{x:.6e}' for x in updated_lrs]}"
                         )
 
-            pre_grad_norm_sum_since_log += pre_grad_norm
-            pre_grad_norm_steps_since_log += 1
-            post_grad_norm_sum_since_log += post_grad_norm
-            post_grad_norm_steps_since_log += 1
+            if math.isfinite(pre_grad_norm):
+                pre_grad_norm_sum_since_log += pre_grad_norm
+                pre_grad_norm_steps_since_log += 1
+            if math.isfinite(post_grad_norm):
+                post_grad_norm_sum_since_log += post_grad_norm
+                post_grad_norm_steps_since_log += 1
             if track_r_metrics and math.isfinite(r_value):
                 r_sum_since_log += r_value
                 r_steps_since_log += 1
@@ -2275,9 +2958,21 @@ def main():
                         ent_parts.append(f"{k}={avg_v:.6f}")
                     if ent_parts:
                         log_msg += ", " + ", ".join(ent_parts)
+                if mix_enabled:
+                    mix_total = sum(mix_bucket_batches_since_log.values())
+                    if mix_total > 0:
+                        mix_parts = []
+                        for name in ("distill", "wiki", "coco"):
+                            c = int(mix_bucket_batches_since_log.get(name, 0))
+                            if c <= 0:
+                                continue
+                            mix_parts.append(f"{name}:{c}/{mix_total} ({(100.0 * c / mix_total):.1f}%)")
+                        if mix_parts:
+                            log_msg += ", MixDraws[" + ", ".join(mix_parts) + "]"
                 if log_top_grad_norms:
                     log_msg += f", {format_top_grad_norms(top_grad_norms_for_log)}"
                 logger.log(log_msg)
+                _log_cuda_mem(logger=logger, device=device, scope="train_log", step=int(global_step))
 
                 log_start = time.perf_counter()
                 tokens_since_log = 0
@@ -2294,12 +2989,18 @@ def main():
                 r_group_steps_since_log = {k: 0 for k in R_METRIC_GROUP_KEYS}
                 attn_entropy_sum_since_log = defaultdict(float)
                 attn_entropy_count_since_log = defaultdict(int)
+                if not (int(args.run_probes) > 0 and (global_step % int(args.run_probes) == 0)):
+                    latest_cap_sample = {}
                 agc_clipped_params_since_log = 0
                 agc_total_params_since_log = 0
                 row_max_norm_affected_params_since_log = 0
                 row_max_norm_total_params_since_log = 0
+                mix_bucket_batches_since_log = {k: 0 for k in ("distill", "wiki", "coco")}
 
             if args.eval_every_steps > 0 and global_step % args.eval_every_steps == 0:
+                if device == "cuda":
+                    torch.cuda.reset_peak_memory_stats()
+                _log_cuda_mem(logger=logger, device=device, scope="eval_start", step=int(global_step))
                 eval_t0 = time.perf_counter()
                 val_metrics = evaluate_model(
                     model=model,
@@ -2307,6 +3008,8 @@ def main():
                     device=device,
                     pad_id=args.pad_id,
                     vocab_size=args.vocab_size,
+                    amp_enabled=amp_enabled,
+                    amp_dtype=amp_dtype,
                     z_loss_enable=z_loss_enabled,
                     z_loss_coef=z_loss_coef,
                     max_tokens=0,
@@ -2320,13 +3023,33 @@ def main():
                     f"PPL={val_metrics['ppl']:.4f} Entropy={val_metrics['entropy']:.6f} "
                     f"tokens={val_metrics['tokens']} steps={val_metrics['steps']}"
                 )
+                eval_elapsed = max(0.0, time.perf_counter() - eval_t0)
+                _log_cuda_mem(
+                    logger=logger,
+                    device=device,
+                    scope="eval_end",
+                    step=int(global_step),
+                    duration_s=eval_elapsed,
+                )
+                if bool(int(args.debug_cuda_empty_cache)) and device == "cuda":
+                    torch.cuda.empty_cache()
+                    _log_cuda_mem(
+                        logger=logger,
+                        device=device,
+                        scope="eval_after_empty_cache",
+                        step=int(global_step),
+                    )
                 # Keep training Tokens/s from being penalized by eval wall-time.
-                log_start += max(0.0, time.perf_counter() - eval_t0)
+                log_start += eval_elapsed
+                del val_metrics
 
             probe_due = int(args.run_probes) > 0 and global_step % int(args.run_probes) == 0
             if probe_due and probe_after_log_only and (global_step % int(args.log_every) != 0):
                 probe_due = False
             if probe_due:
+                if device == "cuda":
+                    torch.cuda.reset_peak_memory_stats()
+                _log_cuda_mem(logger=logger, device=device, scope="probe_start", step=int(global_step))
                 probe_t0 = time.perf_counter()
                 probe_summary = run_debug_probes(
                     model=model,
@@ -2368,13 +3091,37 @@ def main():
                 ):
                     v = agg.get(k, float("nan"))
                     agg_items.append(f"{k}={v:.6f}" if isinstance(v, (int, float)) else f"{k}=nan")
+                cap_items = []
+                if track_caps and len(latest_cap_sample) > 0:
+                    for k in sorted(latest_cap_sample.keys()):
+                        cap_items.append(f"{k}={float(latest_cap_sample[k]):.6f}")
+                cap_blob = (" " + " ".join(cap_items)) if cap_items else ""
                 logger.log(
                     f"\nProbeDebugSummary Step={global_step} probes={probe_summary['num_probes']} "
                     f"{' '.join(agg_items)} "
+                    f"{cap_blob}"
                     f"artifacts={os.path.join(LOGDIR, args.run_id, 'probe_debug')}"
                 )
+                latest_cap_sample = {}
+                probe_elapsed = max(0.0, time.perf_counter() - probe_t0)
+                _log_cuda_mem(
+                    logger=logger,
+                    device=device,
+                    scope="probe_end",
+                    step=int(global_step),
+                    duration_s=probe_elapsed,
+                )
+                if bool(int(args.debug_cuda_empty_cache)) and device == "cuda":
+                    torch.cuda.empty_cache()
+                    _log_cuda_mem(
+                        logger=logger,
+                        device=device,
+                        scope="probe_after_empty_cache",
+                        step=int(global_step),
+                    )
                 # Keep training Tokens/s from being penalized by probe wall-time.
-                log_start += max(0.0, time.perf_counter() - probe_t0)
+                log_start += probe_elapsed
+                del probe_summary, agg, agg_items
 
             if global_step % args.ckpt_every == 0:
                 ckpt_path = os.path.join(LOGDIR, args.run_id, f"step_{global_step}.tar")
@@ -2421,6 +3168,12 @@ def main():
                                 row_max_norm_affected_params_since_log
                             ),
                             "row_max_norm_total_params_since_log": int(row_max_norm_total_params_since_log),
+                            "mix_bucket_batches_since_log": {
+                                k: int(v) for k, v in mix_bucket_batches_since_log.items()
+                            },
+                            "mix_bucket_batches_total": {
+                                k: int(v) for k, v in mix_bucket_batches_total.items()
+                            },
                             "running_ce_tokens": int(running_ce_tokens),
                             "running_ce_loss_sum": float(running_ce_loss_sum),
                             "running_ce_window": [list(x) for x in running_ce_window],
@@ -2435,17 +3188,30 @@ def main():
         if args.max_steps is not None and global_step >= args.max_steps:
             break
 
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    _log_cuda_mem(logger=logger, device=device, scope="test_eval_start", step=int(global_step))
+    test_eval_t0 = time.perf_counter()
     test_metrics = evaluate_model(
         model=model,
         loader=test_loader,
         device=device,
         pad_id=args.pad_id,
         vocab_size=args.vocab_size,
+        amp_enabled=amp_enabled,
+        amp_dtype=amp_dtype,
         z_loss_enable=z_loss_enabled,
         z_loss_coef=z_loss_coef,
         max_tokens=max(0, int(args.test_max_tokens)),
         max_steps=max(0, int(args.test_steps)),
         pin_memory=eval_pin_memory,
+    )
+    _log_cuda_mem(
+        logger=logger,
+        device=device,
+        scope="test_eval_end",
+        step=int(global_step),
+        duration_s=max(0.0, time.perf_counter() - test_eval_t0),
     )
     logger.log(
         "Test "

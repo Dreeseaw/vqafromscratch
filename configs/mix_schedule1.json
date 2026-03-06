@@ -1,0 +1,5 @@
+  [
+    {"start_step":1,"end_step":2000,"weights":{ "distill": 0, "wiki": 1.0, "coco":0 }},
+    {"start_step":2001,"end_step":12000,"weights":{ "distill": 0.1, "wiki": 0.9, "coco":0 }},
+    {"start_step":12001,"end_step":null,"weights":{ "distill": 0.3, "wiki": 0.7, "coco":0 }}
+  ]
