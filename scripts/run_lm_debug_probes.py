@@ -45,6 +45,7 @@ def _load_model_from_ckpt(ckpt_path: str, device: str):
         tie_embeds=bool(cfg_raw.get("tie_embeds", False)),
         causal_lm=bool(cfg_raw.get("causal_lm", True)),
         activation_checkpointing=bool(cfg_raw.get("activation_checkpointing", False)),
+        swiglu=bool(cfg_raw.get("swiglu", False)),
         attn_impl=str(cfg_raw.get("attn_impl", "sdpa")),
         sdp_backend=str(cfg_raw.get("sdp_backend", "auto")),
         cosine_attn=bool(cfg_raw.get("cosine_attn", False)),

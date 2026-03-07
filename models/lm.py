@@ -211,6 +211,25 @@ def _cap_norm_mean(
     return float(vals.mean().item())
 
 
+class FeedForward(nn.Module):
+    def __init__(self, embed_size: int, mlp_ratio: int, swiglu: bool = False):
+        super().__init__()
+        hidden_size = int(embed_size * mlp_ratio)
+        self._swiglu = bool(swiglu)
+        if self._swiglu:
+            self._gate_up = nn.Linear(embed_size, 2 * hidden_size)
+            self._down = nn.Linear(hidden_size, embed_size)
+        else:
+            self._up = nn.Linear(embed_size, hidden_size)
+            self._down = nn.Linear(hidden_size, embed_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._swiglu:
+            gate, up = self._gate_up(x).chunk(2, dim=-1)
+            return self._down(F.silu(gate) * up)
+        return self._down(F.gelu(self._up(x)))
+
+
 class LMConfig:
     """
     Store all LM configurables - including arch & training params, all in one place
@@ -238,6 +257,7 @@ class LMConfig:
         cap_mlp_out_norm: float = 0.0,
         cap_out_mode: str = "token",
         cap_keep_masked: bool = True,
+        swiglu: bool = False,
         logit_softcap: float = 0.0,
         config_file: str = None, 
     ):
@@ -263,6 +283,7 @@ class LMConfig:
         self.cap_mlp_out_norm = cap_mlp_out_norm
         self.cap_out_mode = cap_out_mode
         self.cap_keep_masked = cap_keep_masked
+        self.swiglu = swiglu
         self.logit_softcap = logit_softcap
         self._config_file = config_file
 
@@ -303,6 +324,7 @@ class LMConfig:
         if self.cap_out_mode not in ("token", "token_head", "token_global"):
             raise ValueError("cap_out_mode must be one of: token, token_head, token_global.")
         self.cap_keep_masked = bool(self.cap_keep_masked)
+        self.swiglu = bool(self.swiglu)
         self.logit_softcap = float(self.logit_softcap)
         if self.logit_softcap < 0.0:
             raise ValueError("logit_softcap must be >= 0.0.")
@@ -380,10 +402,10 @@ class TransformerEncoderBlock(nn.Module):
         self._mlp_dropout = nn.Dropout(self._dropout_p)
 
         # MLP sublayer
-        self._mlp = nn.Sequential(
-            nn.Linear(config.embed_size, config.embed_size*config.mlp_ratio),
-            nn.GELU(),
-            nn.Linear(config.embed_size*config.mlp_ratio, config.embed_size),
+        self._mlp = FeedForward(
+            embed_size=config.embed_size,
+            mlp_ratio=config.mlp_ratio,
+            swiglu=bool(getattr(config, "swiglu", False)),
         )
 
     def _attn(
@@ -644,10 +666,10 @@ class TransformerDecoderBlock(nn.Module):
         self._cross_out_proj = nn.Linear(E, E)
 
         # MLP sublayer
-        self._mlp = nn.Sequential(
-            nn.Linear(config.embed_size, config.embed_size*config.mlp_ratio),
-            nn.GELU(),
-            nn.Linear(config.embed_size*config.mlp_ratio, config.embed_size),
+        self._mlp = FeedForward(
+            embed_size=config.embed_size,
+            mlp_ratio=config.mlp_ratio,
+            swiglu=bool(getattr(config, "swiglu", False)),
         )
 
     def _attn(

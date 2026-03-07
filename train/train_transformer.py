@@ -621,6 +621,113 @@ class WarmupScheduler:
         return lr
 
 
+class CombinedOptimizer:
+    def __init__(self, optimizers: Sequence[torch.optim.Optimizer]):
+        self._optimizers = [opt for opt in optimizers if opt is not None]
+        if not self._optimizers:
+            raise ValueError("CombinedOptimizer requires at least one optimizer.")
+        self.defaults = {}
+        self._sync_views()
+
+    def _sync_views(self) -> None:
+        self.param_groups = []
+        self.state = {}
+        for opt in self._optimizers:
+            self.param_groups.extend(opt.param_groups)
+            self.state.update(opt.state)
+        self._step_supports_amp_scaling = any(
+            bool(getattr(opt, "_step_supports_amp_scaling", False))
+            for opt in self._optimizers
+        )
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        for opt in self._optimizers:
+            opt.zero_grad(set_to_none=set_to_none)
+
+    def step(self, closure=None):
+        loss = None
+        for idx, opt in enumerate(self._optimizers):
+            step_loss = opt.step(closure if idx == 0 else None)
+            if loss is None:
+                loss = step_loss
+        self._sync_views()
+        return loss
+
+    def state_dict(self) -> dict:
+        return {
+            "combined_optimizer": True,
+            "sub_optimizers": [
+                {
+                    "name": type(opt).__name__,
+                    "state_dict": opt.state_dict(),
+                }
+                for opt in self._optimizers
+            ],
+        }
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        if not isinstance(state_dict, dict) or not bool(state_dict.get("combined_optimizer", False)):
+            raise ValueError("Unsupported CombinedOptimizer state dict.")
+        sub_optimizers = state_dict.get("sub_optimizers")
+        if not isinstance(sub_optimizers, list) or len(sub_optimizers) != len(self._optimizers):
+            raise ValueError("CombinedOptimizer state dict does not match optimizer layout.")
+        for opt, payload in zip(self._optimizers, sub_optimizers):
+            if not isinstance(payload, dict) or "state_dict" not in payload:
+                raise ValueError("Malformed CombinedOptimizer state payload.")
+            opt.load_state_dict(payload["state_dict"])
+        self._sync_views()
+
+
+def _split_param_groups_for_muon(
+    param_groups: Sequence[dict],
+    min_matrix_dim: int = 0,
+) -> Tuple[List[dict], List[dict]]:
+    min_matrix_dim = max(0, int(min_matrix_dim))
+    muon_groups: List[dict] = []
+    fallback_groups: List[dict] = []
+    for group in param_groups:
+        params = list(group.get("params", []))
+        if not params:
+            continue
+        base_group = {k: v for k, v in group.items() if k != "params"}
+        wants_muon = bool(base_group.get("use_muon", False))
+        muon_params = []
+        fallback_params = []
+        for param in params:
+            if (
+                wants_muon
+                and param.ndim == 2
+                and min(param.shape) >= min_matrix_dim
+            ):
+                muon_params.append(param)
+            else:
+                fallback_params.append(param)
+        if muon_params:
+            muon_group = dict(base_group)
+            muon_group["params"] = muon_params
+            muon_groups.append(muon_group)
+        if fallback_params:
+            fallback_group = dict(base_group)
+            fallback_group["params"] = fallback_params
+            fallback_groups.append(fallback_group)
+    return muon_groups, fallback_groups
+
+
+def _muon_candidate_min_dims(param_groups: Sequence[dict]) -> List[int]:
+    out: List[int] = []
+    for group in param_groups:
+        params = list(group.get("params", []))
+        if not params:
+            continue
+        wants_muon = bool(group.get("use_muon", False))
+        if not wants_muon:
+            continue
+        for param in params:
+            if param.ndim == 2:
+                out.append(int(min(param.shape)))
+    return out
+
+
 ### Training
 
 
@@ -1022,6 +1129,7 @@ def build_optimizer_param_groups(
                     "weight_decay": group_weight_decay,
                     "lr_scale": lr_scale,
                     "lr": float(base_lr) * lr_scale,
+                    "use_muon": key.startswith("main_"),
                 }
             )
         return out
@@ -1087,6 +1195,7 @@ def build_optimizer_param_groups(
                 "weight_decay": group_weight_decay,
                 "lr_scale": lr_scale,
                 "lr": float(base_lr) * lr_scale,
+                "use_muon": key.startswith("main_"),
             }
         )
     return out
@@ -1541,6 +1650,11 @@ def main():
         help="Use decoder-only Transformer (no encoder/cross-attention path).",
     )
     parser.add_argument("--ff_mult", type=int, default=2)
+    parser.add_argument(
+        "--swiglu",
+        action="store_true",
+        help="Use SwiGLU gated MLP blocks instead of GELU MLPs.",
+    )
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument(
         "--precision",
@@ -1640,7 +1754,24 @@ def main():
         default=1.0,
         help="Scale factor for decoder cross-attention parameter LR (_cross_q/_cross_kv/_cross_out_proj/_ls_cross_attn).",
     )
-    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adam", "adamw"])
+    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adam", "adamw", "muon"])
+    parser.add_argument(
+        "--muon",
+        action="store_true",
+        help="Use Muon optimizer (shorthand for --optimizer muon).",
+    )
+    parser.add_argument(
+        "--muon_ns_steps",
+        type=int,
+        default=5,
+        help="Newton-Schulz iterations per Muon optimizer step (lower is faster).",
+    )
+    parser.add_argument(
+        "--muon_min_matrix_dim",
+        type=int,
+        default=0,
+        help="Only apply Muon to 2D params where min(rows, cols) >= this value.",
+    )
     parser.add_argument("--warmup_ratio", type=float, default=0.04)
     parser.add_argument("--schedule", type=str, default="cosine", choices=["cosine", "flat", "stair"])
     parser.add_argument("--max_steps", type=int, default=None)
@@ -1843,6 +1974,10 @@ def main():
     parser.set_defaults(activation_checkpointing=True)
 
     args = parser.parse_args()
+    if bool(args.muon):
+        args.optimizer = "muon"
+    args.muon_ns_steps = max(1, int(args.muon_ns_steps))
+    args.muon_min_matrix_dim = max(0, int(args.muon_min_matrix_dim))
 
     # device selection
     device = "cpu"
@@ -2145,6 +2280,7 @@ def main():
         max_seq_len=args.max_seq_len,
         tie_embeds=args.tie_embeddings,
         activation_checkpointing=args.activation_checkpointing,
+        swiglu=bool(args.swiglu),
         attn_impl=args.attn_impl,
         sdp_backend=args.sdp_backend,
         cosine_attn=args.cosine_attn,
@@ -2184,7 +2320,7 @@ def main():
 
     if args.optimizer == "adam":
         opt = torch.optim.Adam(param_groups, lr=args.lr, weight_decay=0.0)
-    else:
+    elif args.optimizer == "adamw":
         opt = torch.optim.AdamW(
             param_groups,
             lr=args.lr,
@@ -2192,6 +2328,49 @@ def main():
             eps=1e-6,
             weight_decay=0.0,
         )
+    else:
+        if not hasattr(torch.optim, "Muon"):
+            raise SystemExit(
+                f"--optimizer muon requested but torch.optim.Muon is unavailable in torch {torch.__version__}."
+            )
+        muon_param_groups, adamw_param_groups = _split_param_groups_for_muon(
+            param_groups,
+            min_matrix_dim=int(args.muon_min_matrix_dim),
+        )
+        if not muon_param_groups:
+            candidate_min_dims = _muon_candidate_min_dims(param_groups)
+            if candidate_min_dims:
+                lo = int(min(candidate_min_dims))
+                hi = int(max(candidate_min_dims))
+                raise RuntimeError(
+                    "Muon optimizer requested but no Muon-eligible parameter groups were found "
+                    f"(muon_min_matrix_dim={int(args.muon_min_matrix_dim)}). "
+                    f"Observed Muon-candidate matrix min-dim range is [{lo}, {hi}]. "
+                    f"Try --muon_min_matrix_dim <= {hi} (or 0 to disable size filtering)."
+                )
+            raise RuntimeError(
+                "Muon optimizer requested but no Muon-candidate 2D parameter groups were found. "
+                "Use --optimizer adamw, or inspect parameter-group tagging for Muon."
+            )
+        muon_opt = torch.optim.Muon(
+            muon_param_groups,
+            lr=args.lr,
+            momentum=0.95,
+            nesterov=True,
+            ns_steps=int(args.muon_ns_steps),
+            weight_decay=0.0,
+            adjust_lr_fn="match_rms_adamw",
+        )
+        aux_adamw_opt = None
+        if adamw_param_groups:
+            aux_adamw_opt = torch.optim.AdamW(
+                adamw_param_groups,
+                lr=args.lr,
+                betas=(0.9, 0.95),
+                eps=1e-6,
+                weight_decay=0.0,
+            )
+        opt = CombinedOptimizer([muon_opt, aux_adamw_opt])
 
     train_microbatches_per_epoch = (
         sum(int(info["sampler"].batches_per_epoch) for info in bucket_stats_by_bucket.values())
@@ -2229,9 +2408,18 @@ def main():
         ckpt_file = os.path.join(LOGDIR, args.run_id, f"step_{args.checkpoint}.tar")
         checkpoint = torch.load(ckpt_file, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer_resume_status = load_optimizer_state_compat(opt, checkpoint["optimizer_state_dict"])
-        if optimizer_resume_status == "failed":
-            raise RuntimeError("Unable to load optimizer checkpoint with current parameter-group layout.")
+        checkpoint_optimizer_name = str(checkpoint.get("optimizer_name", "")).strip().lower()
+        current_optimizer_name = str(args.optimizer).strip().lower()
+        should_skip_optimizer_state = (
+            (current_optimizer_name == "muon" and checkpoint_optimizer_name != "muon")
+            or (checkpoint_optimizer_name == "muon" and current_optimizer_name != "muon")
+        )
+        if should_skip_optimizer_state:
+            optimizer_resume_status = "skipped_type_mismatch"
+        else:
+            optimizer_resume_status = load_optimizer_state_compat(opt, checkpoint["optimizer_state_dict"])
+            if optimizer_resume_status == "failed":
+                raise RuntimeError("Unable to load optimizer checkpoint with current parameter-group layout.")
         global_step = int(checkpoint.get("global_step", 0))
         scheduler.step_num = int(checkpoint.get("scheduler_step_num", global_step))
         resume_epoch = int(checkpoint.get("epoch", 0))
@@ -2243,6 +2431,7 @@ def main():
     logger = Logger(args.run_id, args.checkpoint)
     log_params(model, logger)
     logger.log(f"batch size: {args.batch_size}")
+    logger.log(f"optimizer: {args.optimizer}")
     logger.log(
         f"grad accumulation: {int(args.grad_accum_steps)} "
         f"(effective batch size: {int(args.batch_size) * int(args.grad_accum_steps)})"
@@ -2251,6 +2440,7 @@ def main():
     logger.log(f"Running on {device}\n")
     logger.log(f"Config: {vars(cfg)}\n")
     logger.log(f"model topology: {'decoder_only' if bool(args.decoder_only) else 'encoder_decoder'}")
+    logger.log(f"mlp backend: {'swiglu' if args.swiglu else 'gelu'}")
     logger.log(
         f"precision: {precision} "
         f"(autocast={'on' if amp_enabled else 'off'}, grad_scaler={'on' if use_grad_scaler else 'off'})"
@@ -2337,6 +2527,15 @@ def main():
     logger.log("optimizer lr scaling: _embed parameters use 0.5x base LR.")
     if args.half_lr_lm_head:
         logger.log("optimizer lr scaling: _unembed parameters use 0.5x base LR.")
+    if args.optimizer == "muon":
+        logger.log(
+            "muon: built-in torch.optim.Muon on main matrix parameter groups; "
+            "AdamW fallback on embeddings, lm_head, biases, and other non-Muon groups."
+        )
+        logger.log(
+            f"muon tuning: ns_steps={int(args.muon_ns_steps)}, "
+            f"min_matrix_dim={int(args.muon_min_matrix_dim)}"
+        )
     logger.log(
         "optimizer lr scaling: decoder cross-attn parameters "
         f"(_cross_q/_cross_kv/_cross_out_proj/_ls_cross_attn) use {float(args.dec_cross_attn_lr_scale):.4f}x."
@@ -2441,6 +2640,8 @@ def main():
         )
         if optimizer_resume_status == "migrated":
             logger.log("resume checkpoint: optimizer state migrated across parameter-group layout.")
+        elif optimizer_resume_status == "skipped_type_mismatch":
+            logger.log("resume checkpoint: optimizer state skipped because optimizer type changed.")
 
     model.train()
     opt.zero_grad(set_to_none=True)
@@ -3137,6 +3338,7 @@ def main():
                         "batch_in_epoch": next_batch_in_epoch,
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": opt.state_dict(),
+                        "optimizer_name": str(args.optimizer),
                         "scheduler_step_num": int(scheduler.step_num),
                         "rng_state": capture_rng_state(),
                         "lr_anneal_state": (

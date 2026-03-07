@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.6
-FROM pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime
+FROM pytorch/pytorch:2.9.0-cuda12.8-cudnn9-runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -27,4 +27,3 @@ USER appuser
 
 # Default: your local command
 CMD ["python", "-m", "train.train_transformer", "lm_drop2"]
-

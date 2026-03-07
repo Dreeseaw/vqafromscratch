@@ -70,7 +70,7 @@ serve({
     // MAIN PAGE
     // -------------------------
     if (url.pathname === "/") {
-      return new Response(await Bun.file("index.html").text(), {
+      return new Response(await Bun.file("tracker/index.html").text(), {
         headers: { "Content-Type": "text/html" },
       });
     }

@@ -20,11 +20,10 @@ docker run --rm -it --gpus all -v "$(pwd)":/app -w /app myrepo:gpu \
 		--tokenizer logs/mix_bpe_16k/tokenizer.pt \
 		--tie_embeddings --debug_cuda_empty_cache=1 \
 		--epochs=100 --warmup_ratio=0.004 \
-		--enc_layers=8 --dec_layers=8 --ff_mult=2 --d_model=384 --n_heads=6 \
-		--attn_impl sdpa --sdp_backend auto --precision bf16 \
 		--num_workers=8 --persistent_workers --prefetch_factor 8 \
 		--run_probes=1000 --probe_after_log_only --eval_every_steps=5000 \
 		--decoder_only --dec_layers=12 --ff_mult=2 --n_heads=8 --d_model=512 \
-		--no_activation_checkpointing --sdp_backend=flash --precision=bf16 \
-		--probe_layers=0,1,2,3,4,5,6,7,8,9,10,11 \
+		--attn_impl sdpa --no_activation_checkpointing --sdp_backend=flash --precision=bf16 \
+		--swiglu --row_max_norm_c=2.0 --probe_layers=0,3,7,11 \
+		--muon --muon_ns_steps=5 --muon_min_matrix_dim=100 --lr=0.001 \
 		"${EXTRA_ARGS[@]}"
