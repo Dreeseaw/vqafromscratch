@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MM Tracker</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --panel: #151b23;
+      --panel2: #1a2230;
+      --text: #d7e0ea;
+      --muted: #8ea0b5;
+      --ok: #26c281;
+      --warn: #f4b400;
+      --accent: #4ca3ff;
+      --accent2: #ff8f3f;
+      --line: #2a3647;
+      --mono: "JetBrains Mono", "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      --sans: "Avenir Next", "Segoe UI", Helvetica, Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      color: var(--text);
+      background: radial-gradient(1200px 700px at 85% -10%, #1a2a42 0%, transparent 50%), var(--bg);
+    }
+
+    .wrap {
+      width: min(1400px, 96vw);
+      margin: 18px auto 40px;
+    }
+
+    .header {
+      display: flex;
+      gap: 12px;
+      align-items: baseline;
+      justify-content: space-between;
+      margin-bottom: 12px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 20px;
+      letter-spacing: 0.4px;
+    }
+
+    .muted { color: var(--muted); }
+    .mono { font-family: var(--mono); }
+
+    .grid {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(12, 1fr);
+    }
+
+    .panel {
+      background: linear-gradient(180deg, var(--panel), var(--panel2));
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+    }
+
+    .panel h2 {
+      margin: 0 0 10px;
+      font-size: 14px;
+      color: #b8c6d8;
+      text-transform: uppercase;
+      letter-spacing: 0.7px;
+    }
+
+    .kpis {
+      grid-column: span 12;
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(6, minmax(120px, 1fr));
+    }
+
+    .kpi {
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px;
+    }
+
+    .kpi .label {
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 4px;
+    }
+
+    .kpi .value {
+      font-family: var(--mono);
+      font-size: 18px;
+      font-weight: 700;
+    }
+
+    .chart-panel { grid-column: span 6; }
+    canvas {
+      width: 100%;
+      height: 230px;
+      border-radius: 8px;
+      background: #0f151f;
+      border: 1px solid #253246;
+      display: block;
+    }
+
+    .fixed-panel { grid-column: span 12; }
+    .fixed-controls {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+    .fixed-controls label {
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+      color: var(--muted);
+      font-size: 12px;
+      user-select: none;
+    }
+    .thumb {
+      width: 92px;
+      height: 92px;
+      border-radius: 8px;
+      border: 1px solid #2b3a4f;
+      object-fit: cover;
+      background: #0b1119;
+      display: block;
+    }
+    .thumb-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      align-items: flex-start;
+    }
+    .thumb-note {
+      font-size: 11px;
+      color: var(--muted);
+      font-family: var(--mono);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    th, td {
+      text-align: left;
+      border-bottom: 1px solid #253246;
+      padding: 8px;
+      vertical-align: top;
+    }
+    th {
+      color: #b8c6d8;
+      font-weight: 700;
+      font-size: 12px;
+      letter-spacing: 0.4px;
+      text-transform: uppercase;
+    }
+
+    .events-panel { grid-column: span 12; max-height: 240px; overflow: auto; }
+    .event-row {
+      font-family: var(--mono);
+      font-size: 12px;
+      padding: 4px 0;
+      border-bottom: 1px dotted #223146;
+      color: #9fb0c5;
+    }
+
+    @media (max-width: 1080px) {
+      .chart-panel { grid-column: span 12; }
+      .kpis { grid-template-columns: repeat(3, minmax(120px, 1fr)); }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="header">
+      <h1>Multimodal Training Tracker</h1>
+      <div class="muted mono" id="meta"></div>
+    </div>
+
+    <div class="grid">
+      <div class="panel kpis" id="kpiPanel">
+        <div class="kpi"><div class="label">Last Step</div><div class="value" id="kStep">-</div></div>
+        <div class="kpi"><div class="label">Last Loss</div><div class="value" id="kLoss">-</div></div>
+        <div class="kpi"><div class="label">Loss Tokens</div><div class="value" id="kLossTok">-</div></div>
+        <div class="kpi"><div class="label">Steps / sec</div><div class="value" id="kSps">-</div></div>
+        <div class="kpi"><div class="label">Eval Split</div><div class="value" id="kEvalSplit">-</div></div>
+        <div class="kpi"><div class="label">Eval Acc</div><div class="value" id="kEvalAcc">-</div></div>
+      </div>
+
+      <div class="panel chart-panel">
+        <h2>Train Loss</h2>
+        <canvas id="lossChart" width="900" height="260"></canvas>
+      </div>
+      <div class="panel chart-panel">
+        <h2>Eval Accuracy</h2>
+        <canvas id="evalChart" width="900" height="260"></canvas>
+      </div>
+
+      <div class="panel fixed-panel">
+        <h2>Fixed 5 Questions (Latest Answers)</h2>
+        <div class="fixed-controls">
+          <div class="muted mono" id="fixedHint"></div>
+          <label><input type="checkbox" id="showImages" checked /> Show images</label>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Image</th>
+              <th>Question ID</th>
+              <th>Image ID</th>
+              <th>Question</th>
+              <th>Latest Prediction</th>
+            </tr>
+          </thead>
+          <tbody id="fixedBody"></tbody>
+        </table>
+      </div>
+
+      <div class="panel events-panel">
+        <h2>Event Feed</h2>
+        <div id="events"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const state = {
+      runDir: "",
+      logfiles: [],
+      train: [],
+      evalOverall: [],
+      fixedPrompts: [],
+      fixedAnswers: [],
+      fixedLatestByQid: new Map(),
+      latestEvalSplit: "",
+      showImages: true,
+    };
+
+    const $ = (id) => document.getElementById(id);
+    const fmt = (v, d=4) => Number.isFinite(v) ? Number(v).toFixed(d) : "-";
+
+    function pushEventLine(text) {
+      const parent = $("events");
+      const row = document.createElement("div");
+      row.className = "event-row";
+      row.textContent = text;
+      parent.prepend(row);
+      const maxRows = 300;
+      while (parent.children.length > maxRows) parent.removeChild(parent.lastChild);
+    }
+
+    function drawSeries(canvas, points, color, yLabel) {
+      const ctx = canvas.getContext("2d");
+      const w = canvas.width, h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+      ctx.fillStyle = "#0f151f";
+      ctx.fillRect(0, 0, w, h);
+      ctx.strokeStyle = "#253246";
+      ctx.lineWidth = 1;
+      for (let i = 0; i <= 4; i++) {
+        const y = 20 + (h - 40) * (i / 4);
+        ctx.beginPath();
+        ctx.moveTo(40, y);
+        ctx.lineTo(w - 10, y);
+        ctx.stroke();
+      }
+      ctx.fillStyle = "#9fb0c5";
+      ctx.font = "12px JetBrains Mono, monospace";
+      ctx.fillText(yLabel, 10, 14);
+      if (!points.length) return;
+
+      const xs = points.map((p) => p.x);
+      const ys = points.map((p) => p.y);
+      const minX = Math.min(...xs), maxX = Math.max(...xs);
+      const minY = Math.min(...ys), maxY = Math.max(...ys);
+      const xSpan = Math.max(1e-9, maxX - minX);
+      const ySpan = Math.max(1e-9, maxY - minY);
+
+      const xToPx = (x) => 40 + ((x - minX) / xSpan) * (w - 50);
+      const yToPx = (y) => (h - 20) - ((y - minY) / ySpan) * (h - 40);
+
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      points.forEach((p, i) => {
+        const x = xToPx(p.x), y = yToPx(p.y);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+      const last = points[points.length - 1];
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(xToPx(last.x), yToPx(last.y), 3.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    function renderKpis() {
+      const tr = state.train[state.train.length - 1];
+      $("kStep").textContent = tr ? String(tr.step) : "-";
+      $("kLoss").textContent = tr ? fmt(tr.loss, 4) : "-";
+      $("kLossTok").textContent = tr ? String(tr.lossTokens) : "-";
+      $("kSps").textContent = tr ? fmt(tr.stepsPerSec, 2) : "-";
+
+      const ev = state.evalOverall[state.evalOverall.length - 1];
+      $("kEvalSplit").textContent = ev ? ev.split : "-";
+      $("kEvalAcc").textContent = ev ? fmt(ev.accuracy, 4) : "-";
+    }
+
+    function renderCharts() {
+      drawSeries(
+        $("lossChart"),
+        state.train.map((x) => ({ x: x.step, y: x.loss })),
+        "#4ca3ff",
+        "loss"
+      );
+      drawSeries(
+        $("evalChart"),
+        state.evalOverall.map((x, i) => ({ x: i + 1, y: x.accuracy })),
+        "#ff8f3f",
+        "accuracy"
+      );
+    }
+
+    function applyLatestFixedAnswers() {
+      state.fixedLatestByQid.clear();
+      if (!state.fixedAnswers.length) return;
+      const last = state.fixedAnswers[state.fixedAnswers.length - 1];
+      for (const a of (last.answers || [])) {
+        state.fixedLatestByQid.set(Number(a.question_id), a.prediction);
+      }
+      $("fixedHint").textContent = `latest: step=${last.step} tag=${last.tag} split=${last.split} rows=${state.fixedAnswers.length}`;
+    }
+
+    function renderFixedTable() {
+      const body = $("fixedBody");
+      body.innerHTML = "";
+      for (const p of state.fixedPrompts) {
+        const tr = document.createElement("tr");
+        const pred = state.fixedLatestByQid.has(Number(p.question_id))
+          ? state.fixedLatestByQid.get(Number(p.question_id))
+          : "(not in latest eval slice)";
+        const imgPath = String(p.image_path || "");
+        const safePath = encodeURIComponent(imgPath);
+        const imgCell = state.showImages
+          ? `<div class="thumb-wrap"><img class="thumb" loading="lazy" src="/img?path=${safePath}" alt="fixed sample image" /><div class="thumb-note mono">${imgPath.replaceAll("<", "&lt;")}</div></div>`
+          : `<span class="muted mono">(hidden)</span>`;
+        tr.innerHTML = `
+          <td>${imgCell}</td>
+          <td class="mono">${p.question_id ?? "-"}</td>
+          <td class="mono">${p.image_id ?? "-"}</td>
+          <td>${(p.question ?? "").replaceAll("<", "&lt;")}</td>
+          <td class="mono">${String(pred ?? "null").replaceAll("<", "&lt;")}</td>
+        `;
+        body.appendChild(tr);
+      }
+    }
+
+    function applyEvent(ev) {
+      if (!ev || !ev.kind) return;
+      if (ev.kind === "train") {
+        const prev = state.train[state.train.length - 1];
+        if (!prev || prev.step !== ev.step) state.train.push(ev);
+        else state.train[state.train.length - 1] = ev;
+        pushEventLine(`train step=${ev.step} loss=${fmt(ev.loss, 4)} tok=${ev.lossTokens} sps=${fmt(ev.stepsPerSec, 2)}`);
+      } else if (ev.kind === "eval_overall") {
+        state.evalOverall.push(ev);
+        state.latestEvalSplit = ev.split;
+        pushEventLine(`eval split=${ev.split} acc=${fmt(ev.accuracy, 4)}`);
+      } else if (ev.kind === "fixed_eval") {
+        state.fixedAnswers.push(ev);
+        if (state.fixedAnswers.length > 500) state.fixedAnswers = state.fixedAnswers.slice(-500);
+        pushEventLine(`fixed step=${ev.step} tag=${ev.tag} split=${ev.split}`);
+      }
+      renderKpis();
+      renderCharts();
+      applyLatestFixedAnswers();
+      renderFixedTable();
+    }
+
+    async function boot() {
+      const boot = await fetch("/api/bootstrap").then((r) => r.json());
+      state.runDir = boot.runDir || "";
+      state.logfiles = boot.logfiles || [];
+      state.fixedPrompts = boot.fixedPrompts || [];
+      state.fixedAnswers = boot.fixedAnswers || [];
+      $("meta").textContent = `${state.runDir} | logs=${state.logfiles.join(",")}`;
+      applyLatestFixedAnswers();
+      renderFixedTable();
+      for (const ev of (boot.events || [])) applyEvent(ev);
+    }
+
+    function stream() {
+      const es = new EventSource("/stream");
+      es.onmessage = (e) => {
+        try {
+          applyEvent(JSON.parse(e.data));
+        } catch {}
+      };
+      es.onerror = () => {
+        pushEventLine("stream disconnected, retrying...");
+      };
+    }
+
+    window.addEventListener("resize", renderCharts);
+    $("showImages").addEventListener("change", (e) => {
+      state.showImages = !!e.target.checked;
+      renderFixedTable();
+    });
+    boot().then(stream);
+  </script>
+</body>
+</html>
