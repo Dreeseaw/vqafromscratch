@@ -347,6 +347,7 @@ class VQAv2Dataset(Dataset):
                 "image_id": image_id,
                 "question": question,
                 "answer": canonical,
+                "all_answers_raw": raw_answers,
                 "all_answers": [normalize_vqa_answer(a) for a in raw_answers if normalize_vqa_answer(a)],
                 "metadata": {
                     "split": split,
@@ -385,6 +386,7 @@ class VQAv2Dataset(Dataset):
             "image": img_t,
             "question": item["question"],
             "answer": item["answer"],
+            "all_answers_raw": item.get("all_answers_raw", []),
             "all_answers": item["all_answers"],
             "question_id": item["question_id"],
             "image_id": item["image_id"],

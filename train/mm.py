@@ -171,6 +171,8 @@ def _apply_runtime_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "bridge_hidden_dim": 1024,
         "num_visual_tokens": 8,
         "bridge_token_reduce": "adaptive_pool",
+        "bridge_learned_init_std": 0.02,
+        "bridge_add_2d_pos_emb": False,
         "images_root": "images",
         "annotations_root": "annotations",
         "max_question_length": 64,
@@ -367,8 +369,14 @@ class MultimodalPrefixLM(nn.Module):
         *,
         debug_shapes: bool = False,
     ) -> Tuple[torch.Tensor, int]:
-        visual_features = self.vision_adapter(images)
-        visual_prefix = self.bridge(visual_features)
+        needs_visual = bool(getattr(self.bridge, "requires_visual_features", True))
+        visual_features: Optional[torch.Tensor] = None
+        if needs_visual:
+            visual_features = self.vision_adapter(images)
+            visual_prefix = self.bridge(visual_features)
+        else:
+            # Image-agnostic bridge baselines only need batch size/device from images.
+            visual_prefix = self.bridge(images)
         text_emb = self.lm._embed_dropout(self.lm._embed(input_ids))
         x = torch.cat([visual_prefix, text_emb], dim=1)
 
@@ -399,7 +407,10 @@ class MultimodalPrefixLM(nn.Module):
             logits = self.lm._lm_head(hidden)
         if debug_shapes:
             print(f"[mm:shape] images={tuple(images.shape)}")
-            print(f"[mm:shape] visual_features={tuple(visual_features.shape)}")
+            if visual_features is None:
+                print("[mm:shape] visual_features=<skipped by bridge>")
+            else:
+                print(f"[mm:shape] visual_features={tuple(visual_features.shape)}")
             print(f"[mm:shape] visual_prefix={tuple(visual_prefix.shape)}")
             print(f"[mm:shape] text_ids={tuple(input_ids.shape)} text_emb={tuple(text_emb.shape)}")
             print(f"[mm:shape] combined={tuple(x.shape)} logits={tuple(logits.shape)}")
@@ -548,6 +559,7 @@ class QACollator:
             "image_ids": [int(s["image_id"]) for s in samples],
             "questions": [s["question"] for s in samples],
             "answers": [s["answer"] for s in samples],
+            "all_answers_raw": [s.get("all_answers_raw", []) for s in samples],
             "all_answers": [s["all_answers"] for s in samples],
             "metadata": [s["metadata"] for s in samples],
         }
@@ -668,16 +680,22 @@ def _maybe_initialize_bridge_from_state_dict(model: MultimodalPrefixLM, state_di
         return
     if getattr(bridge, "_input_dim", None) is not None:
         return
-    in_dim = None
-    for key in ("bridge._token_proj.0.weight", "bridge._global_proj.0.weight"):
-        w = state_dict.get(key)
-        if torch.is_tensor(w) and w.ndim == 2:
-            in_dim = int(w.shape[1])
-            break
-    if in_dim is None:
+
+    w_tok = state_dict.get("bridge._token_proj.0.weight")
+    w_glb = state_dict.get("bridge._global_proj.0.weight")
+    has_tok = torch.is_tensor(w_tok) and w_tok.ndim == 2
+    has_glb = torch.is_tensor(w_glb) and w_glb.ndim == 2
+    if not has_tok and not has_glb:
         return
+
     ref = model.lm._embed.weight
-    bridge._ensure_built(in_dim, device=ref.device, dtype=ref.dtype)
+    if has_tok and hasattr(bridge, "_ensure_token_built"):
+        bridge._ensure_token_built(int(w_tok.shape[1]), device=ref.device, dtype=ref.dtype)
+    if has_glb and hasattr(bridge, "_ensure_global_built"):
+        bridge._ensure_global_built(int(w_glb.shape[1]), device=ref.device, dtype=ref.dtype)
+    if (has_tok and has_glb) and hasattr(bridge, "_ensure_built"):
+        # Older checkpoints may contain both branches; ensure both are present.
+        bridge._ensure_built(int(w_tok.shape[1]), device=ref.device, dtype=ref.dtype)
 
 
 def save_mm_checkpoint(
@@ -742,6 +760,8 @@ def build_runtime_from_args(
         "bridge_hidden_dim": args.bridge_hidden_dim,
         "input_feature_mode": args.vision_feature_mode,
         "token_reduce": args.bridge_token_reduce,
+        "learned_init_std": args.bridge_learned_init_std,
+        "add_2d_pos_emb": bool(args.bridge_add_2d_pos_emb),
     }
     if checkpoint_payload is not None and isinstance(checkpoint_payload.get("bridge_config"), dict):
         bcfg_data.update(dict(checkpoint_payload["bridge_config"]))
@@ -818,6 +838,7 @@ def run_generation_predictions(
                     "question": batch["questions"][i],
                     "prediction": pred,
                     "canonical_answer": batch["answers"][i],
+                    "all_answers_raw": batch["all_answers_raw"][i],
                     "all_answers": batch["all_answers"][i],
                     "metadata": batch["metadata"][i],
                 }
@@ -894,16 +915,18 @@ def run_predictions_from_checkpoint(
     )
 
 
-def evaluate_records(records: Sequence[Dict[str, Any]], *, qualitative_samples: int, confusion_top_k: int) -> Dict[str, Any]:
+def evaluate_records(
+    records: Sequence[Dict[str, Any]], *, qualitative_samples: int, confusion_top_k: int, scorer: str = "official"
+) -> Dict[str, Any]:
     from evals.vqa import (
         build_confusion_summary,
         format_qualitative_samples,
         summarize_vqa_predictions,
     )
 
-    summary = summarize_vqa_predictions(records)
-    summary["qualitative"] = format_qualitative_samples(records, n=qualitative_samples)
-    summary["confusions"] = build_confusion_summary(records, top_k=confusion_top_k)
+    summary = summarize_vqa_predictions(records, scorer=scorer)
+    summary["qualitative"] = format_qualitative_samples(records, n=qualitative_samples, scorer=scorer)
+    summary["confusions"] = build_confusion_summary(records, top_k=confusion_top_k, scorer=scorer)
     return summary
 
 
@@ -993,7 +1016,8 @@ def print_eval_summary(logger: Logger, split: str, summary: Dict[str, Any]) -> N
     if overall is None:
         logger.log(f"[eval:{split}] no labels available; generated predictions only.")
         return
-    logger.log(f"[eval:{split}] overall_accuracy={overall:.4f}")
+    scorer = str(summary.get("scorer", "unknown"))
+    logger.log(f"[eval:{split}] overall_accuracy={overall:.4f} scorer={scorer}")
     by_answer = summary.get("answer_type_accuracy", {})
     if by_answer:
         logger.log(
@@ -1036,7 +1060,8 @@ def log_startup_config(
     )
     logger.log(
         f"[mm] bridge type={bridge_cfg.bridge_type} visual_tokens={bridge_cfg.num_visual_tokens} "
-        f"hidden={bridge_cfg.bridge_hidden_dim} token_reduce={bridge_cfg.token_reduce}"
+        f"hidden={bridge_cfg.bridge_hidden_dim} token_reduce={bridge_cfg.token_reduce} "
+        f"learned_init_std={bridge_cfg.learned_init_std:.6g} add_2d_pos_emb={int(bool(bridge_cfg.add_2d_pos_emb))}"
     )
     logger.log(
         f"[mm] freeze_mode={args.freeze_mode} train_top_lm_layers={args.train_top_lm_layers} "
@@ -1056,7 +1081,8 @@ def log_startup_config(
     logger.log(
         f"[mm] loop epochs={args.epochs} max_steps={args.max_steps} overfit_small_batch={int(bool(args.overfit_small_batch))} "
         f"log_every={args.log_every} eval_every={args.eval_every} eval_batches={args.eval_batches} "
-        f"eval_log_every={args.eval_log_every} fixed_eval_count={args.fixed_eval_count} ckpt_every={args.ckpt_every}"
+        f"eval_log_every={args.eval_log_every} eval_scorer={args.eval_scorer} "
+        f"fixed_eval_count={args.fixed_eval_count} ckpt_every={args.ckpt_every}"
     )
 
 
@@ -1107,9 +1133,21 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--tokenizer_path", type=str, default=None)
 
-    ap.add_argument("--bridge_type", type=str, default="mlp")
+    ap.add_argument("--bridge_type", type=str, default="mlp", choices=["mlp", "learned_tokens"])
     ap.add_argument("--bridge_hidden_dim", type=int, default=1024)
     ap.add_argument("--num_visual_tokens", type=int, default=8)
+    ap.add_argument(
+        "--bridge_add_2d_pos_emb",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Add 2D positional embeddings to visual token features before bridge projection.",
+    )
+    ap.add_argument(
+        "--bridge_learned_init_std",
+        type=float,
+        default=0.02,
+        help="Init std for --bridge_type learned_tokens.",
+    )
     ap.add_argument(
         "--bridge_token_reduce",
         type=str,
@@ -1160,6 +1198,13 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--limit_eval", type=int, default=0)
     ap.add_argument("--qualitative_samples", type=int, default=8)
     ap.add_argument("--confusion_top_k", type=int, default=20)
+    ap.add_argument(
+        "--eval_scorer",
+        type=str,
+        default="official",
+        choices=["official", "proxy"],
+        help="VQA metric scorer for eval summaries.",
+    )
     ap.add_argument("--save_predictions_jsonl", type=str, default=None)
     ap.add_argument("--debug_shapes", action="store_true")
     return ap.parse_args()
@@ -1298,6 +1343,7 @@ def main() -> None:
             records,
             qualitative_samples=int(args.qualitative_samples),
             confusion_top_k=int(args.confusion_top_k),
+            scorer=str(args.eval_scorer),
         )
         print_eval_summary(logger, args.eval_split, summary)
         append_fixed_eval_answers(
@@ -1396,6 +1442,7 @@ def main() -> None:
                     records,
                     qualitative_samples=int(args.qualitative_samples),
                     confusion_top_k=int(args.confusion_top_k),
+                    scorer=str(args.eval_scorer),
                 )
                 print_eval_summary(logger, args.eval_split, summary)
                 append_fixed_eval_answers(
@@ -1458,6 +1505,7 @@ def main() -> None:
         records,
         qualitative_samples=int(args.qualitative_samples),
         confusion_top_k=int(args.confusion_top_k),
+        scorer=str(args.eval_scorer),
     )
     print_eval_summary(logger, args.eval_split, summary)
     append_fixed_eval_answers(

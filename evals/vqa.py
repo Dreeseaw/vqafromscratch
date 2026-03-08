@@ -2,29 +2,272 @@
 VQA evaluation utilities.
 
 Role:
-- Compute VQAv2-style metrics and breakdowns from prediction records.
+- Compute VQAv2 metrics and breakdowns from prediction records.
 - Provide standalone checkpoint eval (`--mm_checkpoint`) without running training.
-- Evaluate outputs from an explicit vision-feature -> bridge -> LM setup (no implicit LM-ready vision tokens).
+- Support both a fast proxy scorer and an official-style VQAv2 scorer.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import random
+import re
 from collections import Counter, defaultdict
 from typing import Any, Dict, Iterable, List, Sequence
 
 from train.vqa_data import (
     heuristic_answer_type,
     heuristic_question_category,
-    majority_answer,
     normalize_vqa_answer,
     vqa_soft_accuracy,
 )
 
 
+_CONTRACTIONS = {
+    "aint": "ain't",
+    "arent": "aren't",
+    "cant": "can't",
+    "couldve": "could've",
+    "couldnt": "couldn't",
+    "couldn'tve": "couldn't've",
+    "couldnt've": "couldn't've",
+    "didnt": "didn't",
+    "doesnt": "doesn't",
+    "dont": "don't",
+    "hadnt": "hadn't",
+    "hadnt've": "hadn't've",
+    "hadn'tve": "hadn't've",
+    "hasnt": "hasn't",
+    "havent": "haven't",
+    "hed": "he'd",
+    "hed've": "he'd've",
+    "he'dve": "he'd've",
+    "hes": "he's",
+    "howd": "how'd",
+    "howll": "how'll",
+    "hows": "how's",
+    "id've": "i'd've",
+    "i'dve": "i'd've",
+    "im": "i'm",
+    "ive": "i've",
+    "isnt": "isn't",
+    "itd": "it'd",
+    "itd've": "it'd've",
+    "it'dve": "it'd've",
+    "itll": "it'll",
+    "let's": "let's",
+    "maam": "ma'am",
+    "mightnt": "mightn't",
+    "mightnt've": "mightn't've",
+    "mightn'tve": "mightn't've",
+    "mightve": "might've",
+    "mustnt": "mustn't",
+    "mustve": "must've",
+    "neednt": "needn't",
+    "notve": "not've",
+    "oclock": "o'clock",
+    "oughtnt": "oughtn't",
+    "ow's'at": "'ow's'at",
+    "'ows'at": "'ow's'at",
+    "'ow'sat": "'ow's'at",
+    "shant": "shan't",
+    "shed've": "she'd've",
+    "she'dve": "she'd've",
+    "she's": "she's",
+    "shouldve": "should've",
+    "shouldnt": "shouldn't",
+    "shouldnt've": "shouldn't've",
+    "shouldn'tve": "shouldn't've",
+    "somebody'd": "somebodyd",
+    "somebodyd've": "somebody'd've",
+    "somebody'dve": "somebody'd've",
+    "somebodyll": "somebody'll",
+    "somebodys": "somebody's",
+    "someoned": "someone'd",
+    "someoned've": "someone'd've",
+    "someone'dve": "someone'd've",
+    "someonell": "someone'll",
+    "someones": "someone's",
+    "somethingd": "something'd",
+    "somethingd've": "something'd've",
+    "something'dve": "something'd've",
+    "somethingll": "something'll",
+    "thats": "that's",
+    "thered": "there'd",
+    "thered've": "there'd've",
+    "there'dve": "there'd've",
+    "therere": "there're",
+    "theres": "there's",
+    "theyd": "they'd",
+    "theyd've": "they'd've",
+    "they'dve": "they'd've",
+    "theyll": "they'll",
+    "theyre": "they're",
+    "theyve": "they've",
+    "twas": "'twas",
+    "wasnt": "wasn't",
+    "wed've": "we'd've",
+    "we'dve": "we'd've",
+    "weve": "we've",
+    "werent": "weren't",
+    "whatll": "what'll",
+    "whatre": "what're",
+    "whats": "what's",
+    "whatve": "what've",
+    "whens": "when's",
+    "whered": "where'd",
+    "wheres": "where's",
+    "whereve": "where've",
+    "whod": "who'd",
+    "whod've": "who'd've",
+    "who'dve": "who'd've",
+    "wholl": "who'll",
+    "whos": "who's",
+    "whove": "who've",
+    "whyll": "why'll",
+    "whyre": "why're",
+    "whys": "why's",
+    "wont": "won't",
+    "wouldve": "would've",
+    "wouldnt": "wouldn't",
+    "wouldnt've": "wouldn't've",
+    "wouldn'tve": "wouldn't've",
+    "yall": "y'all",
+    "yall'll": "y'all'll",
+    "y'allll": "y'all'll",
+    "yall'd've": "y'all'd've",
+    "y'alld've": "y'all'd've",
+    "y'all'dve": "y'all'd've",
+    "youd": "you'd",
+    "youd've": "you'd've",
+    "you'dve": "you'd've",
+    "youll": "you'll",
+    "youre": "you're",
+    "youve": "you've",
+}
+
+_MANUAL_MAP = {
+    "none": "0",
+    "zero": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+}
+
+_ARTICLES = {"a", "an", "the"}
+_PUNCT = [
+    ";",
+    "/",
+    "[",
+    "]",
+    '"',
+    "{",
+    "}",
+    "(",
+    ")",
+    "=",
+    "+",
+    "\\",
+    "_",
+    "-",
+    ">",
+    "<",
+    "@",
+    "`",
+    ",",
+    "?",
+    "!",
+]
+_PERIOD_STRIP = re.compile(r"(?!<=\d)(\.)(?!\d)")
+_COMMA_STRIP = re.compile(r"(\d)(,)(\d)")
+_WS_RE = re.compile(r"\s+")
+
+
 def _safe_div(num: float, den: float) -> float:
     return float(num / den) if den > 0 else 0.0
+
+
+def _process_punctuation(text: str) -> str:
+    out = text
+    for p in _PUNCT:
+        if (p + " " in out) or (" " + p in out) or (_COMMA_STRIP.search(out) is not None):
+            out = out.replace(p, "")
+        else:
+            out = out.replace(p, " ")
+    out = _PERIOD_STRIP.sub("", out)
+    return out
+
+
+def _process_digit_article(text: str) -> str:
+    out: List[str] = []
+    for w in text.lower().split():
+        w = _MANUAL_MAP.get(w, w)
+        if w not in _ARTICLES:
+            out.append(_CONTRACTIONS.get(w, w))
+    return " ".join(out)
+
+
+def normalize_vqa_official(text: str) -> str:
+    out = str(text or "").replace("\n", " ").replace("\t", " ").strip().lower()
+    out = _process_punctuation(out)
+    out = _process_digit_article(out)
+    out = _WS_RE.sub(" ", out).strip()
+    return out
+
+
+def _majority_answer(answers: Sequence[str], scorer: str) -> str:
+    if not answers:
+        return ""
+    if scorer == "official":
+        norm = [normalize_vqa_official(a) for a in answers if str(a).strip()]
+    else:
+        norm = [normalize_vqa_answer(a) for a in answers if str(a).strip()]
+    norm = [x for x in norm if x]
+    if not norm:
+        return ""
+    return Counter(norm).most_common(1)[0][0]
+
+
+def vqa_official_accuracy(prediction: str, gt_answers: Sequence[str]) -> float:
+    if not gt_answers:
+        return 0.0
+    pred = normalize_vqa_official(prediction)
+    gts = [normalize_vqa_official(a) for a in gt_answers if str(a).strip()]
+    if not gts:
+        return 0.0
+
+    accs = []
+    for i in range(len(gts)):
+        others = gts[:i] + gts[i + 1 :]
+        match_count = sum(1 for a in others if a == pred)
+        accs.append(min(1.0, float(match_count) / 3.0))
+    return float(sum(accs) / len(accs))
+
+
+def _record_answers_for_scorer(record: Dict[str, Any], scorer: str) -> List[str]:
+    if scorer == "official":
+        raw = record.get("all_answers_raw")
+        if isinstance(raw, list) and raw:
+            return [str(x) for x in raw if str(x).strip()]
+    ans = record.get("all_answers")
+    if isinstance(ans, list):
+        return [str(x) for x in ans if str(x).strip()]
+    return []
+
+
+def _record_accuracy(record: Dict[str, Any], scorer: str) -> float:
+    answers = _record_answers_for_scorer(record, scorer)
+    pred = str(record.get("prediction", ""))
+    if scorer == "official":
+        return vqa_official_accuracy(pred, answers)
+    return vqa_soft_accuracy(pred, answers)
 
 
 def _answer_type_for_record(record: Dict[str, Any]) -> str:
@@ -47,18 +290,20 @@ def _heuristic_question_category_for_record(record: Dict[str, Any]) -> str:
     return heuristic_question_category(str(record.get("question", "")))
 
 
-def summarize_vqa_predictions(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+def summarize_vqa_predictions(records: Sequence[Dict[str, Any]], scorer: str = "official") -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "num_samples": int(len(records)),
+        "scorer": str(scorer),
         "overall_accuracy": None,
         "answer_type_accuracy": {},
         "question_type_accuracy": {},
         "heuristic_category_accuracy": {},
+        "official_fallback_to_normalized_count": 0,
     }
     if not records:
         return out
 
-    has_labels = any(bool(r.get("all_answers")) for r in records)
+    has_labels = any(bool(_record_answers_for_scorer(r, scorer)) for r in records)
     if not has_labels:
         return out
 
@@ -69,14 +314,17 @@ def summarize_vqa_predictions(records: Sequence[Dict[str, Any]]) -> Dict[str, An
     qt_n = defaultdict(int)
     hc_sum = defaultdict(float)
     hc_n = defaultdict(int)
+    n = 0
 
     for r in records:
-        answers = r.get("all_answers") or []
+        answers = _record_answers_for_scorer(r, scorer)
         if not answers:
             continue
-        pred = str(r.get("prediction", ""))
-        acc = vqa_soft_accuracy(pred, answers)
+        if scorer == "official" and not (r.get("all_answers_raw") or []):
+            out["official_fallback_to_normalized_count"] += 1
+        acc = _record_accuracy(r, scorer)
         total_acc += acc
+        n += 1
 
         at = _answer_type_for_record(r)
         qt = _question_type_for_record(r)
@@ -88,7 +336,6 @@ def summarize_vqa_predictions(records: Sequence[Dict[str, Any]]) -> Dict[str, An
         hc_sum[hc] += acc
         hc_n[hc] += 1
 
-    n = sum(1 for r in records if r.get("all_answers"))
     out["overall_accuracy"] = _safe_div(total_acc, float(n))
     out["answer_type_accuracy"] = {k: _safe_div(at_sum[k], float(at_n[k])) for k in sorted(at_sum.keys())}
     out["question_type_accuracy"] = {k: _safe_div(qt_sum[k], float(qt_n[k])) for k in sorted(qt_sum.keys())}
@@ -96,7 +343,9 @@ def summarize_vqa_predictions(records: Sequence[Dict[str, Any]]) -> Dict[str, An
     return out
 
 
-def format_qualitative_samples(records: Sequence[Dict[str, Any]], n: int = 8, seed: int = 35) -> List[Dict[str, Any]]:
+def format_qualitative_samples(
+    records: Sequence[Dict[str, Any]], n: int = 8, seed: int = 35, scorer: str = "official"
+) -> List[Dict[str, Any]]:
     if n <= 0 or not records:
         return []
     idxs = list(range(len(records)))
@@ -106,7 +355,8 @@ def format_qualitative_samples(records: Sequence[Dict[str, Any]], n: int = 8, se
     out: List[Dict[str, Any]] = []
     for i in picked:
         r = records[i]
-        gt = majority_answer(r.get("all_answers") or [])
+        answers = _record_answers_for_scorer(r, scorer)
+        gt = _majority_answer(answers, scorer)
         out.append(
             {
                 "question_id": r.get("question_id"),
@@ -121,17 +371,22 @@ def format_qualitative_samples(records: Sequence[Dict[str, Any]], n: int = 8, se
     return out
 
 
-def build_confusion_summary(records: Sequence[Dict[str, Any]], top_k: int = 20, short_max_words: int = 2) -> List[Dict[str, Any]]:
+def build_confusion_summary(
+    records: Sequence[Dict[str, Any]], top_k: int = 20, short_max_words: int = 2, scorer: str = "official"
+) -> List[Dict[str, Any]]:
     if top_k <= 0:
         return []
     pair_counts = Counter()
     gt_counts = Counter()
     for r in records:
-        answers = r.get("all_answers") or []
+        answers = _record_answers_for_scorer(r, scorer)
         if not answers:
             continue
-        gt = majority_answer(answers)
-        pr = normalize_vqa_answer(str(r.get("prediction", "")))
+        gt = _majority_answer(answers, scorer)
+        if scorer == "official":
+            pr = normalize_vqa_official(str(r.get("prediction", "")))
+        else:
+            pr = normalize_vqa_answer(str(r.get("prediction", "")))
         if not gt or not pr:
             continue
         if gt == pr:
@@ -197,6 +452,7 @@ def parse_args() -> argparse.Namespace:
 
     ap.add_argument("--qualitative_samples", type=int, default=8)
     ap.add_argument("--confusion_top_k", type=int, default=20)
+    ap.add_argument("--scorer", type=str, default="official", choices=["official", "proxy"])
     ap.add_argument("--seed", type=int, default=35)
 
     ap.add_argument("--save_predictions_jsonl", type=str, default=None)
@@ -233,9 +489,9 @@ def main() -> None:
         if args.save_predictions_jsonl:
             _save_predictions_jsonl(args.save_predictions_jsonl, records)
 
-    summary = summarize_vqa_predictions(records)
-    summary["qualitative"] = format_qualitative_samples(records, n=args.qualitative_samples, seed=args.seed)
-    summary["confusions"] = build_confusion_summary(records, top_k=args.confusion_top_k)
+    summary = summarize_vqa_predictions(records, scorer=args.scorer)
+    summary["qualitative"] = format_qualitative_samples(records, n=args.qualitative_samples, seed=args.seed, scorer=args.scorer)
+    summary["confusions"] = build_confusion_summary(records, top_k=args.confusion_top_k, scorer=args.scorer)
     _print_summary(summary)
 
     if args.save_summary_json:
