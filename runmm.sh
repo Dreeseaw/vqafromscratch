@@ -43,4 +43,7 @@ docker run --rm -it --gpus all --ipc=host \
   -e PYTORCH_ENABLE_MPS_FALLBACK=1 \
   -v "$(pwd)":/app -w /app myrepo:gpu \
   "${CMD[@]}" \
+  --vision_model=vae --vision_checkpoint=logs/vm_base2/step_15001.tar --lm_checkpoint=logs/lm_boom2/step_45000.tar \
+  --num_visual_tokens 49 --bridge_token_reduce all \
+  --batch_size=256 --epochs=10 --eval_every=0 --eval_batches=0 --limit_eval=0 --eval_scorer=official \
   "${EXTRA_ARGS[@]}"

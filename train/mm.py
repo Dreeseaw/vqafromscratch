@@ -35,6 +35,9 @@ from train.vqa_data import VQAv2Dataset, VQAv2Paths, build_image_transform, prep
 
 LOGDIR = "logs"
 LOGFILE = "logfile.txt"
+DEFAULT_FINAL_SANITY_COUNT = 4
+FINAL_SANITY_MIN_PROMPTS = 3
+FINAL_SANITY_MAX_PROMPTS = 5
 
 
 class Logger:
@@ -858,6 +861,69 @@ def run_generation_predictions(
     return records
 
 
+@torch.no_grad()
+def run_final_greedy_sanity_pass(
+    model: MultimodalPrefixLM,
+    loader: DataLoader,
+    tokenizer: ByteBPETokenizer,
+    device: str,
+    *,
+    max_answer_length: int,
+    sanity_count: int,
+    logger: Logger,
+    tag: str,
+) -> None:
+    dataset = getattr(loader, "dataset", None)
+    collate_fn = getattr(loader, "collate_fn", None)
+    if dataset is None or collate_fn is None:
+        logger.log(f"[mm:sanity:{tag}] skipped (missing dataset/collate_fn)")
+        return
+    if len(dataset) <= 0:
+        logger.log(f"[mm:sanity:{tag}] skipped (empty eval dataset)")
+        return
+
+    requested = int(sanity_count)
+    if requested <= 0:
+        logger.log(f"[mm:sanity:{tag}] disabled (--final_sanity_count={requested})")
+        return
+
+    n_prompts = max(FINAL_SANITY_MIN_PROMPTS, min(FINAL_SANITY_MAX_PROMPTS, requested))
+    if requested != n_prompts:
+        logger.log(f"[mm:sanity:{tag}] clamped prompt count from {requested} to {n_prompts}")
+
+    samples: List[Dict[str, Any]] = []
+    idx = 0
+    while idx < len(dataset) and len(samples) < n_prompts:
+        try:
+            samples.append(dataset[idx])
+        except Exception as e:
+            logger.log(f"[mm:sanity:{tag}] skipping sample idx={idx} due to load error: {e}")
+        idx += 1
+
+    if not samples:
+        logger.log(f"[mm:sanity:{tag}] skipped (no loadable samples)")
+        return
+
+    batch = collate_fn(samples)
+    batch = _to_device(batch, device)
+    model.eval()
+    gens = model.generate_answers(
+        images=batch["images"],
+        prompt_ids=batch["prompt_ids"],
+        pad_id=tokenizer.pad_id,
+        eos_id=tokenizer.eos_id,
+        max_new_tokens=int(max_answer_length),
+    )
+    logger.log(f"[mm:sanity:{tag}] greedy decode pass count={len(gens)}")
+    for i in range(len(gens)):
+        qid = int(batch["question_ids"][i])
+        question = str(batch["questions"][i]).replace("\n", " ").strip()
+        pred = tokenizer.decode(gens[i], skip_special=True).strip()
+        logger.log(
+            f"[mm:sanity:{tag}] #{i + 1} qid={qid} question={question!r} prediction={pred!r}"
+        )
+
+
 def run_predictions_from_checkpoint(
     checkpoint_path: str,
     *,
@@ -1020,9 +1086,14 @@ def print_eval_summary(logger: Logger, split: str, summary: Dict[str, Any]) -> N
     logger.log(f"[eval:{split}] overall_accuracy={overall:.4f} scorer={scorer}")
     by_answer = summary.get("answer_type_accuracy", {})
     if by_answer:
+        order = ("yes/no", "number", "other")
+        rendered = [f"{k}={float(by_answer.get(k, 0.0)):.4f}" for k in order]
+        for k in sorted(by_answer.keys()):
+            if k not in order:
+                rendered.append(f"{k}={float(by_answer.get(k, 0.0)):.4f}")
         logger.log(
             "[eval:{split}] answer_type: ".format(split=split)
-            + " ".join(f"{k}={v:.4f}" for (k, v) in sorted(by_answer.items()))
+            + " ".join(rendered)
         )
     qtype = summary.get("question_type_accuracy", {})
     if qtype:
@@ -1082,7 +1153,8 @@ def log_startup_config(
         f"[mm] loop epochs={args.epochs} max_steps={args.max_steps} overfit_small_batch={int(bool(args.overfit_small_batch))} "
         f"log_every={args.log_every} eval_every={args.eval_every} eval_batches={args.eval_batches} "
         f"eval_log_every={args.eval_log_every} eval_scorer={args.eval_scorer} "
-        f"fixed_eval_count={args.fixed_eval_count} ckpt_every={args.ckpt_every}"
+        f"fixed_eval_count={args.fixed_eval_count} ckpt_every={args.ckpt_every} "
+        f"final_sanity_count={args.final_sanity_count}"
     )
 
 
@@ -1192,6 +1264,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--eval_batches", type=int, default=20)
     ap.add_argument("--eval_log_every", type=int, default=10)
     ap.add_argument("--fixed_eval_count", type=int, default=5)
+    ap.add_argument(
+        "--final_sanity_count",
+        type=int,
+        default=DEFAULT_FINAL_SANITY_COUNT,
+        help="Final greedy sanity pass prompt count (default 4, clamped to 3-5; <=0 disables).",
+    )
     ap.add_argument("--ckpt_every", type=int, default=1000)
     ap.add_argument("--limit_train", type=int, default=0)
     ap.add_argument("--limit_val", type=int, default=0)
@@ -1359,6 +1437,16 @@ def main() -> None:
                 for r in records:
                     f.write(json.dumps(r, ensure_ascii=True) + "\n")
             logger.log(f"[mm] wrote predictions: {args.save_predictions_jsonl}")
+        run_final_greedy_sanity_pass(
+            model=model,
+            loader=val_loader,
+            tokenizer=tokenizer,
+            device=device,
+            max_answer_length=int(args.max_answer_length),
+            sanity_count=int(args.final_sanity_count),
+            logger=logger,
+            tag="eval_only_final",
+        )
         return
 
     debug_shape_once = bool(args.debug_shapes)
@@ -1521,6 +1609,16 @@ def main() -> None:
             for r in records:
                 f.write(json.dumps(r, ensure_ascii=True) + "\n")
         logger.log(f"[mm] wrote predictions: {args.save_predictions_jsonl}")
+    run_final_greedy_sanity_pass(
+        model=model,
+        loader=val_loader,
+        tokenizer=tokenizer,
+        device=device,
+        max_answer_length=int(args.max_answer_length),
+        sanity_count=int(args.final_sanity_count),
+        logger=logger,
+        tag="train_final",
+    )
 
 
 if __name__ == "__main__":

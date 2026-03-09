@@ -1,4 +1,4 @@
-// trackerapp.ts
+// vmtrackerapp.ts
 import { serve } from "bun";
 import fs from "fs";
 import path from "path";
@@ -9,7 +9,7 @@ import path from "path";
 const args = process.argv;
 const dirIndex = args.indexOf("-f");
 if (dirIndex === -1) {
-  console.error("Usage: bun run trackerapp.ts -f <run_dir> [-p <port>]");
+  console.error("Usage: bun run tracker/vm/vmtrackerapp.ts -f <run_dir> [-p <port>]");
   process.exit(1);
 }
 
@@ -22,6 +22,13 @@ if (!fs.existsSync(runDir)) {
 }
 if (!fs.existsSync(logfile)) {
   console.error(`Missing logfile.txt in ${runDir}`);
+  process.exit(1);
+}
+
+const staticRoot = import.meta.dir;
+const htmlPath = path.join(staticRoot, "index.html");
+if (!fs.existsSync(htmlPath)) {
+  console.error(`Missing frontend file: ${htmlPath}`);
   process.exit(1);
 }
 
@@ -70,7 +77,7 @@ serve({
     // MAIN PAGE
     // -------------------------
     if (url.pathname === "/") {
-      return new Response(await Bun.file("tracker/index.html").text(), {
+      return new Response(await Bun.file(htmlPath).text(), {
         headers: { "Content-Type": "text/html" },
       });
     }

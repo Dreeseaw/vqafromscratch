@@ -188,6 +188,7 @@ _PUNCT = [
 _PERIOD_STRIP = re.compile(r"(?!<=\d)(\.)(?!\d)")
 _COMMA_STRIP = re.compile(r"(\d)(,)(\d)")
 _WS_RE = re.compile(r"\s+")
+_EVALAI_ANSWER_TYPES = ("yes/no", "number", "other")
 
 
 def _safe_div(num: float, den: float) -> float:
@@ -274,8 +275,15 @@ def _answer_type_for_record(record: Dict[str, Any]) -> str:
     meta = record.get("metadata") or {}
     at = meta.get("answer_type")
     if isinstance(at, str) and at.strip():
-        return at.strip().lower()
-    return heuristic_answer_type(str(record.get("canonical_answer", "")))
+        raw = at.strip().lower()
+    else:
+        raw = heuristic_answer_type(str(record.get("canonical_answer", "")))
+
+    if raw in ("yes/no", "yesno", "yes_no", "yes-no"):
+        return "yes/no"
+    if raw in ("number", "num", "numeric", "numerical"):
+        return "number"
+    return "other"
 
 
 def _question_type_for_record(record: Dict[str, Any]) -> str:
@@ -308,8 +316,8 @@ def summarize_vqa_predictions(records: Sequence[Dict[str, Any]], scorer: str = "
         return out
 
     total_acc = 0.0
-    at_sum = defaultdict(float)
-    at_n = defaultdict(int)
+    at_sum = {k: 0.0 for k in _EVALAI_ANSWER_TYPES}
+    at_n = {k: 0 for k in _EVALAI_ANSWER_TYPES}
     qt_sum = defaultdict(float)
     qt_n = defaultdict(int)
     hc_sum = defaultdict(float)
@@ -337,7 +345,7 @@ def summarize_vqa_predictions(records: Sequence[Dict[str, Any]], scorer: str = "
         hc_n[hc] += 1
 
     out["overall_accuracy"] = _safe_div(total_acc, float(n))
-    out["answer_type_accuracy"] = {k: _safe_div(at_sum[k], float(at_n[k])) for k in sorted(at_sum.keys())}
+    out["answer_type_accuracy"] = {k: _safe_div(at_sum[k], float(at_n[k])) for k in _EVALAI_ANSWER_TYPES}
     out["question_type_accuracy"] = {k: _safe_div(qt_sum[k], float(qt_n[k])) for k in sorted(qt_sum.keys())}
     out["heuristic_category_accuracy"] = {k: _safe_div(hc_sum[k], float(hc_n[k])) for k in sorted(hc_sum.keys())}
     return out
