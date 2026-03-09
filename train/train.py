@@ -12,6 +12,8 @@ results saved in
 - /logs/<run_id>/step_N.jpg
 - /logs/<run_id>/step_N.tar
 """
+import argparse
+from contextlib import nullcontext
 import os
 import sys
 import datetime
@@ -32,8 +34,231 @@ from models.vae import VariationalAutoEncoderRes as VAEr
 from models.vae import ViTVAE, ViTVAE2
 
 
-DATA_DIR = "/Users/williamdreese/percy/vqa/vqafromscratch/images/mscoco/"
+DEFAULT_DATA_DIR = "images"
 SEED = 35
+DEFAULT_PRESET = "vitvae2_current"
+TRAINING_PRESETS = {
+    # Current hardcoded behavior before CLI presets were introduced.
+    "vitvae2_current": {
+        "model": "vitvae2",
+        "latent_dim": 768,
+        "cbld": 1536,
+        "epochs": 20_000,
+        "batch_size": 128,
+        "num_workers": 4,
+        "prefetch_factor": 4,
+        "lr": 0.001,
+        "weight_decay": 0.0001,
+        "alpha": 0.0,
+        "beta": 0.00521,
+        "gamma": 0.0,
+        "corr_reg": True,
+        "precision": "fp32",
+        "channels_last": False,
+        "compile": False,
+        "pin_memory": False,
+        "log_every": 10,
+        "val_every": 50,
+        "ckpt_every": 2000,
+        "grad_clip": 1.0,
+    },
+    # Best pre-LM MPS-era gamma-only decorrelation setup recovered from git history.
+    "gamma_corr_only": {
+        "model": "vaer",
+        "latent_dim": 256,
+        "cbld": None,
+        "epochs": 20_000,
+        "batch_size": 96,
+        "num_workers": 1,
+        "prefetch_factor": 2,
+        "lr": 0.001,
+        "weight_decay": 0.0001,
+        "alpha": 0.0,
+        "beta": 0.0005,
+        "gamma": 0.001,
+        "corr_reg": True,
+        "precision": "fp32",
+        "channels_last": False,
+        "compile": False,
+        "pin_memory": False,
+        "log_every": 10,
+        "val_every": 50,
+        "ckpt_every": 2000,
+        "grad_clip": 1.0,
+    },
+    # Throughput-oriented CUDA variant of the same training regime.
+    "gamma_corr_only_cuda_fast": {
+        "model": "vaer",
+        "latent_dim": 256,
+        "cbld": None,
+        "epochs": 20_000,
+        "batch_size": 256,
+        "num_workers": 8,
+        "prefetch_factor": 8,
+        "lr": 0.0005,
+        "weight_decay": 0.0001,
+        "alpha": 0.0,
+        "beta": 0.0005,
+        "gamma": 0.001,
+        "corr_reg": True,
+        "precision": "bf16",
+        "channels_last": True,
+        "compile": False,
+        "pin_memory": True,
+        "log_every": 10,
+        "val_every": 200,
+        "ckpt_every": 4000,
+        "grad_clip": 1.0,
+    },
+}
+
+
+def _value_or(value, fallback):
+    return fallback if value is None else value
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train a VAE on MSCOCO images.")
+    parser.add_argument("run_id", type=str)
+    parser.add_argument("checkpoint", nargs="?", type=int)
+    parser.add_argument(
+        "--preset",
+        type=str,
+        default=DEFAULT_PRESET,
+        choices=sorted(TRAINING_PRESETS.keys()),
+        help="Named training preset. CLI flags override the preset.",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda", "mps"],
+    )
+    parser.add_argument("--data_dir", type=str, default=DEFAULT_DATA_DIR)
+    parser.add_argument("--train_split", type=str, default="train2014")
+    parser.add_argument("--val_split", type=str, default="val2014")
+    parser.add_argument("--epochs", type=int)
+    parser.add_argument("--batch_size", type=int)
+    parser.add_argument("--num_workers", type=int)
+    parser.add_argument("--prefetch_factor", type=int)
+    parser.add_argument("--val_count", type=int, default=32)
+    parser.add_argument(
+        "--model",
+        type=str,
+        choices=["vae", "vaer", "vitvae", "vitvae2"],
+    )
+    parser.add_argument("--latent_dim", type=int)
+    parser.add_argument("--cbld", type=int)
+    parser.add_argument("--lr", type=float)
+    parser.add_argument("--weight_decay", type=float)
+    parser.add_argument("--alpha", type=float)
+    parser.add_argument("--beta", type=float)
+    parser.add_argument("--gamma", type=float)
+    parser.add_argument("--precision", type=str, choices=["fp32", "bf16", "fp16"])
+    parser.add_argument("--log_every", type=int)
+    parser.add_argument("--val_every", type=int)
+    parser.add_argument("--ckpt_every", type=int)
+    parser.add_argument("--grad_clip", type=float)
+    parser.add_argument("--corr_reg", dest="corr_reg", action="store_true")
+    parser.add_argument("--no_corr_reg", dest="corr_reg", action="store_false")
+    parser.add_argument("--channels_last", dest="channels_last", action="store_true")
+    parser.add_argument("--no_channels_last", dest="channels_last", action="store_false")
+    parser.add_argument("--compile", dest="compile", action="store_true")
+    parser.add_argument("--no_compile", dest="compile", action="store_false")
+    parser.add_argument("--pin_memory", dest="pin_memory", action="store_true")
+    parser.add_argument("--no_pin_memory", dest="pin_memory", action="store_false")
+    parser.set_defaults(corr_reg=None)
+    parser.set_defaults(channels_last=None, compile=None, pin_memory=None)
+    return parser.parse_args()
+
+
+def resolve_training_config(args):
+    preset = TRAINING_PRESETS[args.preset]
+    return {
+        "model": _value_or(args.model, preset["model"]),
+        "latent_dim": _value_or(args.latent_dim, preset["latent_dim"]),
+        "cbld": _value_or(args.cbld, preset["cbld"]),
+        "epochs": _value_or(args.epochs, preset["epochs"]),
+        "batch_size": _value_or(args.batch_size, preset["batch_size"]),
+        "num_workers": _value_or(args.num_workers, preset["num_workers"]),
+        "prefetch_factor": _value_or(args.prefetch_factor, preset["prefetch_factor"]),
+        "lr": _value_or(args.lr, preset["lr"]),
+        "weight_decay": _value_or(args.weight_decay, preset["weight_decay"]),
+        "alpha": _value_or(args.alpha, preset["alpha"]),
+        "beta": _value_or(args.beta, preset["beta"]),
+        "gamma": _value_or(args.gamma, preset["gamma"]),
+        "corr_reg": _value_or(args.corr_reg, preset["corr_reg"]),
+        "precision": _value_or(args.precision, preset["precision"]),
+        "channels_last": _value_or(args.channels_last, preset["channels_last"]),
+        "compile": _value_or(args.compile, preset["compile"]),
+        "pin_memory": _value_or(args.pin_memory, preset["pin_memory"]),
+        "log_every": _value_or(args.log_every, preset["log_every"]),
+        "val_every": _value_or(args.val_every, preset["val_every"]),
+        "ckpt_every": _value_or(args.ckpt_every, preset["ckpt_every"]),
+        "grad_clip": _value_or(args.grad_clip, preset["grad_clip"]),
+    }
+
+
+def resolve_device(requested):
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+
+    if requested == "cuda" and not torch.cuda.is_available():
+        raise SystemExit("CUDA requested but not available.")
+    if requested == "mps" and not (
+        hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    ):
+        raise SystemExit("MPS requested but not available.")
+    return requested
+
+
+def build_model(model_name, latent_dim, cbld, device):
+    config = VAEConfig(latent_dim=latent_dim, cbld=cbld)
+    if model_name == "vae":
+        model = VAE(config)
+    elif model_name == "vaer":
+        model = VAEr(config)
+    elif model_name == "vitvae":
+        model = ViTVAE(config)
+    elif model_name == "vitvae2":
+        model = ViTVAE2(config)
+    else:
+        raise ValueError(f"unknown model: {model_name}")
+    return model.to(device)
+
+
+def resolve_split_dir(data_dir, split):
+    candidates = [
+        os.path.join(data_dir, split),
+        os.path.join(data_dir, split, split),
+    ]
+    for path in candidates:
+        if os.path.isdir(path):
+            return path
+    raise FileNotFoundError(
+        f"could not find image split '{split}' under '{data_dir}'. "
+        f"Tried: {', '.join(candidates)}"
+    )
+
+
+def resolve_amp_dtype(device, precision):
+    if device != "cuda" or precision == "fp32":
+        return None
+    if precision == "bf16":
+        return torch.bfloat16
+    if precision == "fp16":
+        return torch.float16
+    raise ValueError(f"unknown precision: {precision}")
+
+
+def autocast_ctx(device, amp_dtype):
+    if device == "cuda" and amp_dtype is not None:
+        return torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True)
+    return nullcontext()
 
 
 ### Training, eval, & test loading
@@ -347,36 +572,36 @@ def orthogonal_reg_spatial(mu: torch.Tensor, corr: bool = True, eps: float = 1e-
 
 ### Training schedule helper(s)
 
-def set_decoder_trainable(vae, step) -> (float, float, float):
+def get_loss_weights(step, alpha, beta, gamma) -> (float, float, float):
     """
-    manages training schedules & constants + freezing/unfreezing vae components
+    Fixed loss weights for now; the helper remains here so schedules can be restored later.
     returns:
         alpha (float): term for mmd weight
         beta (float): term for kl weight (Original VAE paper B = 0.00521 due to normalization)
         gamma (float): term for ortho reg weight
     """
-    # if step < 5001:
-    #     return (200.0, 0.0005, 0.0) 
-    return (0.0, 0.00521, 0.0)  # let the model have a lil ortho
+    return (alpha, beta, gamma)
 
 
 ### Training loop
 
 if __name__=="__main__":
-    run_id = sys.argv[1] if len(sys.argv) > 1 else "default"
-    checkpoint_id = int(sys.argv[2]) if len(sys.argv) > 2 else None
+    args = parse_args()
+    train_cfg = resolve_training_config(args)
+    run_id = args.run_id
+    checkpoint_id = args.checkpoint
 
     # hyperparams
-    epochs = 20_000  # by the time my kids have kids
+    epochs = train_cfg["epochs"]  # by the time my kids have kids
     global_step = 0
-    batch_size = 128
+    batch_size = train_cfg["batch_size"]
 
     # cpu performance guidance
-    device = "cpu" 
-    if torch.cuda.is_available(): 
-        device = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = "mps"
+    device = resolve_device(args.device)
+    if device == "cuda":
+        torch.backends.cudnn.benchmark = True
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
 
     if device == "cpu":
         torch.set_num_threads(8)
@@ -386,35 +611,58 @@ if __name__=="__main__":
     torch.manual_seed(SEED)
 
     # load dynamic training set
-    dset = "train2014"
-    dataset = CocoImageDataset(DATA_DIR + f"{dset}/{dset}/")
-    loader = DataLoader(
-        dataset, 
-        batch_size=batch_size, 
-        shuffle=True,
-        num_workers=4,
-        persistent_workers=True,
-        prefetch_factor=4,
-        pin_memory=False,
-    )
+    dset = args.train_split
+    train_dir = resolve_split_dir(args.data_dir, dset)
+    dataset = CocoImageDataset(train_dir)
+    train_pin_memory = bool(train_cfg["pin_memory"]) and device == "cuda"
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": True,
+        "num_workers": train_cfg["num_workers"],
+        "pin_memory": train_pin_memory,
+    }
+    if train_cfg["num_workers"] > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = train_cfg["prefetch_factor"]
+    loader = DataLoader(dataset, **loader_kwargs)
 
     # uncomment for overfit testing
-    # dataset = CocoImageDataset(DATA_DIR + f"{dset}/{dset}/", count=8, rrc=False, flip=False)
+    # dataset = CocoImageDataset(train_dir, count=8, rrc=False, flip=False)
     # loader = DataLoader(dataset, batch_size=8, shuffle=False)
 
     # load static validation set
-    v_dset = "val2014"
-    v_dataset = CocoImageDataset(DATA_DIR + f"{v_dset}/{v_dset}/", count=32, rrc=False)
+    v_dset = args.val_split
+    val_dir = resolve_split_dir(args.data_dir, v_dset)
+    val_pin_memory = train_pin_memory
+    v_dataset = CocoImageDataset(
+        val_dir,
+        count=args.val_count,
+        rrc=False,
+    )
     v_loader = DataLoader(
         v_dataset, 
-        batch_size=32, 
+        batch_size=args.val_count,
         shuffle=False,
+        pin_memory=val_pin_memory,
     )
 
     # torch object creation
-    config = VAEConfig(latent_dim=768, cbld=1536) 
-    vae = ViTVAE2(config).to(device)
-    opt = torch.optim.Adam(vae.parameters(), lr=0.001, weight_decay=0.0001)
+    vae = build_model(
+        train_cfg["model"],
+        train_cfg["latent_dim"],
+        train_cfg["cbld"],
+        device,
+    )
+    if device == "cuda" and train_cfg["channels_last"]:
+        vae = vae.to(memory_format=torch.channels_last)
+    opt = torch.optim.Adam(
+        vae.parameters(),
+        lr=train_cfg["lr"],
+        weight_decay=train_cfg["weight_decay"],
+    )
+    amp_dtype = resolve_amp_dtype(device, train_cfg["precision"])
+    use_grad_scaler = device == "cuda" and train_cfg["precision"] == "fp16"
+    grad_scaler = torch.cuda.amp.GradScaler(enabled=use_grad_scaler)
 
     if checkpoint_id:
         ckpt_file = f'logs/{run_id}/step_{checkpoint_id}.tar'
@@ -422,9 +670,40 @@ if __name__=="__main__":
         vae.load_state_dict(checkpoint['model_state_dict'])
         opt.load_state_dict(checkpoint['optimizer_state_dict'])
         global_step = checkpoint['global_step']
+    if train_cfg["compile"]:
+        if not hasattr(torch, "compile"):
+            raise SystemExit("torch.compile requested but not available in this PyTorch build.")
+        vae = torch.compile(vae)
 
     logger = Logger(run_id, checkpoint_id)
     log_params(vae, logger)
+    logger.log(f"preset: {args.preset}")
+    logger.log(f"data_dir: {args.data_dir}")
+    logger.log(f"train_dir: {train_dir}")
+    logger.log(f"val_dir: {val_dir}")
+    logger.log(
+        "runtime: "
+        f"precision={train_cfg['precision']}, "
+        f"pin_memory={train_pin_memory}, "
+        f"channels_last={train_cfg['channels_last']}, "
+        f"compile={train_cfg['compile']}"
+    )
+    logger.log(
+        "model: "
+        f"{train_cfg['model']} "
+        f"(latent_dim={train_cfg['latent_dim']}, cbld={train_cfg['cbld']})"
+    )
+    logger.log(
+        "loss weights: "
+        f"alpha={train_cfg['alpha']}, beta={train_cfg['beta']}, "
+        f"gamma={train_cfg['gamma']}, corr_reg={train_cfg['corr_reg']}"
+    )
+    logger.log(
+        "cadence: "
+        f"log_every={train_cfg['log_every']}, "
+        f"val_every={train_cfg['val_every']}, "
+        f"ckpt_every={train_cfg['ckpt_every']}"
+    )
     logger.log(f"batch size: {batch_size}")
     logger.log(f"Run start time: {str(datetime.datetime.now())}")
     logger.log(f"Running on {device}\n")
@@ -434,41 +713,77 @@ if __name__=="__main__":
         vae.train()
         for images in loader:
             # prepare for step
-            (alpha, beta, gamma) = set_decoder_trainable(vae, global_step)
+            (alpha, beta, gamma) = get_loss_weights(
+                global_step,
+                train_cfg["alpha"],
+                train_cfg["beta"],
+                train_cfg["gamma"],
+            )
 
             # forward
-            images = images.to(device)
-            recon, z, mu, lv = vae(images)
-            
-            # simple normalized recon + weighted KL
-            recon_loss = F.mse_loss(recon, images, reduction="mean")
-            kl_loss = kl_divergence(mu, lv)
-            mmd = mmd_imq(z.flatten(1), torch.randn_like(z).flatten(1))
-            ortho = orthogonal_reg_spatial(mu, corr=True)
+            images = images.to(device, non_blocking=train_pin_memory)
+            if device == "cuda" and train_cfg["channels_last"]:
+                images = images.contiguous(memory_format=torch.channels_last)
+            with autocast_ctx(device, amp_dtype):
+                recon, z, mu, lv = vae(images)
+
+            # keep the model fast under autocast, but do fragile VAE loss math in fp32
+            recon_f = recon.float()
+            z_f = z.float()
+            mu_f = mu.float()
+            lv_f = lv.float()
+            images_f = images.float()
+
+            recon_loss = F.mse_loss(recon_f, images_f, reduction="mean")
+            kl_loss = kl_divergence(mu_f, lv_f)
+            mmd = mmd_imq(z_f.flatten(1), torch.randn_like(z_f).flatten(1))
+            ortho = orthogonal_reg_spatial(mu_f, corr=train_cfg["corr_reg"])
             loss = (recon_loss + beta * kl_loss).mean() + (alpha * mmd) + (gamma * ortho)
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    f"non-finite loss at step {global_step + 1}: "
+                    f"loss={loss.detach().item()} "
+                    f"recon={recon_loss.detach().item()} "
+                    f"kl={kl_loss.mean().detach().item()} "
+                    f"mmd={mmd.detach().item()} "
+                    f"ortho={ortho.detach().item()}"
+                )
 
             # backward
-            opt.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                filter(lambda p: p.requires_grad, vae.parameters()),
-                1.0,
-            )
-            opt.step()
+            opt.zero_grad(set_to_none=True)
+            if use_grad_scaler:
+                grad_scaler.scale(loss).backward()
+                grad_scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(
+                    filter(lambda p: p.requires_grad, vae.parameters()),
+                    train_cfg["grad_clip"],
+                )
+                grad_scaler.step(opt)
+                grad_scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    filter(lambda p: p.requires_grad, vae.parameters()),
+                    train_cfg["grad_clip"],
+                )
+                opt.step()
 
             global_step += 1
 
             # logging every 10
-            if global_step % 10 == 1:
+            if global_step % train_cfg["log_every"] == 1:
                 step_end = perf_counter()
-                (ad, akld, _, _) = spatial_latent_stats(mu, lv, val=False)
+                (ad, akld, _, _) = spatial_latent_stats(mu_f, lv_f, val=False)
                 logger.log(
                     f"\nStep: {global_step}, Loss: {loss.detach():.4f} "
                     f"(RL: {recon_loss.mean().detach():.4f}, "
                     f"KL: {kl_loss.mean().detach():.4f}, KLw: {beta}, "
                     f"MMD: {mmd.detach():.7f} MMDw: {alpha})"
                 )
-                logger.log(f"10-step im/s: {((batch_size*10) / (step_end-step_start)):.4f}")
+                logger.log(
+                    f"{train_cfg['log_every']}-step im/s: "
+                    f"{((batch_size * train_cfg['log_every']) / (step_end-step_start)):.4f}"
+                )
                 logger.log(f"mu.mean: {mu.flatten(1).abs().mean().detach():.4f}, lv.mean: {lv.flatten(1).mean().detach():.4f}")
                 logger.log(f"Active mu dims: {ad:.4f}, Active KL dims: {akld:.4f}")
                 logger.log(f"Ortho reg ({gamma}): {ortho.detach():.4f}")
@@ -476,16 +791,19 @@ if __name__=="__main__":
                 step_start = step_end  # reset loop timer (includes val & weight save)
 
             # validation set + visualization every 50
-            if global_step % 50 == 1:
+            if train_cfg["val_every"] > 0 and global_step % train_cfg["val_every"] == 1:
                 vae.eval()
                 with torch.no_grad():
                     for v_images in v_loader:
-                        v_images = v_images.to(device)
-                        v_recon, v_sample, v_mu, v_lv = vae(v_images)
-                        (ad, akld, kl_hm, snr_hm) = spatial_latent_stats(mu, lv, val=True)
-                        v_recon_loss = F.mse_loss(v_recon, v_images, reduction="mean")
-                        v_kl_loss = kl_divergence(v_mu, v_lv)
-                        v_recon_mu = vae._decoder(v_mu)
+                        v_images = v_images.to(device, non_blocking=val_pin_memory)
+                        if device == "cuda" and train_cfg["channels_last"]:
+                            v_images = v_images.contiguous(memory_format=torch.channels_last)
+                        with autocast_ctx(device, amp_dtype):
+                            v_recon, v_sample, v_mu, v_lv = vae(v_images)
+                            v_recon_mu = vae._decoder(v_mu)
+                        v_recon_loss = F.mse_loss(v_recon.float(), v_images.float(), reduction="mean")
+                        v_kl_loss = kl_divergence(v_mu.float(), v_lv.float())
+                        (ad, akld, kl_hm, snr_hm) = spatial_latent_stats(mu_f, lv_f, val=True)
                         logger.log(f"\nValidation: {global_step}, RL: {v_recon_loss.mean().detach():.4f}, KL: {v_kl_loss.mean().detach():.4f})")
                         logger.log(f"mu.mean: {v_mu.flatten(1).abs().mean().detach():.4f}, lv.mean: {v_lv.flatten(1).mean().detach():.4f}")
                         logger.log(f"Active mu dims: {ad:.4f}, Active KL dims: {akld:.4f}")
@@ -511,7 +829,11 @@ if __name__=="__main__":
                 vae.train()
 
             # save weights for future testing/ training/ probing every 1000
-            if global_step % 2000 == 1 and global_step != 1:
+            if (
+                train_cfg["ckpt_every"] > 0
+                and global_step % train_cfg["ckpt_every"] == 1
+                and global_step != 1
+            ):
                 checkpoint_path = f'logs/{run_id}/step_{global_step}.tar'
                 if checkpoint_id:
                     checkpoint_path = f'logs/{run_id}/step_{global_step}_from_{checkpoint_id}.tar'

@@ -4,7 +4,7 @@ import path from "path";
 
 function usageAndExit() {
   console.error(
-    "Usage: bun run tracker/lmtrackerapp.ts -f <run_dir> [-p <port>] [--log <logfile_name>] [--continued] [--compare-log <logfile_name_or_path>] [--tokenizer <tokenizer.pt>] [--attn-grid-cache <entries>] [--attn-prewarm <count|all>]"
+    "Usage: bun run tracker/lm/lmtrackerapp.ts -f <run_dir> [-p <port>] [--log <logfile_name>] [--continued] [--compare-log <logfile_name_or_path>] [--tokenizer <tokenizer.pt>] [--attn-grid-cache <entries>] [--attn-prewarm <count|all>]"
   );
   process.exit(1);
 }
@@ -172,8 +172,8 @@ if (!Number.isInteger(port) || port <= 0) {
 }
 
 const staticRoot = import.meta.dir;
-const repoRoot = path.resolve(staticRoot, "..");
-const htmlPath = path.join(staticRoot, "lm_index.html");
+const repoRoot = path.resolve(staticRoot, "..", "..");
+const htmlPath = path.join(staticRoot, "index.html");
 if (!fs.existsSync(htmlPath)) {
   console.error(`Missing frontend file: ${htmlPath}`);
   process.exit(1);

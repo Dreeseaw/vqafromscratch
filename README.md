@@ -37,7 +37,7 @@ To visualize the training process a bit better, codex wrote a nice little
 bun web app for us to track experiments in both real time and reload old ones.
 
 ```bash
-> cd tracker/ && bun run trackerapp.ts -f ../logs/<run_id> -p 3000
+> bun run tracker/vm/vmtrackerapp.ts -f logs/<run_id> -p 3000
 ```
 and navigate to `localhost:3000` in your browser. Multiple instances can be run for tab-by-tab comparisons.
 

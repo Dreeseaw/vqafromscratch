@@ -351,26 +351,26 @@ class Decoder(nn.Module):
         # latent comes with spatial structure - no need to recreate
         # seed does not upsample, but preps signal for upsampling
         self._seed = nn.Sequential(
-            nn.Conv2d(16, 64, kernel_size=3, padding=1),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(96, 128, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 192, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+            # nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            # nn.ReLU(inplace=True),
+            # nn.Conv2d(128, 192, kernel_size=3, padding=1),
+            # nn.ReLU(inplace=True),
         )
         
         # focused on upsampling into a real RGB image
         self._decoder = nn.Sequential(
-            ConvUpBlock_NoBN(192, 128, act=nn.Identity()),  # 7
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            ConvUpBlock_NoBN(128, 96, act=nn.Identity()),  # 7
+            nn.Conv2d(96, 96, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            ConvUpBlock_NoBN(128, 96),   # 14
-            nn.Conv2d(96, 64, kernel_size=3, padding=1),
+            ConvUpBlock_NoBN(96, 64),   # 14
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            # nn.Conv2d(64, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             ConvUpBlock_NoBN(64, 32),   # 28 
             ConvUpBlock_NoBN(32, 16),   # 56
