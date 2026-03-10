@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Research Progress Tracker</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <main class="wrap">
+    <header class="top">
+      <h1>Auto-Research Progress</h1>
+      <div id="updatedAt" class="muted mono"></div>
+    </header>
+
+    <section class="kpis" id="kpis"></section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Sweeps</h2>
+        <label class="muted mono">Filter
+          <select id="sweepFilter"></select>
+        </label>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Sweep</th>
+            <th>Status</th>
+            <th>Runs</th>
+            <th>Last Train CE</th>
+            <th>Started</th>
+            <th>Ended</th>
+          </tr>
+        </thead>
+        <tbody id="sweepsBody"></tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Runs</h2>
+        <span class="muted mono">final acc, latest train CE, params</span>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Run / Model</th>
+            <th>Final Acc</th>
+            <th>Last Train CE</th>
+            <th>Last Step</th>
+            <th>Steps/s</th>
+            <th>Params</th>
+            <th>Final Ckpt</th>
+          </tr>
+        </thead>
+        <tbody id="runsBody"></tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Docs (mm_bridge)</h2>
+        <span class="muted mono">Auto-discovered from docs directory</span>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Doc</th>
+            <th>Updated</th>
+            <th>Run Refs</th>
+            <th>Top Mentioned Acc</th>
+          </tr>
+        </thead>
+        <tbody id="docsBody"></tbody>
+      </table>
+      <div class="pager">
+        <button id="docsPrev" type="button">Prev</button>
+        <span id="docsPageLabel" class="muted mono">Page 1 / 1</span>
+        <button id="docsNext" type="button">Next</button>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Markdown Viewer</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <style>
+    .doc-wrap {
+      width: min(1000px, 95vw);
+      margin: 16px auto 30px;
+      background: #fff;
+      border: 1px solid #e5e8ef;
+      border-radius: 8px;
+      padding: 12px;
+    }
+    .doc-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      margin-bottom: 10px;
+    }
+    pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.45;
+      margin: 0;
+    }
+  </style>
+</head>
+<body>
+  <main class="doc-wrap">
+    <div class="doc-head">
+      <strong id="docTitle">Markdown</strong>
+      <a href="/" target="_blank" rel="noopener">Open Dashboard</a>
+    </div>
+    <pre id="docBody">Loading...</pre>
+  </main>
+  <script type="module" src="/doc.js"></script>
+</body>
+</html>
+

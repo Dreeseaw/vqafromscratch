@@ -11,11 +11,13 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import math
 import os
 import random
 import re
 import sys
 import time
+import gc
 from contextlib import nullcontext
 from dataclasses import asdict
 from types import SimpleNamespace
@@ -158,6 +160,7 @@ def _apply_runtime_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "vision_config": None,
         "vision_latent_dim": 768,
         "vision_cbld": 1536,
+        "vision_device": "auto",
         "vision_feature_mode": "auto",
         "vision_feature_source": "posterior_mu",
         "lm_checkpoint": None,
@@ -176,6 +179,32 @@ def _apply_runtime_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "bridge_token_reduce": "adaptive_pool",
         "bridge_learned_init_std": 0.02,
         "bridge_add_2d_pos_emb": False,
+        "bridge_num_heads": 8,
+        "bridge_attn_dropout": 0.0,
+        "bridge_query_depth": 2,
+        "bridge_refine_layers": 0,
+        "bridge_pre_mixer_type": "none",
+        "bridge_pre_mixer_layers": 1,
+        "bridge_pre_mixer_kernel_size": 3,
+        "bridge_hybrid_alpha_mode": "scalar",
+        "bridge_hybrid_alpha_init": 0.5,
+        "bridge_hybrid_image_bridge_type": "learned_query",
+        "bridge_question_conditioning": False,
+        "bridge_qcond_scale": 0.5,
+        "bridge_token_selector_type": "none",
+        "bridge_token_select_k": 0,
+        "prefix_calibration": False,
+        "prefix_calib_layernorm": True,
+        "prefix_calib_bias": True,
+        "prefix_calib_gate_init": 1.0,
+        "prefix_norm_target_ratio": 0.0,
+        "prefix_norm_reg_weight": 0.0,
+        "prefix_batchvar_reg_weight": 0.0,
+        "prefix_dropout": 0.0,
+        "lr_schedule": "constant",
+        "lr_warmup_steps": 0,
+        "lr_min_ratio": 0.1,
+        "cuda_empty_cache_after_eval": True,
         "images_root": "images",
         "annotations_root": "annotations",
         "max_question_length": 64,
@@ -185,6 +214,7 @@ def _apply_runtime_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "num_workers": 2,
         "prefetch_factor": 2,
         "pin_memory": True,
+        "grad_accum_steps": 1,
         "fixed_eval_count": 5,
         "freeze_mode": "bridge_only",
         "train_top_lm_layers": 1,
@@ -290,11 +320,23 @@ class VisionFeatureAdapter(nn.Module):
     - [B, C, H, W] (converted to [B, Nv, Dv])
     """
 
-    def __init__(self, vision_model: nn.Module, feature_mode: str = "auto", feature_source: str = "posterior_mu"):
+    def __init__(
+        self,
+        vision_model: nn.Module,
+        feature_mode: str = "auto",
+        feature_source: str = "posterior_mu",
+        *,
+        vision_device: Optional[str] = None,
+        output_device: Optional[str] = None,
+        force_no_grad: bool = True,
+    ):
         super().__init__()
         self.vision_model = vision_model
         self.feature_mode = feature_mode
         self.feature_source = feature_source
+        self.vision_device = None if vision_device in (None, "auto") else str(vision_device)
+        self.output_device = None if output_device in (None, "auto") else str(output_device)
+        self.force_no_grad = bool(force_no_grad)
 
     def _extract_raw(self, images: torch.Tensor) -> torch.Tensor:
         src = str(self.feature_source)
@@ -319,25 +361,86 @@ class VisionFeatureAdapter(nn.Module):
         raise ValueError("Could not extract tensor features from vision model output.")
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        x = self._extract_raw(images)
+        x_in = images
+        if self.vision_device is not None and str(x_in.device) != self.vision_device:
+            x_in = x_in.to(self.vision_device, non_blocking=True)
+        ctx = torch.no_grad() if self.force_no_grad else nullcontext()
+        with ctx:
+            x = self._extract_raw(x_in)
         if x.ndim == 4:
             x = x.flatten(2).transpose(1, 2)  # [B,C,H,W] -> [B,N,C]
         if self.feature_mode == "global":
             if x.ndim == 2:
-                return x
+                out = x
+                if self.output_device is not None and str(out.device) != self.output_device:
+                    out = out.to(self.output_device, non_blocking=True)
+                return out
             if x.ndim == 3:
-                return x.mean(dim=1)
+                out = x.mean(dim=1)
+                if self.output_device is not None and str(out.device) != self.output_device:
+                    out = out.to(self.output_device, non_blocking=True)
+                return out
             raise ValueError(f"Unsupported feature shape for global mode: {tuple(x.shape)}")
         if self.feature_mode == "token":
             if x.ndim == 3:
-                return x
+                out = x
+                if self.output_device is not None and str(out.device) != self.output_device:
+                    out = out.to(self.output_device, non_blocking=True)
+                return out
             if x.ndim == 2:
-                return x.unsqueeze(1)
+                out = x.unsqueeze(1)
+                if self.output_device is not None and str(out.device) != self.output_device:
+                    out = out.to(self.output_device, non_blocking=True)
+                return out
             raise ValueError(f"Unsupported feature shape for token mode: {tuple(x.shape)}")
         # auto
         if x.ndim in (2, 3):
-            return x
+            out = x
+            if self.output_device is not None and str(out.device) != self.output_device:
+                out = out.to(self.output_device, non_blocking=True)
+            return out
         raise ValueError(f"Unsupported feature shape for auto mode: {tuple(x.shape)}")
+
+
+class PrefixCalibrator(nn.Module):
+    """
+    Optional bridge-output calibrator to better match frozen LM embedding statistics.
+
+    y = gate * LN(x) + bias
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        *,
+        enabled: bool,
+        use_layernorm: bool,
+        use_bias: bool,
+        gate_init: float,
+    ) -> None:
+        super().__init__()
+        self.enabled = bool(enabled)
+        if not self.enabled:
+            self.ln = nn.Identity()
+            self.log_gate = None
+            self.bias = None
+            return
+
+        self.ln = nn.LayerNorm(int(dim), elementwise_affine=False) if bool(use_layernorm) else nn.Identity()
+        init = max(1e-5, float(gate_init))
+        self.log_gate = nn.Parameter(torch.full((1, 1, int(dim)), math.log(init)))
+        self.bias = nn.Parameter(torch.zeros(1, 1, int(dim))) if bool(use_bias) else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.enabled:
+            return x
+        y = self.ln(x)
+        assert self.log_gate is not None
+        gate = torch.exp(self.log_gate).clamp(min=1e-5, max=100.0)
+        y = y * gate
+        if self.bias is not None:
+            y = y + self.bias
+        return y
 
 
 class MultimodalPrefixLM(nn.Module):
@@ -348,12 +451,33 @@ class MultimodalPrefixLM(nn.Module):
         lm: TransformerDecoderOnlyV1,
         *,
         lm_autocast: bool = True,
+        prefix_calibration: bool = False,
+        prefix_calib_layernorm: bool = True,
+        prefix_calib_bias: bool = True,
+        prefix_calib_gate_init: float = 1.0,
+        prefix_norm_target_ratio: float = 0.0,
+        prefix_norm_reg_weight: float = 0.0,
+        prefix_batchvar_reg_weight: float = 0.0,
+        prefix_dropout: float = 0.0,
     ):
         super().__init__()
         self.vision_adapter = vision_adapter
         self.bridge = bridge
         self.lm = lm
         self.lm_autocast = bool(lm_autocast)
+        d_model = int(getattr(lm._config, "embed_size"))
+        self.prefix_calibrator = PrefixCalibrator(
+            d_model,
+            enabled=bool(prefix_calibration),
+            use_layernorm=bool(prefix_calib_layernorm),
+            use_bias=bool(prefix_calib_bias),
+            gate_init=float(prefix_calib_gate_init),
+        )
+        self.prefix_calibration = bool(prefix_calibration)
+        self.prefix_norm_target_ratio = float(prefix_norm_target_ratio)
+        self.prefix_norm_reg_weight = float(prefix_norm_reg_weight)
+        self.prefix_batchvar_reg_weight = float(prefix_batchvar_reg_weight)
+        self.prefix_dropout = max(0.0, float(prefix_dropout))
 
     def _lm_autocast_dtype(self) -> Optional[torch.dtype]:
         if not self.lm_autocast:
@@ -364,6 +488,24 @@ class MultimodalPrefixLM(nn.Module):
             return torch.bfloat16
         return torch.float16
 
+    @staticmethod
+    def _question_context_from_text(
+        text_emb: torch.Tensor,
+        text_pad_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        valid = (~text_pad_mask).unsqueeze(-1).float()
+        denom = valid.sum(dim=1).clamp_min(1.0)
+        return (text_emb * valid).sum(dim=1) / denom
+
+    def _bridge_forward(
+        self,
+        bridge_input: torch.Tensor,
+        question_context: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if bool(getattr(self.bridge, "supports_question_context", False)):
+            return self.bridge(bridge_input, question_context=question_context)
+        return self.bridge(bridge_input)
+
     def forward_logits(
         self,
         input_ids: torch.Tensor,
@@ -371,16 +513,24 @@ class MultimodalPrefixLM(nn.Module):
         text_pad_mask: torch.Tensor,
         *,
         debug_shapes: bool = False,
-    ) -> Tuple[torch.Tensor, int]:
+        return_aux: bool = False,
+    ) -> Tuple[torch.Tensor, int] | Tuple[torch.Tensor, int, Dict[str, torch.Tensor]]:
+        text_emb = self.lm._embed_dropout(self.lm._embed(input_ids))
+        question_context: Optional[torch.Tensor] = None
+        if bool(getattr(self.bridge, "supports_question_context", False)):
+            question_context = self._question_context_from_text(text_emb, text_pad_mask)
+
         needs_visual = bool(getattr(self.bridge, "requires_visual_features", True))
         visual_features: Optional[torch.Tensor] = None
         if needs_visual:
             visual_features = self.vision_adapter(images)
-            visual_prefix = self.bridge(visual_features)
+            visual_prefix = self._bridge_forward(visual_features, question_context)
         else:
             # Image-agnostic bridge baselines only need batch size/device from images.
-            visual_prefix = self.bridge(images)
-        text_emb = self.lm._embed_dropout(self.lm._embed(input_ids))
+            visual_prefix = self._bridge_forward(images, question_context)
+        visual_prefix = self.prefix_calibrator(visual_prefix)
+        if self.prefix_dropout > 0.0 and self.training:
+            visual_prefix = F.dropout(visual_prefix, p=self.prefix_dropout, training=True)
         x = torch.cat([visual_prefix, text_emb], dim=1)
 
         b = int(input_ids.shape[0])
@@ -417,7 +567,14 @@ class MultimodalPrefixLM(nn.Module):
             print(f"[mm:shape] visual_prefix={tuple(visual_prefix.shape)}")
             print(f"[mm:shape] text_ids={tuple(input_ids.shape)} text_emb={tuple(text_emb.shape)}")
             print(f"[mm:shape] combined={tuple(x.shape)} logits={tuple(logits.shape)}")
-        return logits, k
+        if not return_aux:
+            return logits, k
+        aux = {
+            "prefix_norm_mean": visual_prefix.norm(dim=-1).mean(),
+            "text_norm_mean": text_emb.norm(dim=-1).mean(),
+            "prefix_batch_variance_mean": visual_prefix.var(dim=0, unbiased=False).mean(),
+        }
+        return logits, k, aux
 
     def compute_loss(
         self,
@@ -426,11 +583,12 @@ class MultimodalPrefixLM(nn.Module):
         answer_only: bool = True,
         debug_shapes: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        logits, prefix_k = self.forward_logits(
+        logits, prefix_k, aux = self.forward_logits(
             input_ids=batch["input_ids"],
             images=batch["images"],
             text_pad_mask=batch["text_pad_mask"],
             debug_shapes=debug_shapes,
+            return_aux=True,
         )
         text_logits = logits[:, prefix_k:, :]
         if text_logits.shape[1] < 2:
@@ -445,8 +603,29 @@ class MultimodalPrefixLM(nn.Module):
         if answer_only:
             valid = valid & batch["answer_loss_mask"]
         denom = valid.sum().clamp_min(1)
-        loss = (ce * valid.float()).sum() / denom
-        return loss, {"loss_tokens": float(denom.item())}
+        ce_loss = (ce * valid.float()).sum() / denom
+        loss = ce_loss
+
+        info: Dict[str, float] = {
+            "loss_tokens": float(denom.item()),
+            "loss_ce": float(ce_loss.item()),
+            "prefix_norm_mean": float(aux["prefix_norm_mean"].item()),
+            "text_norm_mean": float(aux["text_norm_mean"].item()),
+            "prefix_batch_variance_mean": float(aux["prefix_batch_variance_mean"].item()),
+        }
+
+        if self.prefix_norm_reg_weight > 0.0 and self.prefix_norm_target_ratio > 0.0:
+            ratio = aux["prefix_norm_mean"] / aux["text_norm_mean"].clamp_min(1e-8)
+            reg = (ratio - float(self.prefix_norm_target_ratio)) ** 2
+            loss = loss + float(self.prefix_norm_reg_weight) * reg
+            info["loss_prefix_norm_reg"] = float(reg.item())
+            info["prefix_text_norm_ratio"] = float(ratio.item())
+        if self.prefix_batchvar_reg_weight > 0.0:
+            reg_var = aux["prefix_batch_variance_mean"]
+            loss = loss + float(self.prefix_batchvar_reg_weight) * reg_var
+            info["loss_prefix_batchvar_reg"] = float(reg_var.item())
+
+        return loss, info
 
     @torch.no_grad()
     def generate_answers(
@@ -622,6 +801,8 @@ def configure_freezing(model: MultimodalPrefixLM, args: argparse.Namespace) -> N
         p.requires_grad_(False)
     for p in model.bridge.parameters():
         p.requires_grad_(True)
+    for p in model.prefix_calibrator.parameters():
+        p.requires_grad_(True)
 
     mode = str(args.freeze_mode)
     if mode == "bridge_only":
@@ -742,7 +923,8 @@ def build_runtime_from_args(
     args.tokenizer_path = tokenizer_path
     tokenizer = ByteBPETokenizer.load(tokenizer_path)
 
-    vision = build_vision_model_from_args(args, device=device, ckpt_payload=checkpoint_payload)
+    vision_device = device if str(args.vision_device) == "auto" else resolve_device(str(args.vision_device))
+    vision = build_vision_model_from_args(args, device=vision_device, ckpt_payload=checkpoint_payload)
     lm = build_lm_from_args(args, tokenizer=tokenizer, device=device, ckpt_payload=checkpoint_payload)
     feature_mode = args.vision_feature_mode
     feature_source = args.vision_feature_source
@@ -754,6 +936,9 @@ def build_runtime_from_args(
         vision_model=vision,
         feature_mode=feature_mode,
         feature_source=feature_source,
+        vision_device=vision_device,
+        output_device=device,
+        force_no_grad=True,
     )
 
     bcfg_data = {
@@ -765,6 +950,20 @@ def build_runtime_from_args(
         "token_reduce": args.bridge_token_reduce,
         "learned_init_std": args.bridge_learned_init_std,
         "add_2d_pos_emb": bool(args.bridge_add_2d_pos_emb),
+        "bridge_num_heads": int(args.bridge_num_heads),
+        "bridge_attn_dropout": float(args.bridge_attn_dropout),
+        "bridge_query_depth": int(args.bridge_query_depth),
+        "bridge_refine_layers": int(args.bridge_refine_layers),
+        "bridge_pre_mixer_type": str(args.bridge_pre_mixer_type),
+        "bridge_pre_mixer_layers": int(args.bridge_pre_mixer_layers),
+        "bridge_pre_mixer_kernel_size": int(args.bridge_pre_mixer_kernel_size),
+        "bridge_hybrid_alpha_mode": str(args.bridge_hybrid_alpha_mode),
+        "bridge_hybrid_alpha_init": float(args.bridge_hybrid_alpha_init),
+        "bridge_hybrid_image_bridge_type": str(args.bridge_hybrid_image_bridge_type),
+        "bridge_question_conditioning": bool(args.bridge_question_conditioning),
+        "bridge_qcond_scale": float(args.bridge_qcond_scale),
+        "bridge_token_selector_type": str(args.bridge_token_selector_type),
+        "bridge_token_select_k": int(args.bridge_token_select_k),
     }
     if checkpoint_payload is not None and isinstance(checkpoint_payload.get("bridge_config"), dict):
         bcfg_data.update(dict(checkpoint_payload["bridge_config"]))
@@ -776,7 +975,17 @@ def build_runtime_from_args(
         bridge=bridge,
         lm=lm,
         lm_autocast=bool(args.mm_lm_autocast),
+        prefix_calibration=bool(args.prefix_calibration),
+        prefix_calib_layernorm=bool(args.prefix_calib_layernorm),
+        prefix_calib_bias=bool(args.prefix_calib_bias),
+        prefix_calib_gate_init=float(args.prefix_calib_gate_init),
+        prefix_norm_target_ratio=float(args.prefix_norm_target_ratio),
+        prefix_norm_reg_weight=float(args.prefix_norm_reg_weight),
+        prefix_batchvar_reg_weight=float(args.prefix_batchvar_reg_weight),
+        prefix_dropout=float(args.prefix_dropout),
     ).to(device)
+    if str(vision_device) != str(device):
+        model.vision_adapter.vision_model.to(vision_device)
     return model, tokenizer, bridge_cfg
 
 
@@ -1104,6 +1313,16 @@ def print_eval_summary(logger: Logger, split: str, summary: Dict[str, Any]) -> N
         )
 
 
+def maybe_cuda_empty_cache(logger: Logger, *, enabled: bool, tag: str) -> None:
+    if not bool(enabled):
+        return
+    if not torch.cuda.is_available():
+        return
+    gc.collect()
+    torch.cuda.empty_cache()
+    logger.log(f"[mm] cuda empty_cache after {tag}")
+
+
 def log_startup_config(
     logger: Logger,
     args: argparse.Namespace,
@@ -1124,7 +1343,8 @@ def log_startup_config(
     )
     logger.log(
         f"[mm] vision model={args.vision_model} ckpt={args.vision_checkpoint} "
-        f"feature_source={args.vision_feature_source} feature_mode={args.vision_feature_mode}"
+        f"feature_source={args.vision_feature_source} feature_mode={args.vision_feature_mode} "
+        f"vision_device={args.vision_device}"
     )
     logger.log(
         f"[mm] lm ckpt={args.lm_checkpoint} tokenizer={args.tokenizer_path} vocab={tokenizer.vocab_size}"
@@ -1132,7 +1352,22 @@ def log_startup_config(
     logger.log(
         f"[mm] bridge type={bridge_cfg.bridge_type} visual_tokens={bridge_cfg.num_visual_tokens} "
         f"hidden={bridge_cfg.bridge_hidden_dim} token_reduce={bridge_cfg.token_reduce} "
-        f"learned_init_std={bridge_cfg.learned_init_std:.6g} add_2d_pos_emb={int(bool(bridge_cfg.add_2d_pos_emb))}"
+        f"learned_init_std={bridge_cfg.learned_init_std:.6g} add_2d_pos_emb={int(bool(bridge_cfg.add_2d_pos_emb))} "
+        f"heads={bridge_cfg.bridge_num_heads} depth={bridge_cfg.bridge_query_depth} "
+        f"refine={bridge_cfg.bridge_refine_layers} pre_mixer={bridge_cfg.bridge_pre_mixer_type} "
+        f"hybrid_alpha_mode={bridge_cfg.bridge_hybrid_alpha_mode} "
+        f"qcond={int(bool(bridge_cfg.bridge_question_conditioning))} qcond_scale={bridge_cfg.bridge_qcond_scale:.6g} "
+        f"token_selector={bridge_cfg.bridge_token_selector_type} token_select_k={bridge_cfg.bridge_token_select_k}"
+    )
+    logger.log(
+        f"[mm] prefix_calibration={int(bool(args.prefix_calibration))} "
+        f"prefix_calib_layernorm={int(bool(args.prefix_calib_layernorm))} "
+        f"prefix_calib_bias={int(bool(args.prefix_calib_bias))} "
+        f"prefix_calib_gate_init={float(args.prefix_calib_gate_init):.6g} "
+        f"prefix_norm_target_ratio={float(args.prefix_norm_target_ratio):.6g} "
+        f"prefix_norm_reg_weight={float(args.prefix_norm_reg_weight):.6g} "
+        f"prefix_batchvar_reg_weight={float(args.prefix_batchvar_reg_weight):.6g} "
+        f"prefix_dropout={float(args.prefix_dropout):.6g}"
     )
     logger.log(
         f"[mm] freeze_mode={args.freeze_mode} train_top_lm_layers={args.train_top_lm_layers} "
@@ -1143,7 +1378,8 @@ def log_startup_config(
     )
     logger.log(
         f"[mm] dataloader batch_size={args.batch_size} num_workers={args.num_workers} "
-        f"prefetch_factor={args.prefetch_factor} pin_memory={int(bool(args.pin_memory))}"
+        f"prefetch_factor={args.prefetch_factor} pin_memory={int(bool(args.pin_memory))} "
+        f"grad_accum_steps={args.grad_accum_steps} effective_batch_size={int(args.batch_size) * max(1, int(args.grad_accum_steps))}"
     )
     logger.log(
         f"[mm] data images_root={args.images_root} annotations_root={args.annotations_root} "
@@ -1151,6 +1387,8 @@ def log_startup_config(
     )
     logger.log(
         f"[mm] loop epochs={args.epochs} max_steps={args.max_steps} overfit_small_batch={int(bool(args.overfit_small_batch))} "
+        f"lr_schedule={args.lr_schedule} lr_warmup_steps={args.lr_warmup_steps} lr_min_ratio={args.lr_min_ratio} "
+        f"cuda_empty_cache_after_eval={int(bool(args.cuda_empty_cache_after_eval))} "
         f"log_every={args.log_every} eval_every={args.eval_every} eval_batches={args.eval_batches} "
         f"eval_log_every={args.eval_log_every} eval_scorer={args.eval_scorer} "
         f"fixed_eval_count={args.fixed_eval_count} ckpt_every={args.ckpt_every} "
@@ -1174,6 +1412,13 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--vision_config", type=str, default=None)
     ap.add_argument("--vision_latent_dim", type=int, default=768)
     ap.add_argument("--vision_cbld", type=int, default=1536)
+    ap.add_argument(
+        "--vision_device",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda", "mps"],
+        help="Device used for frozen vision encoder forward. 'auto' follows main --device.",
+    )
     ap.add_argument(
         "--vision_feature_source",
         type=str,
@@ -1205,7 +1450,20 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--tokenizer_path", type=str, default=None)
 
-    ap.add_argument("--bridge_type", type=str, default="mlp", choices=["mlp", "learned_tokens"])
+    ap.add_argument(
+        "--bridge_type",
+        type=str,
+        default="mlp",
+        choices=[
+            "mlp",
+            "learned_tokens",
+            "learned_query",
+            "query_cross_attn",
+            "perceiver_resampler",
+            "qformer_lite",
+            "hybrid_const_image",
+        ],
+    )
     ap.add_argument("--bridge_hidden_dim", type=int, default=1024)
     ap.add_argument("--num_visual_tokens", type=int, default=8)
     ap.add_argument(
@@ -1225,6 +1483,104 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="adaptive_pool",
         choices=["adaptive_pool", "mean_expand", "all"],
+    )
+    ap.add_argument("--bridge_num_heads", type=int, default=8)
+    ap.add_argument("--bridge_attn_dropout", type=float, default=0.0)
+    ap.add_argument("--bridge_query_depth", type=int, default=2)
+    ap.add_argument("--bridge_refine_layers", type=int, default=0)
+    ap.add_argument(
+        "--bridge_pre_mixer_type",
+        type=str,
+        default="none",
+        choices=["none", "self_attn", "conv1d"],
+    )
+    ap.add_argument("--bridge_pre_mixer_layers", type=int, default=1)
+    ap.add_argument("--bridge_pre_mixer_kernel_size", type=int, default=3)
+    ap.add_argument(
+        "--bridge_hybrid_alpha_mode",
+        type=str,
+        default="scalar",
+        choices=["scalar", "token"],
+    )
+    ap.add_argument("--bridge_hybrid_alpha_init", type=float, default=0.5)
+    ap.add_argument(
+        "--bridge_hybrid_image_bridge_type",
+        type=str,
+        default="learned_query",
+        choices=["mlp", "learned_query", "query_cross_attn", "perceiver_resampler", "qformer_lite"],
+    )
+    ap.add_argument(
+        "--bridge_question_conditioning",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Condition perceiver/hybrid image extraction on pooled question embeddings.",
+    )
+    ap.add_argument(
+        "--bridge_qcond_scale",
+        type=float,
+        default=0.5,
+        help="Scale factor for question-conditioned FiLM modulation in perceiver latents.",
+    )
+    ap.add_argument(
+        "--bridge_token_selector_type",
+        type=str,
+        default="none",
+        choices=["none", "topk"],
+        help="Optional token selector before query/cross-attention bridges.",
+    )
+    ap.add_argument(
+        "--bridge_token_select_k",
+        type=int,
+        default=0,
+        help="Selected token count when --bridge_token_selector_type=topk (<=0 disables).",
+    )
+    ap.add_argument(
+        "--prefix_calibration",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable bridge output calibration: y = gate * LN(prefix) + bias.",
+    )
+    ap.add_argument(
+        "--prefix_calib_layernorm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply LayerNorm inside prefix calibration.",
+    )
+    ap.add_argument(
+        "--prefix_calib_bias",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use trainable additive bias in prefix calibration.",
+    )
+    ap.add_argument(
+        "--prefix_calib_gate_init",
+        type=float,
+        default=1.0,
+        help="Initial multiplicative gate for calibrated prefix tokens.",
+    )
+    ap.add_argument(
+        "--prefix_norm_target_ratio",
+        type=float,
+        default=0.0,
+        help="Target ratio (prefix_norm / text_norm). <=0 disables ratio target.",
+    )
+    ap.add_argument(
+        "--prefix_norm_reg_weight",
+        type=float,
+        default=0.0,
+        help="Weight for (prefix/text norm ratio - target)^2 regularization.",
+    )
+    ap.add_argument(
+        "--prefix_batchvar_reg_weight",
+        type=float,
+        default=0.0,
+        help="Weight for prefix batch-variance penalty (stability regularization).",
+    )
+    ap.add_argument(
+        "--prefix_dropout",
+        type=float,
+        default=0.0,
+        help="Dropout probability applied to calibrated visual prefix during training.",
     )
 
     ap.add_argument(
@@ -1253,16 +1609,26 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--overfit_steps", type=int, default=200)
 
     ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--lr_schedule", type=str, default="constant", choices=["constant", "cosine"])
+    ap.add_argument("--lr_warmup_steps", type=int, default=0)
+    ap.add_argument("--lr_min_ratio", type=float, default=0.1)
     ap.add_argument("--weight_decay", type=float, default=0.0)
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--prefetch_factor", type=int, default=2)
     ap.add_argument("--pin_memory", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--grad_accum_steps", type=int, default=1)
 
     ap.add_argument("--log_every", type=int, default=20)
     ap.add_argument("--eval_every", type=int, default=500)
     ap.add_argument("--eval_batches", type=int, default=20)
     ap.add_argument("--eval_log_every", type=int, default=10)
+    ap.add_argument(
+        "--cuda_empty_cache_after_eval",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Call gc.collect()+torch.cuda.empty_cache() before/after eval loops to reduce eval-induced slowdown.",
+    )
     ap.add_argument("--fixed_eval_count", type=int, default=5)
     ap.add_argument(
         "--final_sanity_count",
@@ -1405,6 +1771,11 @@ def main() -> None:
         opt.load_state_dict(resume_payload["optimizer_state_dict"])
 
     if args.eval_only:
+        maybe_cuda_empty_cache(
+            logger,
+            enabled=bool(args.cuda_empty_cache_after_eval),
+            tag="eval_only_pre_eval",
+        )
         records = run_generation_predictions(
             model=model,
             loader=val_loader,
@@ -1432,6 +1803,11 @@ def main() -> None:
             tag="eval_only",
             logger=logger,
         )
+        maybe_cuda_empty_cache(
+            logger,
+            enabled=bool(args.cuda_empty_cache_after_eval),
+            tag="eval_only_post_eval",
+        )
         if args.save_predictions_jsonl:
             with open(args.save_predictions_jsonl, "w", encoding="utf-8") as f:
                 for r in records:
@@ -1450,6 +1826,7 @@ def main() -> None:
         return
 
     debug_shape_once = bool(args.debug_shapes)
+    accum_steps = max(1, int(args.grad_accum_steps))
     train_iter: Iterable[Dict[str, Any]]
     fixed_batch = None
     if args.overfit_small_batch:
@@ -1466,8 +1843,131 @@ def main() -> None:
         train_iter = ()
 
     steps_budget = int(args.max_steps) if int(args.max_steps) > 0 else None
+    for pg in opt.param_groups:
+        pg["base_lr"] = float(pg.get("base_lr", pg["lr"]))
+
+    def _lr_scale(step_id: int) -> float:
+        sched = str(args.lr_schedule)
+        if sched == "constant":
+            return 1.0
+        if sched != "cosine":
+            raise ValueError(f"Unsupported lr schedule: {sched}")
+        warm = max(0, int(args.lr_warmup_steps))
+        min_ratio = float(args.lr_min_ratio)
+        min_ratio = max(0.0, min(1.0, min_ratio))
+        if warm > 0 and step_id <= warm:
+            return max(1e-8, float(step_id) / float(warm))
+        if steps_budget is None or int(steps_budget) <= 0:
+            return 1.0
+        if step_id >= int(steps_budget):
+            return min_ratio
+        denom = max(1, int(steps_budget) - warm)
+        progress = (float(step_id) - float(warm)) / float(denom)
+        progress = max(0.0, min(1.0, progress))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_ratio + (1.0 - min_ratio) * cosine
+
+    def _set_optimizer_lr(scale: float) -> float:
+        for pg in opt.param_groups:
+            pg["lr"] = float(pg["base_lr"]) * float(scale)
+        return float(opt.param_groups[0]["lr"])
+
+    def _optimizer_step() -> None:
+        if use_scaler:
+            if float(args.grad_clip) > 0:
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(optim_params, float(args.grad_clip))
+            scaler.step(opt)
+            scaler.update()
+        else:
+            if float(args.grad_clip) > 0:
+                torch.nn.utils.clip_grad_norm_(optim_params, float(args.grad_clip))
+            opt.step()
+        opt.zero_grad(set_to_none=True)
+
+    def _post_optimizer_step(
+        *,
+        loss_value: float,
+        info_dict: Dict[str, float],
+        current_lr: float,
+    ) -> None:
+        if global_step % int(args.log_every) == 0:
+            elapsed = max(1e-6, time.time() - start_time)
+            tok_count = int(info_dict.get("loss_tokens", 0.0))
+            loss_ce = float(info_dict.get("loss_ce", loss_value))
+            ratio = info_dict.get("prefix_text_norm_ratio", None)
+            reg_norm = info_dict.get("loss_prefix_norm_reg", None)
+            reg_var = info_dict.get("loss_prefix_batchvar_reg", None)
+            ratio_txt = "" if ratio is None else f" pfx_txt_norm_ratio={float(ratio):.4f}"
+            reg_txt = ""
+            if reg_norm is not None:
+                reg_txt += f" reg_norm={float(reg_norm):.6f}"
+            if reg_var is not None:
+                reg_txt += f" reg_var={float(reg_var):.6f}"
+            logger.log(
+                f"[mm] step={global_step} epoch={epoch} loss={float(loss_value):.4f} "
+                f"loss_ce={loss_ce:.4f} loss_tokens={tok_count}{ratio_txt}{reg_txt} "
+                f"lr={current_lr:.6g} steps_per_s={global_step / elapsed:.2f}"
+            )
+
+        if int(args.eval_every) > 0 and global_step % int(args.eval_every) == 0:
+            maybe_cuda_empty_cache(
+                logger,
+                enabled=bool(args.cuda_empty_cache_after_eval),
+                tag=f"periodic_eval_pre_step_{global_step}",
+            )
+            records = run_generation_predictions(
+                model=model,
+                loader=val_loader,
+                tokenizer=tokenizer,
+                device=device,
+                max_answer_length=int(args.max_answer_length),
+                max_batches=int(args.eval_batches),
+                debug_shapes=False,
+                logger=logger,
+                split_name=args.eval_split,
+                log_every=int(args.eval_log_every),
+            )
+            summary = evaluate_records(
+                records,
+                qualitative_samples=int(args.qualitative_samples),
+                confusion_top_k=int(args.confusion_top_k),
+                scorer=str(args.eval_scorer),
+            )
+            print_eval_summary(logger, args.eval_split, summary)
+            append_fixed_eval_answers(
+                fixed_eval_tracker,
+                records,
+                global_step=global_step,
+                epoch=epoch,
+                tag="periodic_eval",
+                logger=logger,
+            )
+            maybe_cuda_empty_cache(
+                logger,
+                enabled=bool(args.cuda_empty_cache_after_eval),
+                tag=f"periodic_eval_post_step_{global_step}",
+            )
+
+        if int(args.ckpt_every) > 0 and global_step % int(args.ckpt_every) == 0:
+            ckpt_path = _checkpoint_path(args.run_id, global_step)
+            save_mm_checkpoint(
+                ckpt_path,
+                model,
+                opt,
+                global_step=global_step,
+                epoch=epoch,
+                args=args,
+                bridge_cfg=bridge_cfg,
+            )
+            logger.log(f"[mm] checkpoint saved: {ckpt_path}")
+
     epoch = start_epoch
     start_time = time.time()
+    opt.zero_grad(set_to_none=True)
+    accum_count = 0
+    accum_loss_sum = 0.0
+    accum_info_sums: Dict[str, float] = {}
 
     while True:
         epoch += 1
@@ -1479,6 +1979,7 @@ def main() -> None:
             iter_obj = train_loader
 
         for batch in iter_obj:
+            current_lr = _set_optimizer_lr(_lr_scale(global_step + 1))
             _set_module_modes(model, args.freeze_mode)
             batch = _to_device(batch, device)
             ctx = torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_enabled) if amp_enabled else nullcontext()
@@ -1490,73 +1991,63 @@ def main() -> None:
                 )
             debug_shape_once = False
 
-            opt.zero_grad(set_to_none=True)
+            loss_back = loss / float(accum_steps)
             if use_scaler:
-                scaler.scale(loss).backward()
-                if float(args.grad_clip) > 0:
-                    scaler.unscale_(opt)
-                    torch.nn.utils.clip_grad_norm_(optim_params, float(args.grad_clip))
-                scaler.step(opt)
-                scaler.update()
+                scaler.scale(loss_back).backward()
             else:
-                loss.backward()
-                if float(args.grad_clip) > 0:
-                    torch.nn.utils.clip_grad_norm_(optim_params, float(args.grad_clip))
-                opt.step()
+                loss_back.backward()
+            accum_count += 1
+            accum_loss_sum += float(loss.item())
+            for k, v in info.items():
+                accum_info_sums[k] = float(accum_info_sums.get(k, 0.0)) + float(v)
 
+            should_step = accum_count >= accum_steps
+            if steps_budget is not None and (global_step + 1) >= steps_budget:
+                should_step = True
+            if not should_step:
+                continue
+
+            _optimizer_step()
             global_step += 1
-            if global_step % int(args.log_every) == 0:
-                elapsed = max(1e-6, time.time() - start_time)
-                tok_count = int(info.get("loss_tokens", 0.0))
-                logger.log(
-                    f"[mm] step={global_step} epoch={epoch} loss={float(loss.item()):.4f} "
-                    f"loss_tokens={tok_count} steps_per_s={global_step / elapsed:.2f}"
-                )
+            info_step: Dict[str, float] = {}
+            for k, v in accum_info_sums.items():
+                if k == "loss_tokens":
+                    info_step[k] = float(v)
+                else:
+                    info_step[k] = float(v) / max(1.0, float(accum_count))
+            loss_step = float(accum_loss_sum) / max(1.0, float(accum_count))
+            accum_count = 0
+            accum_loss_sum = 0.0
+            accum_info_sums = {}
 
-            if int(args.eval_every) > 0 and global_step % int(args.eval_every) == 0:
-                records = run_generation_predictions(
-                    model=model,
-                    loader=val_loader,
-                    tokenizer=tokenizer,
-                    device=device,
-                    max_answer_length=int(args.max_answer_length),
-                    max_batches=int(args.eval_batches),
-                    debug_shapes=False,
-                    logger=logger,
-                    split_name=args.eval_split,
-                    log_every=int(args.eval_log_every),
-                )
-                summary = evaluate_records(
-                    records,
-                    qualitative_samples=int(args.qualitative_samples),
-                    confusion_top_k=int(args.confusion_top_k),
-                    scorer=str(args.eval_scorer),
-                )
-                print_eval_summary(logger, args.eval_split, summary)
-                append_fixed_eval_answers(
-                    fixed_eval_tracker,
-                    records,
-                    global_step=global_step,
-                    epoch=epoch,
-                    tag="periodic_eval",
-                    logger=logger,
-                )
-
-            if int(args.ckpt_every) > 0 and global_step % int(args.ckpt_every) == 0:
-                ckpt_path = _checkpoint_path(args.run_id, global_step)
-                save_mm_checkpoint(
-                    ckpt_path,
-                    model,
-                    opt,
-                    global_step=global_step,
-                    epoch=epoch,
-                    args=args,
-                    bridge_cfg=bridge_cfg,
-                )
-                logger.log(f"[mm] checkpoint saved: {ckpt_path}")
+            _post_optimizer_step(
+                loss_value=loss_step,
+                info_dict=info_step,
+                current_lr=current_lr,
+            )
 
             if steps_budget is not None and global_step >= steps_budget:
                 break
+
+        if accum_count > 0 and (steps_budget is None or global_step < steps_budget):
+            current_lr = _set_optimizer_lr(_lr_scale(global_step + 1))
+            _optimizer_step()
+            global_step += 1
+            info_step = {}
+            for k, v in accum_info_sums.items():
+                if k == "loss_tokens":
+                    info_step[k] = float(v)
+                else:
+                    info_step[k] = float(v) / max(1.0, float(accum_count))
+            loss_step = float(accum_loss_sum) / max(1.0, float(accum_count))
+            accum_count = 0
+            accum_loss_sum = 0.0
+            accum_info_sums = {}
+            _post_optimizer_step(
+                loss_value=loss_step,
+                info_dict=info_step,
+                current_lr=current_lr,
+            )
 
         if steps_budget is not None and global_step >= steps_budget:
             break
@@ -1577,6 +2068,11 @@ def main() -> None:
     )
     logger.log(f"[mm] final checkpoint: {final_ckpt}")
 
+    maybe_cuda_empty_cache(
+        logger,
+        enabled=bool(args.cuda_empty_cache_after_eval),
+        tag="final_eval_pre",
+    )
     records = run_generation_predictions(
         model=model,
         loader=val_loader,
@@ -1603,6 +2099,11 @@ def main() -> None:
         epoch=epoch,
         tag="final_eval",
         logger=logger,
+    )
+    maybe_cuda_empty_cache(
+        logger,
+        enabled=bool(args.cuda_empty_cache_after_eval),
+        tag="final_eval_post",
     )
     if args.save_predictions_jsonl:
         with open(args.save_predictions_jsonl, "w", encoding="utf-8") as f:
