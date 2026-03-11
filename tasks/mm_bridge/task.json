@@ -1,0 +1,10 @@
+{
+  "id": "mm_bridge",
+  "title": "MM Bridge",
+  "description": "Frozen multimodal bridge VQA autoresearch task.",
+  "docsDir": "tasks/mm_bridge/docs",
+  "scriptsDir": "tasks/mm_bridge/scripts",
+  "logsDir": "logs",
+  "default": true,
+  "qaPromptHint": "Focus on diagnosing multimodal bridge VQA sweeps, active queues, architecture regressions, throughput tradeoffs, and next experiment choices."
+}

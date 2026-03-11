@@ -10,11 +10,38 @@
 <body>
   <main class="wrap">
     <header class="top">
-      <h1>Auto-Research Progress</h1>
-      <div id="updatedAt" class="muted mono"></div>
+      <div>
+        <h1>Auto-Research Progress</h1>
+        <div id="taskTitle" class="task-title">Task</div>
+        <div id="taskMeta" class="muted">Loading task...</div>
+      </div>
+      <div class="top-actions">
+        <label class="muted mono">Task
+          <select id="taskSelect"></select>
+        </label>
+        <div id="updatedAt" class="muted mono"></div>
+      </div>
     </header>
 
     <section class="kpis" id="kpis"></section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>Task QA</h2>
+          <div id="taskQaHint" class="muted">Ask about the task as a whole.</div>
+        </div>
+      </div>
+      <div id="taskQaStarters" class="qa-starters"></div>
+      <div id="taskQaThread" class="qa-thread"></div>
+      <form id="taskQaForm" class="qa-form">
+        <textarea id="taskQaInput" rows="3" placeholder="Ask why the task is weak, what changed, or what to try next."></textarea>
+        <div class="qa-form-actions">
+          <span id="taskQaStatus" class="muted mono"></span>
+          <button id="taskQaSubmit" type="submit">Ask</button>
+        </div>
+      </form>
+    </section>
 
     <section class="panel">
       <div class="panel-head">
@@ -88,8 +115,8 @@
 
     <section class="panel">
       <div class="panel-head">
-        <h2>Docs (mm_bridge)</h2>
-        <span class="muted mono">Auto-discovered from docs directory</span>
+        <h2>Docs</h2>
+        <span id="docsHint" class="muted mono">Auto-discovered from task docs directory</span>
       </div>
       <div class="table-wrap">
         <table>

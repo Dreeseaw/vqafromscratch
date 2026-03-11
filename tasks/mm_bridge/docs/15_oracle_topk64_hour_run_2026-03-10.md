@@ -23,7 +23,7 @@ Run one additional oracle-focused experiment for the next hour-ish without perio
 
 ## Launcher
 
-- Script: `scripts/launch_oracle_topk64_single_run.sh`
+- Script: `tasks/mm_bridge/scripts/launch_oracle_topk64_single_run.sh`
 - Resume behavior:
   - skips if `step_5000.tar` exists
   - resumes from latest `step_<N>.tar` if interrupted
@@ -31,5 +31,5 @@ Run one additional oracle-focused experiment for the next hour-ish without perio
 ## Launch command
 
 ```bash
-./scripts/launch_oracle_topk64_single_run.sh
+./tasks/mm_bridge/scripts/launch_oracle_topk64_single_run.sh
 ```

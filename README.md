@@ -43,18 +43,23 @@ and navigate to `localhost:3000` in your browser. Multiple instances can be run 
 
 Auto-Research Progress Tracker
 ------------------------------
-Minimal Bun + HTML/TS/CSS dashboard that auto-discovers:
-- `docs/mm_bridge_diagnostics/*.md`
-- sweep timelines under `logs/*/timeline.log`
-- run-level `overall_accuracy` from `logs/<run_id>/logfile*.txt`
+Minimal Bun + HTML/TS/CSS dashboard that works off task configs under `tasks/*/task.json`.
+Each task can point at its own:
+- docs directory
+- task-owned scripts directory
+- logs directory
+
+Current MM bridge task assets live under:
+- `tasks/mm_bridge/docs/*.md`
+- `tasks/mm_bridge/scripts/*`
 
 ```bash
-bun run tracker/research/researchtrackerapp.ts -p 4090
+bun run tracker/research/researchtrackerapp.ts -p 4090 --task mm_bridge
 ```
 
-Open `http://localhost:4090`.
+Open `http://localhost:4090/?task=mm_bridge`.
 For markdown-only view in a separate tab:
-- `http://localhost:4090/doc?file=<doc_name>.md`
+- `http://localhost:4090/doc?task=mm_bridge&file=<doc_name>.md`
 
 
 Probing
@@ -75,7 +80,7 @@ Docker-first checkpoint diagnostics for the frozen-bridge VQA setup:
 - visual-prefix geometry stats
 
 ```bash
-./run_mm_diag.sh mmdiag_example \
+./tasks/mm_bridge/scripts/run_mm_diag.sh mmdiag_example \
   --checkpoint logs/mmbr_basesweep_on_high/step_3466.tar \
   --max_batches 80 \
   --stats_batches 40 \
@@ -93,7 +98,7 @@ Prefix Calibration Sweep (MM Training)
 Shortened iterative training sweep for calibrated bridge interface:
 
 ```bash
-./scripts/launch_prefix_calib_sweep.sh
+./tasks/mm_bridge/scripts/launch_prefix_calib_sweep.sh
 ```
 
 Key new MM flags:
@@ -116,7 +121,7 @@ Architecture-focused sequential sweep (Docker via `runmm.sh`) covering:
 
 Launch:
 ```bash
-./scripts/launch_night_bridge_sweep_v1.sh
+./tasks/mm_bridge/scripts/launch_night_bridge_sweep_v1.sh
 ```
 
 Common bridge flags:

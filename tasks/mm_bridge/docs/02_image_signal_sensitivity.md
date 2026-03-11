@@ -4,7 +4,7 @@
 Measure how much each trained checkpoint actually depends on image content at inference time.
 
 ## Method
-- Script: `scripts/mm_bridge_diagnostics.py`
+- Script: `tasks/mm_bridge/scripts/mm_bridge_diagnostics.py`
 - Docker wrapper: `run_mm_diag.sh`
 - Eval budget per mode: `80` batches at `batch_size=256` (`20,480` samples)
 - Perturbation modes:

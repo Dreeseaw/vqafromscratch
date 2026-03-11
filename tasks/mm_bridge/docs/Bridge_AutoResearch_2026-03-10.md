@@ -160,18 +160,18 @@ Trainable and total parameter counts below are copied from each run's final log 
 
 ## Run Status and Artifacts
 
-- Structured run ledger: `docs/mm_bridge_diagnostics/10_all_runs_structured_2026-03-10.md`
+- Structured run ledger: `tasks/mm_bridge/docs/10_all_runs_structured_2026-03-10.md`
 - Night sweep timeline: `logs/mmnight_bridge_v2_8h_20260309_234936/timeline.log`
-- Night sweep launcher: `scripts/launch_night_bridge_sweep_v2_8h.sh`
+- Night sweep launcher: `tasks/mm_bridge/scripts/launch_night_bridge_sweep_v2_8h.sh`
 - Prior diagnostics narrative:
-  - `docs/mm_bridge_diagnostics/01_historical_gap_audit.md`
-  - `docs/mm_bridge_diagnostics/02_image_signal_sensitivity.md`
-  - `docs/mm_bridge_diagnostics/03_prefix_geometry_interface.md`
-  - `docs/mm_bridge_diagnostics/04_prefix_calibration_iteration.md`
-  - `docs/mm_bridge_diagnostics/05_prefix_calibration_sweep_v2.md`
-  - `docs/mm_bridge_diagnostics/06_sweep_v2_completion_report_2026-03-09.md`
-  - `docs/mm_bridge_diagnostics/08_dinner_followup_runs_report_2026-03-09.md`
-  - `docs/mm_bridge_diagnostics/09_night_sweep_plan_v2_8h_2026-03-09.md`
+  - `tasks/mm_bridge/docs/01_historical_gap_audit.md`
+  - `tasks/mm_bridge/docs/02_image_signal_sensitivity.md`
+  - `tasks/mm_bridge/docs/03_prefix_geometry_interface.md`
+  - `tasks/mm_bridge/docs/04_prefix_calibration_iteration.md`
+  - `tasks/mm_bridge/docs/05_prefix_calibration_sweep_v2.md`
+  - `tasks/mm_bridge/docs/06_sweep_v2_completion_report_2026-03-09.md`
+  - `tasks/mm_bridge/docs/08_dinner_followup_runs_report_2026-03-09.md`
+  - `tasks/mm_bridge/docs/09_night_sweep_plan_v2_8h_2026-03-09.md`
 
 ## Performance Engineering Summary
 

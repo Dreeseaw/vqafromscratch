@@ -15,7 +15,7 @@ This plan supersedes V1 based on the latest two runs plus throughput profiling:
 
 ## Launcher
 
-- `scripts/launch_night_bridge_sweep_v2_8h.sh`
+- `tasks/mm_bridge/scripts/launch_night_bridge_sweep_v2_8h.sh`
 - Sequential queue with an **8-hour time guard** (`HORIZON_HOURS=8` default).
 - If horizon is reached, remaining runs are skipped automatically.
 
@@ -56,13 +56,13 @@ The queue is intended to consume approximately an 8-hour overnight window, with 
 ## Launch
 
 ```bash
-./scripts/launch_night_bridge_sweep_v2_8h.sh
+./tasks/mm_bridge/scripts/launch_night_bridge_sweep_v2_8h.sh
 ```
 
 Optional tighter memory mode:
 
 ```bash
-BATCH_SIZE=128 GRAD_ACCUM_STEPS=2 ./scripts/launch_night_bridge_sweep_v2_8h.sh
+BATCH_SIZE=128 GRAD_ACCUM_STEPS=2 ./tasks/mm_bridge/scripts/launch_night_bridge_sweep_v2_8h.sh
 ```
 
 ## Monitor

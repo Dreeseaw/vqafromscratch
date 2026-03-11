@@ -13,7 +13,7 @@ This is designed for exploration-first progress before heavy ablation stabilizat
 
 ## Launcher
 
-- Script: `scripts/launch_arch_coverage_big_sweep_v1_6h.sh`
+- Script: `tasks/mm_bridge/scripts/launch_arch_coverage_big_sweep_v1_6h.sh`
 - Docker path: uses `./runmm.sh` for every run (Docker-backed).
 - Horizon guard: default `HORIZON_HOURS=6`.
 
@@ -59,17 +59,17 @@ All run IDs are prefixed by:
 ## Launch / Relaunch
 
 ```bash
-./scripts/launch_arch_coverage_big_sweep_v1_6h.sh
+./tasks/mm_bridge/scripts/launch_arch_coverage_big_sweep_v1_6h.sh
 ```
 
 Relaunch same queue without redoing completed runs:
 
 ```bash
-RUN_PREFIX=mmarch_cov_v1_20260310 ./scripts/launch_arch_coverage_big_sweep_v1_6h.sh
+RUN_PREFIX=mmarch_cov_v1_20260310 ./tasks/mm_bridge/scripts/launch_arch_coverage_big_sweep_v1_6h.sh
 ```
 
 Optional dry-run command print:
 
 ```bash
-DRY_RUN=1 ./scripts/launch_arch_coverage_big_sweep_v1_6h.sh
+DRY_RUN=1 ./tasks/mm_bridge/scripts/launch_arch_coverage_big_sweep_v1_6h.sh
 ```

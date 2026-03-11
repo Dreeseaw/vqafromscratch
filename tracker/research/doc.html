@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Markdown Viewer</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.8.1/github-markdown-light.min.css" />
   <link rel="stylesheet" href="/styles.css" />
   <style>
     .doc-wrap {
@@ -20,25 +21,25 @@
       align-items: baseline;
       margin-bottom: 10px;
     }
-    pre {
-      white-space: pre-wrap;
-      word-break: break-word;
-      font-family: var(--mono);
-      font-size: 12px;
-      line-height: 1.45;
-      margin: 0;
+    #docMeta {
+      margin-top: 4px;
+    }
+    #docBody {
+      min-height: 120px;
     }
   </style>
 </head>
 <body>
   <main class="doc-wrap">
     <div class="doc-head">
-      <strong id="docTitle">Markdown</strong>
-      <a href="/" target="_blank" rel="noopener">Open Dashboard</a>
+      <div>
+        <strong id="docTitle">Markdown</strong>
+        <div id="docMeta" class="muted mono"></div>
+      </div>
+      <a id="docHome" href="/" target="_blank" rel="noopener">Open Dashboard</a>
     </div>
-    <pre id="docBody">Loading...</pre>
+    <div id="docBody" class="muted mono">Loading...</div>
   </main>
   <script type="module" src="/doc.js"></script>
 </body>
 </html>
-

@@ -35,10 +35,26 @@ type DocSummary = {
   mentionedAccuracies: number[];
 };
 
+type TaskSummary = {
+  id: string;
+  title: string;
+  description: string | null;
+};
+
 type Bootstrap = {
   generatedAt: string;
   docsRoot: string;
   logsRoot: string;
+  scriptsRoot: string;
+  tasks: TaskSummary[];
+  selectedTask: {
+    id: string;
+    title: string;
+    description: string | null;
+    docsRoot: string;
+    scriptsRoot: string;
+    logsRoot: string;
+  };
   docs: DocSummary[];
   sweeps: SweepSummary[];
   runs: RunSummary[];
@@ -67,6 +83,27 @@ type RunDetail = {
   latestValCe: number | null;
 };
 
+type ChatTurn = {
+  role: "user" | "assistant";
+  content: string;
+};
+
+type TaskQaResponse = {
+  taskId: string;
+  answer: string;
+  evidence: string[];
+  generatedAt: string;
+};
+
+type QaMessage = {
+  role: "user" | "assistant";
+  content: string;
+  evidence?: string[];
+  generatedAt?: string;
+  pending?: boolean;
+  error?: boolean;
+};
+
 const $ = <T extends HTMLElement>(id: string): T => {
   const el = document.getElementById(id);
   if (!el) throw new Error(`Missing element #${id}`);
@@ -83,7 +120,14 @@ const fmtParams = (total: number | null, trainable: number | null) => {
   return `${totalStr} (${fmtPct(((trainable as number) / (total as number)) * 100)})`;
 };
 
+const SWEEPS_PAGE_SIZE = 5;
+const RUNS_PAGE_SIZE = 10;
+const DOCS_PAGE_SIZE = 5;
+const BOOTSTRAP_REFRESH_MS = 10000;
+const RUN_DETAIL_REFRESH_MS = 10000;
+
 let state: Bootstrap | null = null;
+let selectedTaskId = getTaskFromUrl();
 let selectedSweep = "__all__";
 let activeOnly = false;
 let sweepsPage = 0;
@@ -94,11 +138,99 @@ let runDetail: RunDetail | null = null;
 let selectedDocFile: string | null = null;
 let bootstrapLoadInFlight = false;
 let runDetailLoadInFlight = false;
-const SWEEPS_PAGE_SIZE = 5;
-const RUNS_PAGE_SIZE = 10;
-const DOCS_PAGE_SIZE = 5;
-const BOOTSTRAP_REFRESH_MS = 10000;
-const RUN_DETAIL_REFRESH_MS = 10000;
+let taskQaLoadInFlight = false;
+const qaThreads = new Map<string, QaMessage[]>();
+
+function getTaskFromUrl(): string {
+  const url = new URL(window.location.href);
+  return String(url.searchParams.get("task") ?? "").trim();
+}
+
+function setTaskInUrl(taskId: string) {
+  const url = new URL(window.location.href);
+  if (taskId) url.searchParams.set("task", taskId);
+  else url.searchParams.delete("task");
+  history.replaceState(null, "", url.toString());
+}
+
+function getActiveTaskId(): string {
+  return selectedTaskId || state?.selectedTask.id || "";
+}
+
+function apiUrl(path: string, extra: Record<string, string> = {}): string {
+  const url = new URL(path, window.location.origin);
+  const taskId = getActiveTaskId();
+  if (taskId) url.searchParams.set("task", taskId);
+  for (const [key, value] of Object.entries(extra)) url.searchParams.set(key, value);
+  return `${url.pathname}${url.search}`;
+}
+
+function shouldOpenDocsInNewTab(): boolean {
+  return window.matchMedia("(max-width: 700px)").matches;
+}
+
+function openDocInNewTab(file: string) {
+  window.open(apiUrl("/doc", { file }), "_blank", "noopener,noreferrer");
+}
+
+function resetTaskScopedUi() {
+  selectedSweep = "__all__";
+  activeOnly = false;
+  sweepsPage = 0;
+  runsPage = 0;
+  docsPage = 0;
+  selectedRunId = null;
+  runDetail = null;
+  selectedDocFile = null;
+  $("runDetailPanel").hidden = true;
+  $("docDetailPanel").hidden = true;
+  $("docDetailOpen").hidden = true;
+}
+
+function syncSelectionToState(data: Bootstrap) {
+  if (selectedSweep !== "__all__" && !data.sweeps.some((sweep) => sweep.sweepId === selectedSweep)) selectedSweep = "__all__";
+  if (selectedRunId && !data.runs.some((run) => run.runId === selectedRunId)) {
+    selectedRunId = null;
+    runDetail = null;
+    $("runDetailPanel").hidden = true;
+  }
+  if (selectedDocFile && !data.docs.some((doc) => doc.file === selectedDocFile)) {
+    selectedDocFile = null;
+    $("docDetailPanel").hidden = true;
+    $("docDetailOpen").hidden = true;
+  }
+}
+
+function getQaThread(taskId: string): QaMessage[] {
+  const thread = qaThreads.get(taskId);
+  if (thread) return thread;
+  const next: QaMessage[] = [];
+  qaThreads.set(taskId, next);
+  return next;
+}
+
+function renderHeader(data: Bootstrap) {
+  const task = data.selectedTask;
+  selectedTaskId = task.id;
+  setTaskInUrl(task.id);
+  document.title = `${task.title} Research Tracker`;
+  $("taskTitle").textContent = task.title;
+  $("taskMeta").textContent = task.description ? `${task.description} Docs: ${task.docsRoot}` : `Docs: ${task.docsRoot}`;
+  $("updatedAt").textContent = `updated: ${data.generatedAt}`;
+  $("docsHint").textContent = task.docsRoot;
+  $("taskQaHint").textContent = `Answers use ${task.docsRoot}, ${task.scriptsRoot}, and ${task.logsRoot}.`;
+
+  const select = $("taskSelect") as HTMLSelectElement;
+  const prev = select.value || selectedTaskId;
+  select.innerHTML = "";
+  for (const item of data.tasks) {
+    const option = document.createElement("option");
+    option.value = item.id;
+    option.textContent = item.title;
+    select.appendChild(option);
+  }
+  select.value = data.tasks.some((item) => item.id === prev) ? prev : task.id;
+}
 
 function renderKpis(data: Bootstrap) {
   const kpis = $("kpis");
@@ -134,24 +266,24 @@ function renderSweeps(data: Bootstrap) {
   const pages = Math.max(1, Math.ceil(data.sweeps.length / SWEEPS_PAGE_SIZE));
   sweepsPage = Math.min(sweepsPage, pages - 1);
   const pageSweeps = data.sweeps.slice(sweepsPage * SWEEPS_PAGE_SIZE, (sweepsPage + 1) * SWEEPS_PAGE_SIZE);
-  for (const s of pageSweeps) {
+  for (const sweep of pageSweeps) {
     const tr = document.createElement("tr");
-    tr.className = s.sweepId === selectedSweep ? "is-selected clickable-row" : "clickable-row";
+    tr.className = sweep.sweepId === selectedSweep ? "is-selected clickable-row" : "clickable-row";
     tr.innerHTML = `
-      <td><code>${s.sweepId}</code></td>
-      <td>${s.status}</td>
-      <td>${String(s.activeRuns)}</td>
-      <td>${s.runs.length}</td>
-      <td>${fmtAcc(s.bestAccuracy)}</td>
-      <td>${fmtAcc(s.lastTrainCe)}</td>
-      <td>${s.startedAt ?? "-"}</td>
-      <td>${s.endedAt ?? "-"}</td>
+      <td><code>${sweep.sweepId}</code></td>
+      <td>${sweep.status}</td>
+      <td>${String(sweep.activeRuns)}</td>
+      <td>${sweep.runs.length}</td>
+      <td>${fmtAcc(sweep.bestAccuracy)}</td>
+      <td>${fmtAcc(sweep.lastTrainCe)}</td>
+      <td>${sweep.startedAt ?? "-"}</td>
+      <td>${sweep.endedAt ?? "-"}</td>
     `;
     tr.addEventListener("click", () => {
-      selectedSweep = s.sweepId;
+      selectedSweep = sweep.sweepId;
       runsPage = 0;
-      const sel = $("sweepFilter") as HTMLSelectElement;
-      sel.value = s.sweepId;
+      const select = $("sweepFilter") as HTMLSelectElement;
+      select.value = sweep.sweepId;
       renderSweeps(data);
       renderRuns(data);
     });
@@ -164,17 +296,41 @@ function renderSweepsPager(totalSweeps: number) {
   const pages = Math.max(1, Math.ceil(totalSweeps / SWEEPS_PAGE_SIZE));
   const prevBtn = $("sweepsPrev") as HTMLButtonElement;
   const nextBtn = $("sweepsNext") as HTMLButtonElement;
-  const label = $("sweepsPageLabel");
-  label.textContent = `Page ${sweepsPage + 1} / ${pages}`;
+  $("sweepsPageLabel").textContent = `Page ${sweepsPage + 1} / ${pages}`;
   prevBtn.disabled = sweepsPage === 0;
   nextBtn.disabled = sweepsPage >= pages - 1;
 }
 
+function renderSweepFilter(data: Bootstrap) {
+  const select = $("sweepFilter") as HTMLSelectElement;
+  const prev = selectedSweep || "__all__";
+  select.innerHTML = "";
+  const allOpt = document.createElement("option");
+  allOpt.value = "__all__";
+  allOpt.textContent = "All runs";
+  select.appendChild(allOpt);
+  for (const sweep of data.sweeps) {
+    const option = document.createElement("option");
+    option.value = sweep.sweepId;
+    option.textContent = sweep.sweepId;
+    select.appendChild(option);
+  }
+  select.value = data.sweeps.some((sweep) => sweep.sweepId === prev) ? prev : "__all__";
+  selectedSweep = select.value;
+}
+
 function getFilteredRuns(data: Bootstrap): RunSummary[] {
-  if (activeOnly) return data.runs.filter((r) => r.isActive);
+  if (activeOnly) return data.runs.filter((run) => run.isActive);
   if (selectedSweep === "__all__") return data.runs;
-  const sweep = data.sweeps.find((s) => s.sweepId === selectedSweep);
+  const sweep = data.sweeps.find((entry) => entry.sweepId === selectedSweep);
   return sweep ? sweep.runs : [];
+}
+
+function renderActiveToggle(data: Bootstrap) {
+  const toggle = $("activeOnly") as HTMLInputElement;
+  const count = data.runs.filter((run) => run.isActive).length;
+  toggle.checked = activeOnly;
+  $("activeCount").textContent = `${count} active`;
 }
 
 function renderRuns(data: Bootstrap) {
@@ -186,22 +342,22 @@ function renderRuns(data: Bootstrap) {
   const pages = Math.max(1, Math.ceil(rows.length / RUNS_PAGE_SIZE));
   runsPage = Math.min(runsPage, pages - 1);
   const pageRows = rows.slice(runsPage * RUNS_PAGE_SIZE, (runsPage + 1) * RUNS_PAGE_SIZE);
-  for (const r of pageRows) {
+  for (const run of pageRows) {
     const tr = document.createElement("tr");
-    tr.className = r.runId === selectedRunId ? "is-selected clickable-row" : "clickable-row";
+    tr.className = run.runId === selectedRunId ? "is-selected clickable-row" : "clickable-row";
     tr.innerHTML = `
-      <td><code>${r.runId}</code></td>
-      <td>${fmtAcc(r.finalAccuracy)}</td>
-      <td>${fmtAcc(r.lastTrainCe)}</td>
-      <td>${fmtNum(r.lastStep)}</td>
-      <td>${fmtNum(r.lastStepsPerSec)}</td>
-      <td>${fmtParams(r.numParams, r.trainableParams)}</td>
-      <td>${r.hasFinalCheckpoint ? "yes" : "no"}</td>
+      <td><code>${run.runId}</code></td>
+      <td>${fmtAcc(run.finalAccuracy)}</td>
+      <td>${fmtAcc(run.lastTrainCe)}</td>
+      <td>${fmtNum(run.lastStep)}</td>
+      <td>${fmtNum(run.lastStepsPerSec)}</td>
+      <td>${fmtParams(run.numParams, run.trainableParams)}</td>
+      <td>${run.hasFinalCheckpoint ? "yes" : "no"}</td>
     `;
     tr.addEventListener("click", () => {
-      selectedRunId = r.runId;
+      selectedRunId = run.runId;
       renderRuns(data);
-      void loadRunDetail(r.runId, true);
+      void loadRunDetail(run.runId, true);
     });
     body.appendChild(tr);
   }
@@ -212,18 +368,9 @@ function renderRunsPager(totalRuns: number) {
   const pages = Math.max(1, Math.ceil(totalRuns / RUNS_PAGE_SIZE));
   const prevBtn = $("runsPrev") as HTMLButtonElement;
   const nextBtn = $("runsNext") as HTMLButtonElement;
-  const label = $("runsPageLabel");
-  label.textContent = `Page ${runsPage + 1} / ${pages}`;
+  $("runsPageLabel").textContent = `Page ${runsPage + 1} / ${pages}`;
   prevBtn.disabled = runsPage === 0;
   nextBtn.disabled = runsPage >= pages - 1;
-}
-
-function shouldOpenDocsInNewTab(): boolean {
-  return window.matchMedia("(max-width: 700px)").matches;
-}
-
-function openDocInNewTab(file: string) {
-  window.open(`/doc?file=${encodeURIComponent(file)}`, "_blank", "noopener,noreferrer");
 }
 
 function renderDocs(data: Bootstrap) {
@@ -231,29 +378,28 @@ function renderDocs(data: Bootstrap) {
   body.innerHTML = "";
   const pages = Math.max(1, Math.ceil(data.docs.length / DOCS_PAGE_SIZE));
   docsPage = Math.min(docsPage, pages - 1);
-  const start = docsPage * DOCS_PAGE_SIZE;
-  const pageDocs = data.docs.slice(start, start + DOCS_PAGE_SIZE);
-  for (const d of pageDocs) {
-    const topAcc = d.mentionedAccuracies.length > 0 ? d.mentionedAccuracies[0].toFixed(4) : "-";
+  const pageDocs = data.docs.slice(docsPage * DOCS_PAGE_SIZE, (docsPage + 1) * DOCS_PAGE_SIZE);
+  for (const doc of pageDocs) {
+    const topAcc = doc.mentionedAccuracies.length > 0 ? doc.mentionedAccuracies[0].toFixed(4) : "-";
     const tr = document.createElement("tr");
-    tr.className = d.file === selectedDocFile ? "is-selected clickable-row" : "clickable-row";
+    tr.className = doc.file === selectedDocFile ? "is-selected clickable-row" : "clickable-row";
     tr.innerHTML = `
       <td>
-        <strong>${d.title}</strong><br />
-        <span class="mono muted">${d.file}</span>
+        <strong>${doc.title}</strong><br />
+        <span class="mono muted">${doc.file}</span>
       </td>
-      <td class="mono">${d.updatedAt}</td>
-      <td>${d.runRefs.length}</td>
+      <td class="mono">${doc.updatedAt}</td>
+      <td>${doc.runRefs.length}</td>
       <td>${topAcc}</td>
     `;
     tr.addEventListener("click", () => {
       if (shouldOpenDocsInNewTab()) {
-        openDocInNewTab(d.file);
+        openDocInNewTab(doc.file);
         return;
       }
-      selectedDocFile = d.file;
+      selectedDocFile = doc.file;
       renderDocs(data);
-      void loadDocDetail(d.file, true);
+      void loadDocDetail(doc.file, true);
     });
     body.appendChild(tr);
   }
@@ -264,33 +410,70 @@ function renderDocsPager(totalDocs: number) {
   const pages = Math.max(1, Math.ceil(totalDocs / DOCS_PAGE_SIZE));
   const prevBtn = $("docsPrev") as HTMLButtonElement;
   const nextBtn = $("docsNext") as HTMLButtonElement;
-  const label = $("docsPageLabel");
-  label.textContent = `Page ${docsPage + 1} / ${pages}`;
+  $("docsPageLabel").textContent = `Page ${docsPage + 1} / ${pages}`;
   prevBtn.disabled = docsPage === 0;
   nextBtn.disabled = docsPage >= pages - 1;
 }
 
-function renderSweepFilter(data: Bootstrap) {
-  const sel = $("sweepFilter") as HTMLSelectElement;
-  const prev = sel.value || "__all__";
-  sel.innerHTML = "";
-  const allOpt = document.createElement("option");
-  allOpt.value = "__all__";
-  allOpt.textContent = "All runs";
-  sel.appendChild(allOpt);
-  for (const s of data.sweeps) {
-    const opt = document.createElement("option");
-    opt.value = s.sweepId;
-    opt.textContent = s.sweepId;
-    sel.appendChild(opt);
+function renderTaskQa(data: Bootstrap) {
+  const taskId = data.selectedTask.id;
+  const starterWrap = $("taskQaStarters");
+  const threadWrap = $("taskQaThread");
+  const status = $("taskQaStatus");
+  const thread = getQaThread(taskId);
+  const starterPrompts = [
+    "Why does this task look weak right now?",
+    "What differs from the best completed runs?",
+    "What should I try next?",
+    "Is there an active regression I should worry about?",
+  ];
+
+  starterWrap.innerHTML = "";
+  for (const prompt of starterPrompts) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ghost-button";
+    button.textContent = prompt;
+    button.disabled = taskQaLoadInFlight;
+    button.addEventListener("click", () => {
+      void submitTaskQa(prompt);
+    });
+    starterWrap.appendChild(button);
   }
-  sel.value = data.sweeps.some((s) => s.sweepId === prev) ? prev : "__all__";
-  selectedSweep = sel.value;
+
+  threadWrap.innerHTML = "";
+  if (thread.length === 0) {
+    threadWrap.innerHTML = `<div class="qa-empty muted">Ask about the whole task. The answer is grounded in current sweeps, runs, docs, and task scripts.</div>`;
+  } else {
+    for (const message of thread) {
+      const bubble = document.createElement("div");
+      bubble.className = `qa-message qa-${message.role}${message.pending ? " is-pending" : ""}${message.error ? " is-error" : ""}`;
+      const meta = document.createElement("div");
+      meta.className = "qa-meta mono muted";
+      meta.textContent = message.role === "user" ? "You" : message.pending ? "Agent thinking..." : `Agent${message.generatedAt ? ` • ${message.generatedAt}` : ""}`;
+      const body = document.createElement("div");
+      body.className = "qa-content";
+      body.textContent = message.content;
+      bubble.appendChild(meta);
+      bubble.appendChild(body);
+      if (message.evidence && message.evidence.length > 0) {
+        const evidence = document.createElement("div");
+        evidence.className = "qa-evidence";
+        evidence.innerHTML = `<div class="detail-section-title">Evidence</div><ul>${message.evidence.map((item) => `<li>${item}</li>`).join("")}</ul>`;
+        bubble.appendChild(evidence);
+      }
+      threadWrap.appendChild(bubble);
+    }
+  }
+
+  status.textContent = taskQaLoadInFlight ? "asking..." : "";
 }
 
 function renderAll(data: Bootstrap) {
-  $("updatedAt").textContent = `updated: ${data.generatedAt}`;
+  syncSelectionToState(data);
+  renderHeader(data);
   renderKpis(data);
+  renderTaskQa(data);
   renderSweeps(data);
   renderSweepFilter(data);
   renderActiveToggle(data);
@@ -298,33 +481,31 @@ function renderAll(data: Bootstrap) {
   renderDocs(data);
 }
 
-function renderActiveToggle(data: Bootstrap) {
-  const toggle = $("activeOnly") as HTMLInputElement;
-  const label = $("activeCount");
-  const count = data.runs.filter((r) => r.isActive).length;
-  toggle.checked = activeOnly;
-  label.textContent = `${count} active`;
-}
-
 async function load() {
   if (bootstrapLoadInFlight) return;
   bootstrapLoadInFlight = true;
+  const requestedTaskId = getActiveTaskId();
   try {
-  const res = await fetch("/api/bootstrap", { cache: "no-store" });
-  if (!res.ok) throw new Error(`bootstrap failed: ${res.status}`);
-  const data = (await res.json()) as Bootstrap;
-  state = data;
-  renderAll(data);
-  if (selectedRunId) await loadRunDetail(selectedRunId, false);
-  if (selectedDocFile) await loadDocDetail(selectedDocFile, false);
+    const res = await fetch(apiUrl("/api/bootstrap"), { cache: "no-store" });
+    if (!res.ok) throw new Error(`bootstrap failed: ${res.status}`);
+    const data = (await res.json()) as Bootstrap;
+    state = data;
+    selectedTaskId = data.selectedTask.id;
+    renderAll(data);
+    if (selectedRunId) await loadRunDetail(selectedRunId, false);
+    if (selectedDocFile) await loadDocDetail(selectedDocFile, false);
   } finally {
     bootstrapLoadInFlight = false;
+    if (requestedTaskId && requestedTaskId !== getActiveTaskId()) {
+      // task switched while loading; leave current state alone
+    }
   }
 }
 
 async function loadRunDetail(runId: string, scrollIntoView: boolean) {
   if (runDetailLoadInFlight) return;
   runDetailLoadInFlight = true;
+  const taskId = getActiveTaskId();
   const panel = $("runDetailPanel");
   const title = $("runDetailTitle");
   const body = $("runDetailBody");
@@ -334,15 +515,16 @@ async function loadRunDetail(runId: string, scrollIntoView: boolean) {
     body.innerHTML = `<div class="muted mono">Loading run detail...</div>`;
   }
   try {
-    const res = await fetch(`/api/run?runId=${encodeURIComponent(runId)}`, { cache: "no-store" });
+    const res = await fetch(apiUrl("/api/run", { runId }), { cache: "no-store" });
     if (!res.ok) throw new Error(`run detail failed: ${res.status}`);
-    runDetail = (await res.json()) as RunDetail;
-    if (selectedRunId !== runId) return;
-    renderRunDetail(runDetail);
+    const detail = (await res.json()) as RunDetail;
+    if (selectedRunId !== runId || taskId !== getActiveTaskId()) return;
+    runDetail = detail;
+    renderRunDetail(detail);
     if (scrollIntoView) panel.scrollIntoView({ behavior: "smooth", block: "start" });
-  } catch (e) {
-    if (selectedRunId !== runId) return;
-    body.innerHTML = `<div class="muted mono">Error: ${String(e)}</div>`;
+  } catch (error) {
+    if (selectedRunId !== runId || taskId !== getActiveTaskId()) return;
+    body.innerHTML = `<div class="muted mono">Error: ${String(error)}</div>`;
   } finally {
     runDetailLoadInFlight = false;
   }
@@ -405,7 +587,7 @@ function makeChartCard(title: string, points: SeriesPoint[], kind: "acc" | "ce")
     return card;
   }
   const path = buildChartPath(points, 320, 140);
-  const values = points.map((p) => p.value);
+  const values = points.map((point) => point.value);
   const latest = values[values.length - 1];
   const best = kind === "acc" ? Math.max(...values) : Math.min(...values);
   card.innerHTML = `
@@ -422,8 +604,8 @@ function makeChartCard(title: string, points: SeriesPoint[], kind: "acc" | "ce")
 }
 
 function buildChartPath(points: SeriesPoint[], width: number, height: number) {
-  const steps = points.map((p) => p.step);
-  const values = points.map((p) => p.value);
+  const steps = points.map((point) => point.step);
+  const values = points.map((point) => point.value);
   const minStep = Math.min(...steps);
   const maxStep = Math.max(...steps);
   const minVal = Math.min(...values);
@@ -440,6 +622,7 @@ function buildChartPath(points: SeriesPoint[], width: number, height: number) {
 }
 
 async function loadDocDetail(file: string, scrollIntoView: boolean) {
+  const taskId = getActiveTaskId();
   const panel = $("docDetailPanel");
   const title = $("docDetailTitle");
   const body = $("docDetailBody");
@@ -447,15 +630,15 @@ async function loadDocDetail(file: string, scrollIntoView: boolean) {
   title.textContent = file;
   body.innerHTML = `<div class="muted mono">Loading doc...</div>`;
   try {
-    const res = await fetch(`/api/doc?file=${encodeURIComponent(file)}`, { cache: "no-store" });
+    const res = await fetch(apiUrl("/api/doc", { file }), { cache: "no-store" });
     if (!res.ok) throw new Error(`doc failed: ${res.status}`);
     const markdown = await res.text();
-    if (selectedDocFile !== file) return;
+    if (selectedDocFile !== file || taskId !== getActiveTaskId()) return;
     renderDocDetail(file, markdown);
     if (scrollIntoView) panel.scrollIntoView({ behavior: "smooth", block: "start" });
-  } catch (e) {
-    if (selectedDocFile !== file) return;
-    body.innerHTML = `<div class="muted mono">Error: ${String(e)}</div>`;
+  } catch (error) {
+    if (selectedDocFile !== file || taskId !== getActiveTaskId()) return;
+    body.innerHTML = `<div class="muted mono">Error: ${String(error)}</div>`;
   }
 }
 
@@ -471,7 +654,83 @@ function renderDocDetail(file: string, markdown: string) {
   body.innerHTML = `<article class="markdown-body doc-render">${marked.parse(markdown, { async: false }) as string}</article>`;
 }
 
+function renderTaskQaError(taskId: string, message: string) {
+  const thread = getQaThread(taskId);
+  const pendingIndex = thread.findIndex((item) => item.pending);
+  const replacement: QaMessage = {
+    role: "assistant",
+    content: message,
+    error: true,
+    generatedAt: new Date().toISOString(),
+  };
+  if (pendingIndex >= 0) thread.splice(pendingIndex, 1, replacement);
+  else thread.push(replacement);
+}
+
+async function submitTaskQa(question: string) {
+  const taskId = getActiveTaskId();
+  if (!taskId || !state || taskQaLoadInFlight) return;
+  const trimmed = question.trim();
+  if (!trimmed) return;
+  const input = $("taskQaInput") as HTMLTextAreaElement;
+  input.value = "";
+  const thread = getQaThread(taskId);
+  const conversation: ChatTurn[] = thread
+    .filter((item) => !item.pending)
+    .map((item) => ({ role: item.role, content: item.content }));
+  thread.push({ role: "user", content: trimmed, generatedAt: new Date().toISOString() });
+  thread.push({ role: "assistant", content: "Thinking...", pending: true });
+  taskQaLoadInFlight = true;
+  renderTaskQa(state);
+
+  try {
+    const res = await fetch("/api/qa/task", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        taskId,
+        question: trimmed,
+        conversation,
+      }),
+    });
+    const body = (await res.json()) as TaskQaResponse | { error?: string };
+    if (!res.ok) throw new Error(body && "error" in body ? body.error ?? `qa failed: ${res.status}` : `qa failed: ${res.status}`);
+    const pendingIndex = thread.findIndex((item) => item.pending);
+    const answer = body as TaskQaResponse;
+    const replacement: QaMessage = {
+      role: "assistant",
+      content: answer.answer,
+      evidence: answer.evidence,
+      generatedAt: answer.generatedAt,
+    };
+    if (pendingIndex >= 0) thread.splice(pendingIndex, 1, replacement);
+    else thread.push(replacement);
+  } catch (error) {
+    renderTaskQaError(taskId, `Task QA failed: ${String(error)}`);
+  } finally {
+    taskQaLoadInFlight = false;
+    if (state && state.selectedTask.id === taskId) renderTaskQa(state);
+  }
+}
+
 function setup() {
+  const taskSelect = $("taskSelect") as HTMLSelectElement;
+  taskSelect.addEventListener("change", () => {
+    if (!taskSelect.value || taskSelect.value === getActiveTaskId()) return;
+    selectedTaskId = taskSelect.value;
+    resetTaskScopedUi();
+    void load().catch((error) => {
+      $("updatedAt").textContent = `error: ${String(error)}`;
+    });
+  });
+
+  const taskQaForm = $("taskQaForm") as HTMLFormElement;
+  taskQaForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const input = $("taskQaInput") as HTMLTextAreaElement;
+    void submitTaskQa(input.value);
+  });
+
   const sweepsPrevBtn = $("sweepsPrev") as HTMLButtonElement;
   const sweepsNextBtn = $("sweepsNext") as HTMLButtonElement;
   sweepsPrevBtn.addEventListener("click", () => {
@@ -486,25 +745,29 @@ function setup() {
     sweepsPage += 1;
     renderSweeps(state);
   });
-  const sel = $("sweepFilter") as HTMLSelectElement;
-  sel.addEventListener("change", () => {
-    selectedSweep = sel.value;
+
+  const sweepFilter = $("sweepFilter") as HTMLSelectElement;
+  sweepFilter.addEventListener("change", () => {
+    selectedSweep = sweepFilter.value;
     runsPage = 0;
     if (state) renderRuns(state);
   });
+
   const activeToggle = $("activeOnly") as HTMLInputElement;
   activeToggle.addEventListener("change", () => {
     activeOnly = activeToggle.checked;
     runsPage = 0;
     if (state) renderRuns(state);
   });
-  const closeDetailBtn = $("runDetailClose") as HTMLButtonElement;
-  closeDetailBtn.addEventListener("click", () => {
+
+  const closeRunDetailBtn = $("runDetailClose") as HTMLButtonElement;
+  closeRunDetailBtn.addEventListener("click", () => {
     selectedRunId = null;
     runDetail = null;
     $("runDetailPanel").hidden = true;
     if (state) renderRuns(state);
   });
+
   const closeDocBtn = $("docDetailClose") as HTMLButtonElement;
   closeDocBtn.addEventListener("click", () => {
     selectedDocFile = null;
@@ -512,6 +775,7 @@ function setup() {
     $("docDetailOpen").hidden = true;
     if (state) renderDocs(state);
   });
+
   const runsPrevBtn = $("runsPrev") as HTMLButtonElement;
   const runsNextBtn = $("runsNext") as HTMLButtonElement;
   runsPrevBtn.addEventListener("click", () => {
@@ -526,14 +790,15 @@ function setup() {
     runsPage += 1;
     renderRuns(state);
   });
-  const prevBtn = $("docsPrev") as HTMLButtonElement;
-  const nextBtn = $("docsNext") as HTMLButtonElement;
-  prevBtn.addEventListener("click", () => {
+
+  const docsPrevBtn = $("docsPrev") as HTMLButtonElement;
+  const docsNextBtn = $("docsNext") as HTMLButtonElement;
+  docsPrevBtn.addEventListener("click", () => {
     if (!state || docsPage === 0) return;
     docsPage -= 1;
     renderDocs(state);
   });
-  nextBtn.addEventListener("click", () => {
+  docsNextBtn.addEventListener("click", () => {
     if (!state) return;
     const pages = Math.max(1, Math.ceil(state.docs.length / DOCS_PAGE_SIZE));
     if (docsPage >= pages - 1) return;
@@ -543,14 +808,16 @@ function setup() {
 }
 
 setup();
-load().catch((e) => {
-  $("updatedAt").textContent = `error: ${String(e)}`;
+load().catch((error) => {
+  $("updatedAt").textContent = `error: ${String(error)}`;
 });
+
 setInterval(() => {
   load().catch(() => {
     // keep old state on transient failures
   });
 }, BOOTSTRAP_REFRESH_MS);
+
 setInterval(() => {
   if (!selectedRunId) return;
   loadRunDetail(selectedRunId, false).catch(() => {

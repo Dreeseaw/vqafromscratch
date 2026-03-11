@@ -4,9 +4,9 @@
 
 This section recompiles the planning context from:
 
-- `docs/mm_bridge_diagnostics/16_final_10h_arch_plan_2026-03-10.md`
-- `docs/mm_bridge_diagnostics/17_new_arch_memory_probes_v1_2026-03-10.md`
-- `docs/mm_bridge_diagnostics/18_final_arch_run_queue_v1_2026-03-10.md`
+- `tasks/mm_bridge/docs/16_final_10h_arch_plan_2026-03-10.md`
+- `tasks/mm_bridge/docs/17_new_arch_memory_probes_v1_2026-03-10.md`
+- `tasks/mm_bridge/docs/18_final_arch_run_queue_v1_2026-03-10.md`
 
 ### 1. Planning Objective
 
@@ -134,7 +134,7 @@ Completed runs:
 Reference frontier from prior work:
 
 - best prior run: `0.4544`
-- source: `docs/mm_bridge_diagnostics/10_all_runs_structured_2026-03-10.md`
+- source: `tasks/mm_bridge/docs/10_all_runs_structured_2026-03-10.md`
 - same run at `step=6000`: `0.4410`
 - source log: `logs/mmnight_bridge_v2_8h_20260309_234936_perceiver_d3_pd03_main/logfile.txt`
 

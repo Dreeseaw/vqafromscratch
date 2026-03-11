@@ -1,7 +1,7 @@
 # Prefix Calibration Sweep V2 (Launched)
 
 ## Sweep
-- Script: `scripts/launch_prefix_calib_sweep_v2.sh`
+- Script: `tasks/mm_bridge/scripts/launch_prefix_calib_sweep_v2.sh`
 - Sweep dir: `logs/mmcal_sweep_v2_20260309_140137`
 - Data roots unchanged:
   - `images_root=images`

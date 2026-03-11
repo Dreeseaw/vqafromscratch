@@ -1,7 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
-source "$(dirname "$0")/mm_run_budget.sh"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+cd "${REPO_ROOT}"
+
+source "${SCRIPT_DIR}/mm_run_budget.sh"
 
 RUN_ID="${RUN_ID:-mmarch_cov_v1_20260310_perceiver_oracle196_topk64_h1}"
 BATCH_SIZE="${BATCH_SIZE:-64}"

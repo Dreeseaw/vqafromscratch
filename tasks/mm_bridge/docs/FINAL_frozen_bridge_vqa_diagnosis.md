@@ -71,19 +71,19 @@ Prioritize **bridge/interface redesign and calibration** before retraining VM fr
 
 ```bash
 # learned-token baseline sensitivity
-./run_mm_diag.sh mmdiag_lt1 \
+./tasks/mm_bridge/scripts/run_mm_diag.sh mmdiag_lt1 \
   --checkpoint logs/mmbr_basesweep_lt1/step_17330.tar \
   --max_batches 80 --stats_batches 40 --batch_size 256 \
   --modes clean,shuffle,zero,noise,fixed_image --noise_std 0.2
 
 # image-conditioned K=49 (+2D pos)
-./run_mm_diag.sh mmdiag_mlp_onhigh \
+./tasks/mm_bridge/scripts/run_mm_diag.sh mmdiag_mlp_onhigh \
   --checkpoint logs/mmbr_basesweep_on_high/step_3466.tar \
   --max_batches 80 --stats_batches 40 --batch_size 256 \
   --modes clean,shuffle,zero,noise,fixed_image --noise_std 0.2
 
 # image-conditioned K=49 (no 2D pos)
-./run_mm_diag.sh mmdiag_mlp_offhigh \
+./tasks/mm_bridge/scripts/run_mm_diag.sh mmdiag_mlp_offhigh \
   --checkpoint logs/mmbr_basesweep_off_high/step_3466.tar \
   --max_batches 80 --stats_batches 40 --batch_size 256 \
   --modes clean,shuffle,zero,noise,fixed_image --noise_std 0.2
@@ -104,10 +104,10 @@ Prioritize **bridge/interface redesign and calibration** before retraining VM fr
 
 ## Artifacts Produced
 - Intermediate direction notes:
-  - `docs/mm_bridge_diagnostics/01_historical_gap_audit.md`
-  - `docs/mm_bridge_diagnostics/02_image_signal_sensitivity.md`
-  - `docs/mm_bridge_diagnostics/03_prefix_geometry_interface.md`
-  - `docs/mm_bridge_diagnostics/08_dinner_followup_runs_report_2026-03-09.md`
+  - `tasks/mm_bridge/docs/01_historical_gap_audit.md`
+  - `tasks/mm_bridge/docs/02_image_signal_sensitivity.md`
+  - `tasks/mm_bridge/docs/03_prefix_geometry_interface.md`
+  - `tasks/mm_bridge/docs/08_dinner_followup_runs_report_2026-03-09.md`
 - Per-run diagnostic outputs:
   - `logs/mmdiag_*/diag_report.json`
   - `logs/mmdiag_*/diag_report.md`

@@ -1,7 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
-source "$(dirname "$0")/mm_run_budget.sh"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+cd "${REPO_ROOT}"
+
+source "${SCRIPT_DIR}/mm_run_budget.sh"
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
 SWEEP_ID="mmarch_coverage_big_v1_6h_${STAMP}"

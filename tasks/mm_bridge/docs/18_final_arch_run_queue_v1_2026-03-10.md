@@ -117,15 +117,15 @@ This queue is prepared but not started.
 
 ## Launcher
 
-- script: `scripts/launch_final_arch_run_queue_v1.sh`
+- script: `tasks/mm_bridge/scripts/launch_final_arch_run_queue_v1.sh`
 - recommended command:
 
 ```bash
-RUN_PREFIX=mmarch_final_v1_20260310 ./scripts/launch_final_arch_run_queue_v1.sh
+RUN_PREFIX=mmarch_final_v1_20260310 ./tasks/mm_bridge/scripts/launch_final_arch_run_queue_v1.sh
 ```
 
 - rerun/resume command:
 
 ```bash
-RUN_PREFIX=mmarch_final_v1_20260310 ./scripts/launch_final_arch_run_queue_v1.sh
+RUN_PREFIX=mmarch_final_v1_20260310 ./tasks/mm_bridge/scripts/launch_final_arch_run_queue_v1.sh
 ```

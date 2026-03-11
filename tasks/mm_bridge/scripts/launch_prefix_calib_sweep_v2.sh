@@ -1,31 +1,32 @@
 #!/bin/bash
 set -euo pipefail
 
-source "$(dirname "$0")/mm_run_budget.sh"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+cd "${REPO_ROOT}"
+
+source "${SCRIPT_DIR}/mm_run_budget.sh"
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
-SWEEP_ID="mmcal_sweep_v3_accum_${STAMP}"
+SWEEP_ID="mmcal_sweep_v2_${STAMP}"
 SWEEP_DIR="logs/${SWEEP_ID}"
 mkdir -pv "${SWEEP_DIR}"
 
-BATCH_SIZE="${BATCH_SIZE:-128}"
-GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-2}"
+BATCH_SIZE="${BATCH_SIZE:-256}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
 MAX_STEPS="${MAX_STEPS:-$(mm_budget_steps_for_bs_ga "${BATCH_SIZE}" "${GRAD_ACCUM_STEPS}")}"
 
 cat > "${SWEEP_DIR}/README.md" <<EOF
-# Prefix Calibration Sweep V3 (Gradient Accumulation)
+# Prefix Calibration Sweep V2
 
 Sweep ID: ${SWEEP_ID}
 Start time: $(date)
 
-Data roots (unchanged):
+Data roots remain unchanged from runmm defaults:
 - images_root: images
 - annotations_root: data/vqav2
 
-Batching:
-- batch_size=${BATCH_SIZE}
-- grad_accum_steps=${GRAD_ACCUM_STEPS}
-- effective_batch_size=$((BATCH_SIZE * GRAD_ACCUM_STEPS))
+Runs are sequential via runmm + Docker.
 EOF
 
 COMMON_ARGS=(
@@ -49,7 +50,6 @@ COMMON_ARGS=(
   --prefix_calib_bias
   --prefix_calib_gate_init 1.0
   --freeze_mode bridge_plus_top_lm
-  --train_top_lm_layers 1
 )
 
 run_one() {
@@ -67,7 +67,9 @@ run_one() {
   echo "[$(date)] END   ${run_id}" | tee -a "${SWEEP_DIR}/timeline.log"
 }
 
-run_one "mmcal3_top1_const_accum1" \
+# A) Strong prior baseline from v1, extended horizon.
+run_one "mmcal2_top1_const_ext1" \
+  --train_top_lm_layers 1 \
   --lr 0.0002 \
   --lr_schedule constant \
   --prefix_norm_target_ratio 4.0 \
@@ -75,7 +77,9 @@ run_one "mmcal3_top1_const_accum1" \
   --prefix_batchvar_reg_weight 0.0002 \
   --prefix_dropout 0.0
 
-run_one "mmcal3_top1_cos_accum1" \
+# B) Cosine decay + warmup around top1.
+run_one "mmcal2_top1_cos_ext1" \
+  --train_top_lm_layers 1 \
   --lr 0.00025 \
   --lr_schedule cosine \
   --lr_warmup_steps 400 \
@@ -85,7 +89,9 @@ run_one "mmcal3_top1_cos_accum1" \
   --prefix_batchvar_reg_weight 0.0002 \
   --prefix_dropout 0.0
 
-run_one "mmcal3_top1_cos_pd05_accum1" \
+# C) Cosine + mild prefix dropout + softer regularization.
+run_one "mmcal2_top1_cos_pd05_ext1" \
+  --train_top_lm_layers 1 \
   --lr 0.00025 \
   --lr_schedule cosine \
   --lr_warmup_steps 500 \
@@ -94,5 +100,17 @@ run_one "mmcal3_top1_cos_pd05_accum1" \
   --prefix_norm_reg_weight 0.003 \
   --prefix_batchvar_reg_weight 0.00015 \
   --prefix_dropout 0.05
+
+# D) Top2 LM layers with cosine.
+run_one "mmcal2_top2_cos_ext1" \
+  --train_top_lm_layers 2 \
+  --lr 0.0002 \
+  --lr_schedule cosine \
+  --lr_warmup_steps 500 \
+  --lr_min_ratio 0.15 \
+  --prefix_norm_target_ratio 4.0 \
+  --prefix_norm_reg_weight 0.005 \
+  --prefix_batchvar_reg_weight 0.0002 \
+  --prefix_dropout 0.0
 
 echo "[$(date)] SWEEP COMPLETE ${SWEEP_ID}" | tee -a "${SWEEP_DIR}/timeline.log"

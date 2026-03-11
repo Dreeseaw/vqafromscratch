@@ -35,7 +35,7 @@ Vision-on-CPU test:
 
 ## Prepared Run Script
 
-- Launcher: `scripts/launch_night_bridge_sweep_v1.sh`
+- Launcher: `tasks/mm_bridge/scripts/launch_night_bridge_sweep_v1.sh`
 - Default schedule: 5 sequential runs
 - Default runtime knobs:
   - `MAX_STEPS=3000`
@@ -77,13 +77,13 @@ All runs use:
 ## How To Launch
 
 ```bash
-./scripts/launch_night_bridge_sweep_v1.sh
+./tasks/mm_bridge/scripts/launch_night_bridge_sweep_v1.sh
 ```
 
 Optional safer-memory override (if needed):
 
 ```bash
-BATCH_SIZE=128 GRAD_ACCUM_STEPS=2 ./scripts/launch_night_bridge_sweep_v1.sh
+BATCH_SIZE=128 GRAD_ACCUM_STEPS=2 ./tasks/mm_bridge/scripts/launch_night_bridge_sweep_v1.sh
 ```
 
 ## Monitoring Commands

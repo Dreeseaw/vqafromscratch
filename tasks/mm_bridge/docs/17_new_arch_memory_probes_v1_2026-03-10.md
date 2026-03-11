@@ -22,7 +22,7 @@ Benchmark the newly added architecture branches with short Docker-backed runs to
 
 ## Launcher
 
-- Script: `scripts/launch_new_arch_memory_probes_v1.sh`
+- Script: `tasks/mm_bridge/scripts/launch_new_arch_memory_probes_v1.sh`
 - Results table: `logs/mmarch_memprobe_v1_latest/probe_results.tsv`
 
 ## Initial Candidate Pairs
@@ -54,6 +54,6 @@ All first-pass probes completed successfully in Docker.
 
 ## Artifacts
 
-- Probe launcher: `scripts/launch_new_arch_memory_probes_v1.sh`
+- Probe launcher: `tasks/mm_bridge/scripts/launch_new_arch_memory_probes_v1.sh`
 - Timeline log: `logs/mmarch_memprobe_v1_latest/timeline.log`
 - Result table: `logs/mmarch_memprobe_v1_latest/probe_results.tsv`

@@ -117,4 +117,4 @@ Assumed runtime:
 - `--train_top_lm_layers 3`
 
 3. `mmdiag_mmday_best_sofar`
-- Run `./run_mm_diag.sh` on the best new checkpoint to compare clean vs perturbation sensitivity and prefix geometry.
+- Run `./tasks/mm_bridge/scripts/run_mm_diag.sh` on the best new checkpoint to compare clean vs perturbation sensitivity and prefix geometry.

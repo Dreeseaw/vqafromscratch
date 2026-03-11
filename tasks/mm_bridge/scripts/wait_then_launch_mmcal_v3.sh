@@ -1,6 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+cd "${REPO_ROOT}"
+
 LOG_PATH="logs/mmcal_v3_autostart.log"
 mkdir -pv logs >/dev/null 2>&1 || true
 
@@ -21,5 +25,5 @@ while true; do
 done
 
 echo "[$(date)] wait_then_launch_mmcal_v3: launching v3 accumulation sweep" >> "${LOG_PATH}"
-./scripts/launch_prefix_calib_sweep_v3_accum.sh >> "${LOG_PATH}" 2>&1
+"${SCRIPT_DIR}/launch_prefix_calib_sweep_v3_accum.sh" >> "${LOG_PATH}" 2>&1
 echo "[$(date)] wait_then_launch_mmcal_v3: done" >> "${LOG_PATH}"

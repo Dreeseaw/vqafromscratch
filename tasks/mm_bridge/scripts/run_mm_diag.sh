@@ -1,6 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+cd "${REPO_ROOT}"
+
 RUN_ID="${1:-}"
 if [[ -z "${RUN_ID}" ]]; then
   echo "Usage: $0 <diag_run_id> --checkpoint <path> [extra diagnostics args...]"
@@ -14,10 +18,10 @@ shift || true
 EXTRA_ARGS=("$@")
 
 mkdir -pv "logs/${RUN_ID}"
-cat scripts/mm_bridge_diagnostics.py train/mm.py train/vqa_data.py evals/vqa.py > "logs/${RUN_ID}/code_mm_diag.py"
+cat "${SCRIPT_DIR}/mm_bridge_diagnostics.py" train/mm.py train/vqa_data.py evals/vqa.py > "logs/${RUN_ID}/code_mm_diag.py"
 
 CMD=(
-  python -m scripts.mm_bridge_diagnostics
+  python -m tasks.mm_bridge.scripts.mm_bridge_diagnostics
   --output_json "logs/${RUN_ID}/diag_report.json"
   --output_md "logs/${RUN_ID}/diag_report.md"
 )

@@ -6,6 +6,10 @@ It is intended to prevent apples-to-oranges comparisons across bridge runs and t
 
 Unless a future note explicitly overrides it for a narrow reason, this document should be treated as the default policy for bridge-modeling experiments.
 
+## Project Notes
+
+This project was created for research purposes, for a user to learn tons about multimodal representations. The user believes that the best direction in general is to create a unified Vision-Language model, but before getting into all that jazz would like to establish the best possible baseline from using frozen single-modal components, with no respect to any current research in the field. Decisions should err on the side of exploration, not caution. 
+
 ## Task Scope
 
 This policy applies to:
@@ -149,3 +153,4 @@ The intent of this policy is simple:
 - future bridge runs should be directly comparable by default
 - intermediate progress should be visible on the same cadence
 - final best runs should end with full-eval scores that can be shown publicly without caveat
+- understand this task's place in the greater project goals

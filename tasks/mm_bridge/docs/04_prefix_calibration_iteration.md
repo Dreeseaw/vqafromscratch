@@ -14,7 +14,7 @@ Test the new calibrated bridge interface under shortened but indicative training
   - `--prefix_batchvar_reg_weight`
 
 ## Active Sweep
-- Launcher: `scripts/launch_prefix_calib_sweep.sh`
+- Launcher: `tasks/mm_bridge/scripts/launch_prefix_calib_sweep.sh`
 - Active sweep dir: `logs/mmcal_sweep_20260309_105004`
 - Planned sequence:
   1. `mmcal_mlp49_calib_bonly_v1`
