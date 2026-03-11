@@ -1,11 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-RUN_ID="${RUN_ID:-mmarch_cov_v1_20260310_perceiver_oracle196_topk64_h1}"
-TARGET_STEP="${TARGET_STEP:-5000}"
+source "$(dirname "$0")/mm_run_budget.sh"
 
+RUN_ID="${RUN_ID:-mmarch_cov_v1_20260310_perceiver_oracle196_topk64_h1}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-3}"
+TARGET_STEP="${TARGET_STEP:-$(mm_budget_steps_for_bs_ga "${BATCH_SIZE}" "${GRAD_ACCUM_STEPS}")}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
 
@@ -48,7 +49,7 @@ CMD+=(
   --max_steps "${TARGET_STEP}"
   --log_every 20
   --eval_every 0
-  --eval_batches 160
+  --eval_batches 0
   --eval_log_every 20
   --ckpt_every 1000
   --eval_scorer official

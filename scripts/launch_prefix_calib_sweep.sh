@@ -1,10 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
+source "$(dirname "$0")/mm_run_budget.sh"
+
 STAMP="$(date +%Y%m%d_%H%M%S)"
 SWEEP_ID="mmcal_sweep_${STAMP}"
 SWEEP_DIR="logs/${SWEEP_ID}"
 mkdir -pv "${SWEEP_DIR}"
+
+BATCH_SIZE="${BATCH_SIZE:-256}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
+MAX_STEPS="${MAX_STEPS:-$(mm_budget_steps_for_bs_ga "${BATCH_SIZE}" "${GRAD_ACCUM_STEPS}")}"
 
 cat > "${SWEEP_DIR}/README.md" <<EOF
 # Prefix Calibration Sweep
@@ -18,11 +24,13 @@ This sweep also captures stdout to \`logs/${SWEEP_ID}/<run_id>.stdout.log\`.
 EOF
 
 COMMON_ARGS=(
-  --max_steps 2500
+  --batch_size "${BATCH_SIZE}"
+  --grad_accum_steps "${GRAD_ACCUM_STEPS}"
+  --max_steps "${MAX_STEPS}"
   --epochs 50
   --log_every 20
   --eval_every 500
-  --eval_batches 120
+  --eval_batches 0
   --eval_log_every 20
   --ckpt_every 1000
   --eval_scorer official

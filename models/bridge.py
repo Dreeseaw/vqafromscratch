@@ -38,8 +38,11 @@ class BridgeConfig:
     bridge_hybrid_image_bridge_type: str = "learned_query"
     bridge_question_conditioning: bool = False
     bridge_qcond_scale: float = 0.5
+    bridge_question_context_mode: str = "all_text"  # all_text | prompt_only
     bridge_token_selector_type: str = "none"  # none | topk
     bridge_token_select_k: int = 0
+    bridge_num_roles: int = 4
+    bridge_evidence_topk: int = 0
 
 
 def _resolve_num_heads(dim: int, requested: int) -> int:
@@ -56,6 +59,14 @@ def _as_token_sequence(x: torch.Tensor) -> torch.Tensor:
     if x.ndim == 3:
         return x
     raise ValueError(f"Expected [B,D] or [B,N,D], got shape={tuple(x.shape)}")
+
+
+def _as_multiscale_token_pair(
+    x: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if isinstance(x, (tuple, list)) and len(x) == 2:
+        return _as_token_sequence(x[0]), _as_token_sequence(x[1])
+    raise ValueError("Expected a 2-tensor multiscale feature tuple/list.")
 
 
 def _build_1d_sincos(length: int, dim: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -273,6 +284,77 @@ class _QueryBridgeBase(nn.Module):
         return selected * gate
 
 
+class _PerceiverCore(nn.Module):
+    def __init__(self, cfg: BridgeConfig):
+        super().__init__()
+        d_lm = int(cfg.lm_hidden_size)
+        k = int(cfg.num_visual_tokens)
+        std = float(cfg.learned_init_std)
+        rounds = max(1, int(cfg.bridge_query_depth))
+        self.latents = nn.Parameter(torch.randn(1, k, d_lm) * std)
+        self.cross_blocks = nn.ModuleList(
+            [
+                _CrossAttnFFNBlock(
+                    d_lm,
+                    num_heads=int(cfg.bridge_num_heads),
+                    attn_dropout=float(cfg.bridge_attn_dropout),
+                )
+                for _ in range(rounds)
+            ]
+        )
+        self.self_blocks = nn.ModuleList(
+            [
+                _SelfAttnFFNBlock(
+                    d_lm,
+                    num_heads=int(cfg.bridge_num_heads),
+                    attn_dropout=float(cfg.bridge_attn_dropout),
+                )
+                for _ in range(rounds)
+            ]
+        )
+        self.supports_question_context = bool(getattr(cfg, "bridge_question_conditioning", False))
+        self.qcond_scale = float(getattr(cfg, "bridge_qcond_scale", 0.5))
+        if self.supports_question_context:
+            self.qcond_ln = nn.LayerNorm(d_lm)
+            self.qcond_proj = nn.Linear(d_lm, 2 * d_lm)
+        else:
+            self.qcond_ln = None
+            self.qcond_proj = None
+
+    def _apply_question_conditioning(
+        self,
+        latents: torch.Tensor,
+        question_context: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if not self.supports_question_context or question_context is None:
+            return latents
+        if question_context.ndim != 2:
+            raise ValueError(f"Expected question_context [B,D], got {tuple(question_context.shape)}")
+        assert self.qcond_ln is not None and self.qcond_proj is not None
+        qctx = self.qcond_ln(question_context)
+        gamma_beta = self.qcond_proj(qctx)
+        gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
+        s = max(0.0, float(self.qcond_scale))
+        scale = 1.0 + s * torch.tanh(gamma).unsqueeze(1)
+        shift = s * beta.unsqueeze(1)
+        return latents * scale + shift
+
+    def forward(
+        self,
+        visual_tokens: torch.Tensor,
+        *,
+        question_context: torch.Tensor | None = None,
+        latents: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if latents is None:
+            latents = self.latents.expand(int(visual_tokens.shape[0]), -1, -1)
+        latents = self._apply_question_conditioning(latents, question_context)
+        for cross_blk, self_blk in zip(self.cross_blocks, self.self_blocks):
+            latents = cross_blk(latents, visual_tokens)
+            latents = self_blk(latents)
+        return latents
+
+
 class MLPVisualBridge(nn.Module):
     """
     Supports visual feature inputs:
@@ -455,11 +537,86 @@ class PerceiverResamplerBridge(_QueryBridgeBase):
 
     def __init__(self, cfg: BridgeConfig):
         super().__init__(cfg)
+        self.core = _PerceiverCore(cfg)
+        self.supports_question_context = bool(self.core.supports_question_context)
+
+    def forward(
+        self,
+        visual_features: torch.Tensor,
+        question_context: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        visual_tokens = self._prepare_visual_tokens(visual_features)
+        return self.core(visual_tokens, question_context=question_context)
+
+
+class MultiScalePerceiverBridge(nn.Module):
+    """
+    Perceiver over fused early/late visual tokens.
+    Expected input: (encoder_tokens, posterior_mu_tokens).
+    """
+
+    def __init__(self, cfg: BridgeConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.requires_visual_features = True
+        self._pos_cache: dict[tuple[int, int, str, str], torch.Tensor] = {}
+        d_lm = int(cfg.lm_hidden_size)
+        self.low_proj = nn.LazyLinear(d_lm)
+        self.high_proj = nn.LazyLinear(d_lm)
+        self.low_log_scale = nn.Parameter(torch.zeros(1, 1, d_lm))
+        self.high_log_scale = nn.Parameter(torch.zeros(1, 1, d_lm))
+        self.spatial_mixer = _SpatialMixer(cfg)
+        self.core = _PerceiverCore(cfg)
+        self.supports_question_context = bool(self.core.supports_question_context)
+
+    def _token_pos_emb(self, nv: int, d_model: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        key = (int(nv), int(d_model), str(device), str(dtype))
+        cached = self._pos_cache.get(key)
+        if cached is not None:
+            return cached
+        emb = _build_token_2d_pos_emb(int(nv), int(d_model), device=device, dtype=dtype)
+        self._pos_cache[key] = emb
+        return emb
+
+    def _prepare_tokens(
+        self,
+        x: torch.Tensor,
+        proj: nn.Module,
+        scale_log: torch.Tensor,
+    ) -> torch.Tensor:
+        y = proj(_as_token_sequence(x))
+        if bool(self.cfg.add_2d_pos_emb):
+            y = y + self._token_pos_emb(int(y.shape[1]), int(y.shape[2]), device=y.device, dtype=y.dtype).unsqueeze(0)
+        return y * torch.exp(scale_log).clamp(min=0.25, max=4.0)
+
+    def forward(
+        self,
+        visual_features: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor],
+        question_context: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        low, high = _as_multiscale_token_pair(visual_features)
+        low_t = self._prepare_tokens(low, self.low_proj, self.low_log_scale)
+        high_t = self._prepare_tokens(high, self.high_proj, self.high_log_scale)
+        visual_tokens = self.spatial_mixer(torch.cat([low_t, high_t], dim=1))
+        return self.core(visual_tokens, question_context=question_context)
+
+
+class StructuredRolesBridge(_QueryBridgeBase):
+    """
+    Query bridge with fixed semantic role groups.
+    """
+
+    def __init__(self, cfg: BridgeConfig):
+        super().__init__(cfg)
         d_lm = int(cfg.lm_hidden_size)
         k = int(cfg.num_visual_tokens)
         std = float(cfg.learned_init_std)
-        rounds = max(1, int(cfg.bridge_query_depth))
-        self.latents = nn.Parameter(torch.randn(1, k, d_lm) * std)
+        role_count = max(1, int(getattr(cfg, "bridge_num_roles", 4)))
+        self.query_tokens = nn.Parameter(torch.randn(1, k, d_lm) * std)
+        self.role_embeddings = nn.Parameter(torch.randn(role_count, d_lm) * std)
+        role_ids = torch.arange(k, dtype=torch.long) % role_count
+        self.register_buffer("role_ids", role_ids, persistent=False)
+        depth = max(1, int(cfg.bridge_query_depth))
         self.cross_blocks = nn.ModuleList(
             [
                 _CrossAttnFFNBlock(
@@ -467,7 +624,7 @@ class PerceiverResamplerBridge(_QueryBridgeBase):
                     num_heads=int(cfg.bridge_num_heads),
                     attn_dropout=float(cfg.bridge_attn_dropout),
                 )
-                for _ in range(rounds)
+                for _ in range(depth)
             ]
         )
         self.self_blocks = nn.ModuleList(
@@ -477,50 +634,86 @@ class PerceiverResamplerBridge(_QueryBridgeBase):
                     num_heads=int(cfg.bridge_num_heads),
                     attn_dropout=float(cfg.bridge_attn_dropout),
                 )
-                for _ in range(rounds)
+                for _ in range(depth)
             ]
         )
-        self.supports_question_context = bool(getattr(cfg, "bridge_question_conditioning", False))
-        self.qcond_scale = float(getattr(cfg, "bridge_qcond_scale", 0.5))
-        if self.supports_question_context:
-            self.qcond_ln = nn.LayerNorm(d_lm)
-            self.qcond_proj = nn.Linear(d_lm, 2 * d_lm)
-        else:
-            self.qcond_ln = None
-            self.qcond_proj = None
 
-    def _apply_question_conditioning(
-        self,
-        latents: torch.Tensor,
-        question_context: torch.Tensor | None,
-    ) -> torch.Tensor:
-        if not self.supports_question_context or question_context is None:
-            return latents
-        if question_context.ndim != 2:
-            raise ValueError(
-                f"Expected question_context [B,D], got {tuple(question_context.shape)}"
-            )
-        assert self.qcond_ln is not None and self.qcond_proj is not None
-        qctx = self.qcond_ln(question_context)
-        gamma_beta = self.qcond_proj(qctx)
-        gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
-        s = max(0.0, float(self.qcond_scale))
-        scale = 1.0 + s * torch.tanh(gamma).unsqueeze(1)
-        shift = s * beta.unsqueeze(1)
-        return latents * scale + shift
-
-    def forward(
-        self,
-        visual_features: torch.Tensor,
-        question_context: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    def forward(self, visual_features: torch.Tensor) -> torch.Tensor:
         visual_tokens = self._prepare_visual_tokens(visual_features)
-        latents = self.latents.expand(int(visual_tokens.shape[0]), -1, -1)
-        latents = self._apply_question_conditioning(latents, question_context)
+        role_emb = self.role_embeddings[self.role_ids].unsqueeze(0)
+        q = self.query_tokens.expand(int(visual_tokens.shape[0]), -1, -1) + role_emb
         for cross_blk, self_blk in zip(self.cross_blocks, self.self_blocks):
-            latents = cross_blk(latents, visual_tokens)
-            latents = self_blk(latents)
-        return latents
+            q = cross_blk(q, visual_tokens)
+            q = self_blk(q)
+        return q
+
+
+class EvidenceSparseBridge(_QueryBridgeBase):
+    """
+    One global summary token plus sparse evidence queries over top-scoring visual tokens.
+    """
+
+    def __init__(self, cfg: BridgeConfig):
+        super().__init__(cfg)
+        d_lm = int(cfg.lm_hidden_size)
+        k = int(cfg.num_visual_tokens)
+        std = float(cfg.learned_init_std)
+        evidence_queries = max(0, k - 1)
+        self.evidence_queries = nn.Parameter(torch.randn(1, evidence_queries, d_lm) * std)
+        self.summary_proj = nn.Sequential(
+            nn.LayerNorm(d_lm),
+            nn.Linear(d_lm, d_lm),
+        )
+        self.evidence_scorer = nn.Sequential(
+            nn.LayerNorm(d_lm),
+            nn.Linear(d_lm, 1),
+        )
+        topk = int(getattr(cfg, "bridge_evidence_topk", 0))
+        self.evidence_topk = max(1, topk) if topk > 0 else max(8, min(32, 2 * max(1, evidence_queries)))
+        depth = max(1, int(cfg.bridge_query_depth))
+        self.cross_blocks = nn.ModuleList(
+            [
+                _CrossAttnFFNBlock(
+                    d_lm,
+                    num_heads=int(cfg.bridge_num_heads),
+                    attn_dropout=float(cfg.bridge_attn_dropout),
+                )
+                for _ in range(depth)
+            ]
+        )
+        self.self_blocks = nn.ModuleList(
+            [
+                _SelfAttnFFNBlock(
+                    d_lm,
+                    num_heads=int(cfg.bridge_num_heads),
+                    attn_dropout=float(cfg.bridge_attn_dropout),
+                )
+                for _ in range(depth)
+            ]
+        )
+
+    def _select_evidence_tokens(self, visual_tokens: torch.Tensor) -> torch.Tensor:
+        n = int(visual_tokens.shape[1])
+        k = min(self.evidence_topk, n)
+        if k >= n:
+            return visual_tokens
+        scores = self.evidence_scorer(visual_tokens).squeeze(-1)
+        top_vals, top_idx = torch.topk(scores, k=k, dim=1)
+        gather_idx = top_idx.unsqueeze(-1).expand(-1, -1, int(visual_tokens.shape[-1]))
+        selected = torch.gather(visual_tokens, dim=1, index=gather_idx)
+        return selected * torch.sigmoid(top_vals).unsqueeze(-1)
+
+    def forward(self, visual_features: torch.Tensor) -> torch.Tensor:
+        visual_tokens = self._prepare_visual_tokens(visual_features)
+        summary = self.summary_proj(visual_tokens.mean(dim=1, keepdim=True))
+        if int(self.evidence_queries.shape[1]) == 0:
+            return summary
+        evidence_tokens = self._select_evidence_tokens(visual_tokens)
+        q = self.evidence_queries.expand(int(visual_tokens.shape[0]), -1, -1)
+        for cross_blk, self_blk in zip(self.cross_blocks, self.self_blocks):
+            q = cross_blk(q, evidence_tokens)
+            q = self_blk(q)
+        return torch.cat([summary, q], dim=1)
 
 
 class _QFormerLiteBlock(nn.Module):
@@ -657,11 +850,18 @@ def build_bridge(cfg: BridgeConfig) -> nn.Module:
         return LearnedQueryCrossAttentionBridge(cfg)
     if bt == "perceiver_resampler":
         return PerceiverResamplerBridge(cfg)
+    if bt == "multiscale_perceiver":
+        return MultiScalePerceiverBridge(cfg)
     if bt == "qformer_lite":
         return QFormerLiteBridge(cfg)
+    if bt == "structured_roles":
+        return StructuredRolesBridge(cfg)
+    if bt == "evidence_sparse":
+        return EvidenceSparseBridge(cfg)
     if bt == "hybrid_const_image":
         return HybridConstantImageBridge(cfg)
     raise ValueError(
         f"Unsupported bridge_type={cfg.bridge_type}. "
-        "Supported: mlp, learned_tokens, learned_query, perceiver_resampler, qformer_lite, hybrid_const_image"
+        "Supported: mlp, learned_tokens, learned_query, perceiver_resampler, multiscale_perceiver, "
+        "qformer_lite, structured_roles, evidence_sparse, hybrid_const_image"
     )

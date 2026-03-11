@@ -1,19 +1,21 @@
 #!/bin/bash
 set -euo pipefail
 
+source "$(dirname "$0")/mm_run_budget.sh"
+
 STAMP="$(date +%Y%m%d_%H%M%S)"
 SWEEP_ID="mmnight_bridge_v1_${STAMP}"
 SWEEP_DIR="logs/${SWEEP_ID}"
 mkdir -pv "${SWEEP_DIR}"
 ln -sfn "${SWEEP_ID}" "logs/mmnight_bridge_v1_latest"
 
-MAX_STEPS="${MAX_STEPS:-3000}"
-EVAL_EVERY="${EVAL_EVERY:-750}"
-EVAL_BATCHES="${EVAL_BATCHES:-80}"
-LOG_EVERY="${LOG_EVERY:-20}"
-CKPT_EVERY="${CKPT_EVERY:-750}"
 BATCH_SIZE="${BATCH_SIZE:-192}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
+MAX_STEPS="${MAX_STEPS:-$(mm_budget_steps_for_bs_ga "${BATCH_SIZE}" "${GRAD_ACCUM_STEPS}")}"
+EVAL_EVERY="${EVAL_EVERY:-750}"
+EVAL_BATCHES="${EVAL_BATCHES:-0}"
+LOG_EVERY="${LOG_EVERY:-20}"
+CKPT_EVERY="${CKPT_EVERY:-1000}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
 DRY_RUN="${DRY_RUN:-0}"

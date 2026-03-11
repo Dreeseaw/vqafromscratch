@@ -38,6 +38,8 @@ from train.vqa_data import VQAv2Dataset, VQAv2Paths, build_image_transform, prep
 LOGDIR = "logs"
 LOGFILE = "logfile.txt"
 DEFAULT_FINAL_SANITY_COUNT = 4
+DEFAULT_TRAIN_SAMPLE_BUDGET = 1_152_000
+DEFAULT_EVAL_FRACTION = 0.5
 FINAL_SANITY_MIN_PROMPTS = 3
 FINAL_SANITY_MAX_PROMPTS = 5
 
@@ -191,12 +193,17 @@ def _apply_runtime_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "bridge_hybrid_image_bridge_type": "learned_query",
         "bridge_question_conditioning": False,
         "bridge_qcond_scale": 0.5,
+        "bridge_question_context_mode": "all_text",
         "bridge_token_selector_type": "none",
         "bridge_token_select_k": 0,
+        "bridge_num_roles": 4,
+        "bridge_evidence_topk": 0,
         "prefix_calibration": False,
         "prefix_calib_layernorm": True,
         "prefix_calib_bias": True,
         "prefix_calib_gate_init": 1.0,
+        "prefix_geom_mlp_ratio": 0.0,
+        "prefix_geom_token_mixer_layers": 0,
         "prefix_norm_target_ratio": 0.0,
         "prefix_norm_reg_weight": 0.0,
         "prefix_batchvar_reg_weight": 0.0,
@@ -345,6 +352,12 @@ class VisionFeatureAdapter(nn.Module):
             if not hasattr(m, "_encoder"):
                 raise ValueError("feature_source=encoder requires vision model._encoder")
             return m._encoder(images)
+        if src == "encoder_plus_posterior_mu":
+            if not hasattr(m, "_encoder") or not hasattr(m, "_post_head"):
+                raise ValueError("feature_source=encoder_plus_posterior_mu requires _encoder and _post_head")
+            h = m._encoder(images)
+            mu, _ = m._post_head(h)
+            return h, mu
         if src == "posterior_mu":
             if not hasattr(m, "_encoder") or not hasattr(m, "_post_head"):
                 raise ValueError("feature_source=posterior_mu requires _encoder and _post_head")
@@ -360,6 +373,30 @@ class VisionFeatureAdapter(nn.Module):
                     return x
         raise ValueError("Could not extract tensor features from vision model output.")
 
+    def _move_output(self, out: torch.Tensor) -> torch.Tensor:
+        if self.output_device is not None and str(out.device) != self.output_device:
+            out = out.to(self.output_device, non_blocking=True)
+        return out
+
+    def _format_single(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 4:
+            x = x.flatten(2).transpose(1, 2)  # [B,C,H,W] -> [B,N,C]
+        if self.feature_mode == "global":
+            if x.ndim == 2:
+                return self._move_output(x)
+            if x.ndim == 3:
+                return self._move_output(x.mean(dim=1))
+            raise ValueError(f"Unsupported feature shape for global mode: {tuple(x.shape)}")
+        if self.feature_mode == "token":
+            if x.ndim == 3:
+                return self._move_output(x)
+            if x.ndim == 2:
+                return self._move_output(x.unsqueeze(1))
+            raise ValueError(f"Unsupported feature shape for token mode: {tuple(x.shape)}")
+        if x.ndim in (2, 3):
+            return self._move_output(x)
+        raise ValueError(f"Unsupported feature shape for auto mode: {tuple(x.shape)}")
+
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         x_in = images
         if self.vision_device is not None and str(x_in.device) != self.vision_device:
@@ -367,39 +404,29 @@ class VisionFeatureAdapter(nn.Module):
         ctx = torch.no_grad() if self.force_no_grad else nullcontext()
         with ctx:
             x = self._extract_raw(x_in)
-        if x.ndim == 4:
-            x = x.flatten(2).transpose(1, 2)  # [B,C,H,W] -> [B,N,C]
-        if self.feature_mode == "global":
-            if x.ndim == 2:
-                out = x
-                if self.output_device is not None and str(out.device) != self.output_device:
-                    out = out.to(self.output_device, non_blocking=True)
-                return out
-            if x.ndim == 3:
-                out = x.mean(dim=1)
-                if self.output_device is not None and str(out.device) != self.output_device:
-                    out = out.to(self.output_device, non_blocking=True)
-                return out
-            raise ValueError(f"Unsupported feature shape for global mode: {tuple(x.shape)}")
-        if self.feature_mode == "token":
-            if x.ndim == 3:
-                out = x
-                if self.output_device is not None and str(out.device) != self.output_device:
-                    out = out.to(self.output_device, non_blocking=True)
-                return out
-            if x.ndim == 2:
-                out = x.unsqueeze(1)
-                if self.output_device is not None and str(out.device) != self.output_device:
-                    out = out.to(self.output_device, non_blocking=True)
-                return out
-            raise ValueError(f"Unsupported feature shape for token mode: {tuple(x.shape)}")
-        # auto
-        if x.ndim in (2, 3):
-            out = x
-            if self.output_device is not None and str(out.device) != self.output_device:
-                out = out.to(self.output_device, non_blocking=True)
-            return out
-        raise ValueError(f"Unsupported feature shape for auto mode: {tuple(x.shape)}")
+        if isinstance(x, (tuple, list)):
+            if self.feature_mode == "global":
+                raise ValueError("feature_source=encoder_plus_posterior_mu does not support feature_mode=global")
+            return tuple(self._format_single(t) for t in x)
+        return self._format_single(x)
+
+
+class _PrefixGeomTokenMixerBlock(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.ln = nn.LayerNorm(int(dim))
+        self.dw = nn.Conv1d(int(dim), int(dim), kernel_size=3, padding=1, groups=int(dim), bias=False)
+        self.pw = nn.Conv1d(int(dim), int(dim), kernel_size=1, bias=True)
+        nn.init.zeros_(self.dw.weight)
+        nn.init.zeros_(self.pw.weight)
+        nn.init.zeros_(self.pw.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.ln(x).transpose(1, 2)
+        y = self.dw(y)
+        y = F.gelu(y)
+        y = self.pw(y).transpose(1, 2)
+        return x + y
 
 
 class PrefixCalibrator(nn.Module):
@@ -417,6 +444,8 @@ class PrefixCalibrator(nn.Module):
         use_layernorm: bool,
         use_bias: bool,
         gate_init: float,
+        geom_mlp_ratio: float,
+        geom_token_mixer_layers: int,
     ) -> None:
         super().__init__()
         self.enabled = bool(enabled)
@@ -424,12 +453,34 @@ class PrefixCalibrator(nn.Module):
             self.ln = nn.Identity()
             self.log_gate = None
             self.bias = None
+            self.geom_blocks = nn.ModuleList()
+            self.geom_ln = nn.Identity()
+            self.geom_mlp = None
             return
 
         self.ln = nn.LayerNorm(int(dim), elementwise_affine=False) if bool(use_layernorm) else nn.Identity()
         init = max(1e-5, float(gate_init))
         self.log_gate = nn.Parameter(torch.full((1, 1, int(dim)), math.log(init)))
         self.bias = nn.Parameter(torch.zeros(1, 1, int(dim))) if bool(use_bias) else None
+        self.geom_blocks = nn.ModuleList(
+            [_PrefixGeomTokenMixerBlock(int(dim)) for _ in range(max(0, int(geom_token_mixer_layers)))]
+        )
+        ratio = float(geom_mlp_ratio)
+        if ratio > 0.0:
+            h = max(4, int(round(int(dim) * ratio)))
+            self.geom_ln = nn.LayerNorm(int(dim))
+            self.geom_mlp = nn.Sequential(
+                nn.Linear(int(dim), h),
+                nn.GELU(),
+                nn.Linear(h, int(dim)),
+            )
+            last = self.geom_mlp[-1]
+            assert isinstance(last, nn.Linear)
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
+        else:
+            self.geom_ln = nn.Identity()
+            self.geom_mlp = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.enabled:
@@ -440,6 +491,10 @@ class PrefixCalibrator(nn.Module):
         y = y * gate
         if self.bias is not None:
             y = y + self.bias
+        for blk in self.geom_blocks:
+            y = blk(y)
+        if self.geom_mlp is not None:
+            y = y + self.geom_mlp(self.geom_ln(y))
         return y
 
 
@@ -455,10 +510,13 @@ class MultimodalPrefixLM(nn.Module):
         prefix_calib_layernorm: bool = True,
         prefix_calib_bias: bool = True,
         prefix_calib_gate_init: float = 1.0,
+        prefix_geom_mlp_ratio: float = 0.0,
+        prefix_geom_token_mixer_layers: int = 0,
         prefix_norm_target_ratio: float = 0.0,
         prefix_norm_reg_weight: float = 0.0,
         prefix_batchvar_reg_weight: float = 0.0,
         prefix_dropout: float = 0.0,
+        question_context_mode: str = "all_text",
     ):
         super().__init__()
         self.vision_adapter = vision_adapter
@@ -472,12 +530,15 @@ class MultimodalPrefixLM(nn.Module):
             use_layernorm=bool(prefix_calib_layernorm),
             use_bias=bool(prefix_calib_bias),
             gate_init=float(prefix_calib_gate_init),
+            geom_mlp_ratio=float(prefix_geom_mlp_ratio),
+            geom_token_mixer_layers=int(prefix_geom_token_mixer_layers),
         )
         self.prefix_calibration = bool(prefix_calibration)
         self.prefix_norm_target_ratio = float(prefix_norm_target_ratio)
         self.prefix_norm_reg_weight = float(prefix_norm_reg_weight)
         self.prefix_batchvar_reg_weight = float(prefix_batchvar_reg_weight)
         self.prefix_dropout = max(0.0, float(prefix_dropout))
+        self.question_context_mode = str(question_context_mode)
 
     def _lm_autocast_dtype(self) -> Optional[torch.dtype]:
         if not self.lm_autocast:
@@ -491,9 +552,9 @@ class MultimodalPrefixLM(nn.Module):
     @staticmethod
     def _question_context_from_text(
         text_emb: torch.Tensor,
-        text_pad_mask: torch.Tensor,
+        context_mask: torch.Tensor,
     ) -> torch.Tensor:
-        valid = (~text_pad_mask).unsqueeze(-1).float()
+        valid = context_mask.unsqueeze(-1).float()
         denom = valid.sum(dim=1).clamp_min(1.0)
         return (text_emb * valid).sum(dim=1) / denom
 
@@ -511,6 +572,7 @@ class MultimodalPrefixLM(nn.Module):
         input_ids: torch.Tensor,
         images: torch.Tensor,
         text_pad_mask: torch.Tensor,
+        prompt_mask: Optional[torch.Tensor] = None,
         *,
         debug_shapes: bool = False,
         return_aux: bool = False,
@@ -518,7 +580,11 @@ class MultimodalPrefixLM(nn.Module):
         text_emb = self.lm._embed_dropout(self.lm._embed(input_ids))
         question_context: Optional[torch.Tensor] = None
         if bool(getattr(self.bridge, "supports_question_context", False)):
-            question_context = self._question_context_from_text(text_emb, text_pad_mask)
+            if self.question_context_mode == "prompt_only" and prompt_mask is not None:
+                context_mask = prompt_mask & (~text_pad_mask)
+            else:
+                context_mask = ~text_pad_mask
+            question_context = self._question_context_from_text(text_emb, context_mask)
 
         needs_visual = bool(getattr(self.bridge, "requires_visual_features", True))
         visual_features: Optional[torch.Tensor] = None
@@ -587,6 +653,7 @@ class MultimodalPrefixLM(nn.Module):
             input_ids=batch["input_ids"],
             images=batch["images"],
             text_pad_mask=batch["text_pad_mask"],
+            prompt_mask=batch.get("prompt_mask"),
             debug_shapes=debug_shapes,
             return_aux=True,
         )
@@ -646,14 +713,21 @@ class MultimodalPrefixLM(nn.Module):
             max_len = max(len(s) for s in seqs)
             input_ids = torch.full((len(seqs), max_len), int(pad_id), dtype=torch.long, device=images.device)
             text_pad_mask = torch.ones((len(seqs), max_len), dtype=torch.bool, device=images.device)
+            prompt_mask = torch.zeros((len(seqs), max_len), dtype=torch.bool, device=images.device)
             for i, s in enumerate(seqs):
                 if not s:
                     continue
                 t = torch.tensor(s, dtype=torch.long, device=images.device)
                 input_ids[i, : len(s)] = t
                 text_pad_mask[i, : len(s)] = False
+                prompt_mask[i, : len(s)] = True
 
-            logits, prefix_k = self.forward_logits(input_ids=input_ids, images=images, text_pad_mask=text_pad_mask)
+            logits, prefix_k = self.forward_logits(
+                input_ids=input_ids,
+                images=images,
+                text_pad_mask=text_pad_mask,
+                prompt_mask=prompt_mask,
+            )
             text_logits = logits[:, prefix_k:, :]
 
             for i in range(len(seqs)):
@@ -716,14 +790,17 @@ class QACollator:
         max_len = max(len(x["input_ids"]) for x in enc) if enc else 1
         input_ids = torch.full((b, max_len), int(self.tok.pad_id), dtype=torch.long)
         text_pad_mask = torch.ones((b, max_len), dtype=torch.bool)
+        prompt_mask = torch.zeros((b, max_len), dtype=torch.bool)
         target_mask = torch.zeros((b, max_len - 1), dtype=torch.bool)
         answer_loss_mask = torch.zeros((b, max_len - 1), dtype=torch.bool)
 
         for i, e in enumerate(enc):
             ids = e["input_ids"]
             L = len(ids)
+            P = len(e["prompt_ids"])
             input_ids[i, :L] = torch.tensor(ids, dtype=torch.long)
             text_pad_mask[i, :L] = False
+            prompt_mask[i, :P] = True
             if L > 1:
                 target_mask[i, : L - 1] = True
                 if e["has_answer"]:
@@ -734,6 +811,7 @@ class QACollator:
             "images": torch.stack([s["image"] for s in samples], dim=0),
             "input_ids": input_ids,
             "text_pad_mask": text_pad_mask,
+            "prompt_mask": prompt_mask,
             "target_mask": target_mask,
             "answer_loss_mask": answer_loss_mask,
             "prompt_ids": [e["prompt_ids"] for e in enc],
@@ -764,6 +842,11 @@ def build_loader(
         limit=limit,
         skip_missing_images=True,
     )
+    if (not train_mode) and int(limit) <= 0:
+        eval_fraction = float(getattr(args, "eval_fraction", 1.0))
+        if 0.0 < eval_fraction < 1.0:
+            keep = max(1, int(math.ceil(float(len(ds)) * eval_fraction)))
+            ds.items = ds.items[:keep]
     collator = QACollator(
         tokenizer=tokenizer,
         max_q=args.max_question_length,
@@ -834,7 +917,7 @@ def _set_module_modes(model: MultimodalPrefixLM, freeze_mode: str) -> None:
 
 def _to_device(batch: Dict[str, Any], device: str) -> Dict[str, Any]:
     out = dict(batch)
-    for k in ("images", "input_ids", "text_pad_mask", "target_mask", "answer_loss_mask"):
+    for k in ("images", "input_ids", "text_pad_mask", "prompt_mask", "target_mask", "answer_loss_mask"):
         out[k] = batch[k].to(device)
     return out
 
@@ -846,6 +929,7 @@ def _materialize_lazy_params(model: MultimodalPrefixLM, batch: Dict[str, Any], d
             input_ids=b["input_ids"],
             images=b["images"],
             text_pad_mask=b["text_pad_mask"],
+            prompt_mask=b.get("prompt_mask"),
             debug_shapes=False,
         )
 
@@ -962,8 +1046,11 @@ def build_runtime_from_args(
         "bridge_hybrid_image_bridge_type": str(args.bridge_hybrid_image_bridge_type),
         "bridge_question_conditioning": bool(args.bridge_question_conditioning),
         "bridge_qcond_scale": float(args.bridge_qcond_scale),
+        "bridge_question_context_mode": str(args.bridge_question_context_mode),
         "bridge_token_selector_type": str(args.bridge_token_selector_type),
         "bridge_token_select_k": int(args.bridge_token_select_k),
+        "bridge_num_roles": int(args.bridge_num_roles),
+        "bridge_evidence_topk": int(args.bridge_evidence_topk),
     }
     if checkpoint_payload is not None and isinstance(checkpoint_payload.get("bridge_config"), dict):
         bcfg_data.update(dict(checkpoint_payload["bridge_config"]))
@@ -979,10 +1066,13 @@ def build_runtime_from_args(
         prefix_calib_layernorm=bool(args.prefix_calib_layernorm),
         prefix_calib_bias=bool(args.prefix_calib_bias),
         prefix_calib_gate_init=float(args.prefix_calib_gate_init),
+        prefix_geom_mlp_ratio=float(args.prefix_geom_mlp_ratio),
+        prefix_geom_token_mixer_layers=int(args.prefix_geom_token_mixer_layers),
         prefix_norm_target_ratio=float(args.prefix_norm_target_ratio),
         prefix_norm_reg_weight=float(args.prefix_norm_reg_weight),
         prefix_batchvar_reg_weight=float(args.prefix_batchvar_reg_weight),
         prefix_dropout=float(args.prefix_dropout),
+        question_context_mode=str(args.bridge_question_context_mode),
     ).to(device)
     if str(vision_device) != str(device):
         model.vision_adapter.vision_model.to(vision_device)
@@ -1357,13 +1447,17 @@ def log_startup_config(
         f"refine={bridge_cfg.bridge_refine_layers} pre_mixer={bridge_cfg.bridge_pre_mixer_type} "
         f"hybrid_alpha_mode={bridge_cfg.bridge_hybrid_alpha_mode} "
         f"qcond={int(bool(bridge_cfg.bridge_question_conditioning))} qcond_scale={bridge_cfg.bridge_qcond_scale:.6g} "
-        f"token_selector={bridge_cfg.bridge_token_selector_type} token_select_k={bridge_cfg.bridge_token_select_k}"
+        f"qctx_mode={bridge_cfg.bridge_question_context_mode} "
+        f"token_selector={bridge_cfg.bridge_token_selector_type} token_select_k={bridge_cfg.bridge_token_select_k} "
+        f"num_roles={bridge_cfg.bridge_num_roles} evidence_topk={bridge_cfg.bridge_evidence_topk}"
     )
     logger.log(
         f"[mm] prefix_calibration={int(bool(args.prefix_calibration))} "
         f"prefix_calib_layernorm={int(bool(args.prefix_calib_layernorm))} "
         f"prefix_calib_bias={int(bool(args.prefix_calib_bias))} "
         f"prefix_calib_gate_init={float(args.prefix_calib_gate_init):.6g} "
+        f"prefix_geom_mlp_ratio={float(args.prefix_geom_mlp_ratio):.6g} "
+        f"prefix_geom_token_mixer_layers={int(args.prefix_geom_token_mixer_layers)} "
         f"prefix_norm_target_ratio={float(args.prefix_norm_target_ratio):.6g} "
         f"prefix_norm_reg_weight={float(args.prefix_norm_reg_weight):.6g} "
         f"prefix_batchvar_reg_weight={float(args.prefix_batchvar_reg_weight):.6g} "
@@ -1383,11 +1477,13 @@ def log_startup_config(
     )
     logger.log(
         f"[mm] data images_root={args.images_root} annotations_root={args.annotations_root} "
-        f"limit_train={args.limit_train} limit_val={args.limit_val} limit_eval={args.limit_eval}"
+        f"limit_train={args.limit_train} limit_val={args.limit_val} limit_eval={args.limit_eval} "
+        f"eval_fraction={float(args.eval_fraction):.4g}"
     )
     logger.log(
         f"[mm] loop epochs={args.epochs} max_steps={args.max_steps} overfit_small_batch={int(bool(args.overfit_small_batch))} "
         f"lr_schedule={args.lr_schedule} lr_warmup_steps={args.lr_warmup_steps} lr_min_ratio={args.lr_min_ratio} "
+        f"train_sample_budget={int(args.train_sample_budget)} manual_max_steps={int(bool(args.manual_max_steps))} "
         f"cuda_empty_cache_after_eval={int(bool(args.cuda_empty_cache_after_eval))} "
         f"log_every={args.log_every} eval_every={args.eval_every} eval_batches={args.eval_batches} "
         f"eval_log_every={args.eval_log_every} eval_scorer={args.eval_scorer} "
@@ -1423,7 +1519,7 @@ def parse_args() -> argparse.Namespace:
         "--vision_feature_source",
         type=str,
         default="posterior_mu",
-        choices=["posterior_mu", "encoder", "model_output"],
+        choices=["posterior_mu", "encoder", "encoder_plus_posterior_mu", "model_output"],
     )
     ap.add_argument("--vision_feature_mode", type=str, default="auto", choices=["auto", "global", "token"])
 
@@ -1460,7 +1556,10 @@ def parse_args() -> argparse.Namespace:
             "learned_query",
             "query_cross_attn",
             "perceiver_resampler",
+            "multiscale_perceiver",
             "qformer_lite",
+            "structured_roles",
+            "evidence_sparse",
             "hybrid_const_image",
         ],
     )
@@ -1507,7 +1606,16 @@ def parse_args() -> argparse.Namespace:
         "--bridge_hybrid_image_bridge_type",
         type=str,
         default="learned_query",
-        choices=["mlp", "learned_query", "query_cross_attn", "perceiver_resampler", "qformer_lite"],
+        choices=[
+            "mlp",
+            "learned_query",
+            "query_cross_attn",
+            "perceiver_resampler",
+            "multiscale_perceiver",
+            "qformer_lite",
+            "structured_roles",
+            "evidence_sparse",
+        ],
     )
     ap.add_argument(
         "--bridge_question_conditioning",
@@ -1522,6 +1630,13 @@ def parse_args() -> argparse.Namespace:
         help="Scale factor for question-conditioned FiLM modulation in perceiver latents.",
     )
     ap.add_argument(
+        "--bridge_question_context_mode",
+        type=str,
+        default="all_text",
+        choices=["all_text", "prompt_only"],
+        help="Pool q-conditioning context from all text tokens or prompt/question tokens only.",
+    )
+    ap.add_argument(
         "--bridge_token_selector_type",
         type=str,
         default="none",
@@ -1534,6 +1649,8 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Selected token count when --bridge_token_selector_type=topk (<=0 disables).",
     )
+    ap.add_argument("--bridge_num_roles", type=int, default=4)
+    ap.add_argument("--bridge_evidence_topk", type=int, default=0)
     ap.add_argument(
         "--prefix_calibration",
         action=argparse.BooleanOptionalAction,
@@ -1557,6 +1674,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Initial multiplicative gate for calibrated prefix tokens.",
+    )
+    ap.add_argument(
+        "--prefix_geom_mlp_ratio",
+        type=float,
+        default=0.0,
+        help="Optional residual geometry MLP ratio inside prefix calibration. <=0 disables.",
+    )
+    ap.add_argument(
+        "--prefix_geom_token_mixer_layers",
+        type=int,
+        default=0,
+        help="Optional token-mixer layers inside prefix calibration.",
     )
     ap.add_argument(
         "--prefix_norm_target_ratio",
@@ -1605,6 +1734,18 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--max_steps", type=int, default=0)
+    ap.add_argument(
+        "--manual_max_steps",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Respect the provided --max_steps exactly instead of deriving it from effective batch size.",
+    )
+    ap.add_argument(
+        "--train_sample_budget",
+        type=int,
+        default=DEFAULT_TRAIN_SAMPLE_BUDGET,
+        help="Total training samples budget used to derive max_steps for normal runs.",
+    )
     ap.add_argument("--overfit_small_batch", action="store_true")
     ap.add_argument("--overfit_steps", type=int, default=200)
 
@@ -1640,6 +1781,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--limit_train", type=int, default=0)
     ap.add_argument("--limit_val", type=int, default=0)
     ap.add_argument("--limit_eval", type=int, default=0)
+    ap.add_argument(
+        "--eval_fraction",
+        type=float,
+        default=DEFAULT_EVAL_FRACTION,
+        help="Fraction of the eval split to use when --limit_eval is not set.",
+    )
     ap.add_argument("--qualitative_samples", type=int, default=8)
     ap.add_argument("--confusion_top_k", type=int, default=20)
     ap.add_argument(
@@ -1654,9 +1801,33 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
+def _resolve_training_max_steps(args: argparse.Namespace) -> int:
+    explicit_max_steps = int(args.max_steps)
+    if bool(args.overfit_small_batch):
+        return explicit_max_steps
+    if bool(args.manual_max_steps):
+        return explicit_max_steps
+    eff_batch = max(1, int(args.batch_size) * max(1, int(args.grad_accum_steps)))
+    budget = max(1, int(args.train_sample_budget))
+    return int(math.ceil(float(budget) / float(eff_batch)))
+
+
 def main() -> None:
     args = parse_args()
     args = _apply_runtime_defaults(args)
+    resolved_max_steps = _resolve_training_max_steps(args)
+    max_steps_override_msg = None
+    if (not bool(args.overfit_small_batch)) and (not bool(args.manual_max_steps)):
+        explicit_max_steps = int(args.max_steps)
+        args.max_steps = int(resolved_max_steps)
+        eff_batch = max(1, int(args.batch_size) * max(1, int(args.grad_accum_steps)))
+        if explicit_max_steps > 0 and explicit_max_steps != int(resolved_max_steps):
+            max_steps_override_msg = (
+                f"[mm] overriding explicit --max_steps {explicit_max_steps} with derived max_steps={resolved_max_steps} "
+                f"from train_sample_budget={int(args.train_sample_budget)} effective_batch_size={eff_batch}"
+            )
+    else:
+        args.max_steps = int(resolved_max_steps)
     set_seed(int(args.seed))
     device = resolve_device(args.device)
     amp_enabled, amp_dtype, use_scaler = resolve_amp(device, args.precision)
@@ -1665,6 +1836,8 @@ def main() -> None:
     run_dir = os.path.join(LOGDIR, args.run_id)
     os.makedirs(run_dir, exist_ok=True)
     logger = Logger(run_id=args.run_id, checkpoint_id=args.checkpoint)
+    if max_steps_override_msg:
+        logger.log(max_steps_override_msg)
     if args.auto_download:
         prepare_vqav2(
             VQAv2Paths(images_root=args.images_root, annotations_root=args.annotations_root),
@@ -1885,14 +2058,20 @@ def main() -> None:
             opt.step()
         opt.zero_grad(set_to_none=True)
 
+    train_log_time_sec = 0.0
+    train_log_steps = 0
+
     def _post_optimizer_step(
         *,
         loss_value: float,
         info_dict: Dict[str, float],
         current_lr: float,
+        step_train_elapsed: float,
     ) -> None:
+        nonlocal train_log_time_sec, train_log_steps
+        train_log_time_sec += max(0.0, float(step_train_elapsed))
+        train_log_steps += 1
         if global_step % int(args.log_every) == 0:
-            elapsed = max(1e-6, time.time() - start_time)
             tok_count = int(info_dict.get("loss_tokens", 0.0))
             loss_ce = float(info_dict.get("loss_ce", loss_value))
             ratio = info_dict.get("prefix_text_norm_ratio", None)
@@ -1904,11 +2083,14 @@ def main() -> None:
                 reg_txt += f" reg_norm={float(reg_norm):.6f}"
             if reg_var is not None:
                 reg_txt += f" reg_var={float(reg_var):.6f}"
+            steps_per_s = float(train_log_steps) / max(1e-6, float(train_log_time_sec))
             logger.log(
                 f"[mm] step={global_step} epoch={epoch} loss={float(loss_value):.4f} "
                 f"loss_ce={loss_ce:.4f} loss_tokens={tok_count}{ratio_txt}{reg_txt} "
-                f"lr={current_lr:.6g} steps_per_s={global_step / elapsed:.2f}"
+                f"lr={current_lr:.6g} steps_per_s={steps_per_s:.2f}"
             )
+            train_log_time_sec = 0.0
+            train_log_steps = 0
 
         if int(args.eval_every) > 0 and global_step % int(args.eval_every) == 0:
             maybe_cuda_empty_cache(
@@ -1963,11 +2145,11 @@ def main() -> None:
             logger.log(f"[mm] checkpoint saved: {ckpt_path}")
 
     epoch = start_epoch
-    start_time = time.time()
     opt.zero_grad(set_to_none=True)
     accum_count = 0
     accum_loss_sum = 0.0
     accum_info_sums: Dict[str, float] = {}
+    optimizer_step_started_at: Optional[float] = None
 
     while True:
         epoch += 1
@@ -1979,6 +2161,8 @@ def main() -> None:
             iter_obj = train_loader
 
         for batch in iter_obj:
+            if accum_count == 0:
+                optimizer_step_started_at = time.perf_counter()
             current_lr = _set_optimizer_lr(_lr_scale(global_step + 1))
             _set_module_modes(model, args.freeze_mode)
             batch = _to_device(batch, device)
@@ -2009,6 +2193,8 @@ def main() -> None:
 
             _optimizer_step()
             global_step += 1
+            step_train_elapsed = 0.0 if optimizer_step_started_at is None else (time.perf_counter() - optimizer_step_started_at)
+            optimizer_step_started_at = None
             info_step: Dict[str, float] = {}
             for k, v in accum_info_sums.items():
                 if k == "loss_tokens":
@@ -2024,6 +2210,7 @@ def main() -> None:
                 loss_value=loss_step,
                 info_dict=info_step,
                 current_lr=current_lr,
+                step_train_elapsed=step_train_elapsed,
             )
 
             if steps_budget is not None and global_step >= steps_budget:
@@ -2033,6 +2220,8 @@ def main() -> None:
             current_lr = _set_optimizer_lr(_lr_scale(global_step + 1))
             _optimizer_step()
             global_step += 1
+            step_train_elapsed = 0.0 if optimizer_step_started_at is None else (time.perf_counter() - optimizer_step_started_at)
+            optimizer_step_started_at = None
             info_step = {}
             for k, v in accum_info_sums.items():
                 if k == "loss_tokens":
@@ -2047,6 +2236,7 @@ def main() -> None:
                 loss_value=loss_step,
                 info_dict=info_step,
                 current_lr=current_lr,
+                step_train_elapsed=step_train_elapsed,
             )
 
         if steps_budget is not None and global_step >= steps_budget:

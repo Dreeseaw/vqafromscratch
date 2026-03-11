@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Research Progress Tracker</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.8.1/github-markdown-light.min.css" />
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
@@ -22,40 +23,67 @@
           <select id="sweepFilter"></select>
         </label>
       </div>
-      <table>
-        <thead>
-          <tr>
-            <th>Sweep</th>
-            <th>Status</th>
-            <th>Runs</th>
-            <th>Last Train CE</th>
-            <th>Started</th>
-            <th>Ended</th>
-          </tr>
-        </thead>
-        <tbody id="sweepsBody"></tbody>
-      </table>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Sweep</th>
+              <th>Status</th>
+              <th>Active</th>
+              <th>Runs</th>
+              <th>Best Acc</th>
+              <th>Last Train CE</th>
+              <th>Started</th>
+              <th>Ended</th>
+            </tr>
+          </thead>
+          <tbody id="sweepsBody"></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button id="sweepsPrev" type="button">Prev</button>
+        <span id="sweepsPageLabel" class="muted mono">Page 1 / 1</span>
+        <button id="sweepsNext" type="button">Next</button>
+      </div>
     </section>
 
     <section class="panel">
       <div class="panel-head">
         <h2>Runs</h2>
-        <span class="muted mono">final acc, latest train CE, params</span>
+        <label class="muted mono">Active
+          <input id="activeOnly" type="checkbox" />
+          <span id="activeCount">0 active</span>
+        </label>
       </div>
-      <table>
-        <thead>
-          <tr>
-            <th>Run / Model</th>
-            <th>Final Acc</th>
-            <th>Last Train CE</th>
-            <th>Last Step</th>
-            <th>Steps/s</th>
-            <th>Params</th>
-            <th>Final Ckpt</th>
-          </tr>
-        </thead>
-        <tbody id="runsBody"></tbody>
-      </table>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Run / Model</th>
+              <th>Final Acc</th>
+              <th>Last Train CE</th>
+              <th>Last Step</th>
+              <th>Steps/s</th>
+              <th>Params</th>
+              <th>Final Ckpt</th>
+            </tr>
+          </thead>
+          <tbody id="runsBody"></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button id="runsPrev" type="button">Prev</button>
+        <span id="runsPageLabel" class="muted mono">Page 1 / 1</span>
+        <button id="runsNext" type="button">Next</button>
+      </div>
+    </section>
+
+    <section id="runDetailPanel" class="panel detail-panel" hidden>
+      <div class="panel-head">
+        <h2 id="runDetailTitle">Run Detail</h2>
+        <button id="runDetailClose" type="button">Close</button>
+      </div>
+      <div id="runDetailBody"></div>
     </section>
 
     <section class="panel">
@@ -63,22 +91,35 @@
         <h2>Docs (mm_bridge)</h2>
         <span class="muted mono">Auto-discovered from docs directory</span>
       </div>
-      <table>
-        <thead>
-          <tr>
-            <th>Doc</th>
-            <th>Updated</th>
-            <th>Run Refs</th>
-            <th>Top Mentioned Acc</th>
-          </tr>
-        </thead>
-        <tbody id="docsBody"></tbody>
-      </table>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Doc</th>
+              <th>Updated</th>
+              <th>Run Refs</th>
+              <th>Top Mentioned Acc</th>
+            </tr>
+          </thead>
+          <tbody id="docsBody"></tbody>
+        </table>
+      </div>
       <div class="pager">
         <button id="docsPrev" type="button">Prev</button>
         <span id="docsPageLabel" class="muted mono">Page 1 / 1</span>
         <button id="docsNext" type="button">Next</button>
       </div>
+    </section>
+
+    <section id="docDetailPanel" class="panel detail-panel" hidden>
+      <div class="panel-head">
+        <h2 id="docDetailTitle">Doc Detail</h2>
+        <div class="detail-actions">
+          <button id="docDetailOpen" type="button" hidden>Open ↗</button>
+          <button id="docDetailClose" type="button">Close</button>
+        </div>
+      </div>
+      <div id="docDetailBody"></div>
     </section>
   </main>
 

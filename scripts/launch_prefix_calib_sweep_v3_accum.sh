@@ -1,10 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
+source "$(dirname "$0")/mm_run_budget.sh"
+
 STAMP="$(date +%Y%m%d_%H%M%S)"
 SWEEP_ID="mmcal_sweep_v3_accum_${STAMP}"
 SWEEP_DIR="logs/${SWEEP_ID}"
 mkdir -pv "${SWEEP_DIR}"
+
+BATCH_SIZE="${BATCH_SIZE:-128}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-2}"
+MAX_STEPS="${MAX_STEPS:-$(mm_budget_steps_for_bs_ga "${BATCH_SIZE}" "${GRAD_ACCUM_STEPS}")}"
 
 cat > "${SWEEP_DIR}/README.md" <<EOF
 # Prefix Calibration Sweep V3 (Gradient Accumulation)
@@ -17,19 +23,19 @@ Data roots (unchanged):
 - annotations_root: data/vqav2
 
 Batching:
-- batch_size=128
-- grad_accum_steps=2
-- effective_batch_size=256
+- batch_size=${BATCH_SIZE}
+- grad_accum_steps=${GRAD_ACCUM_STEPS}
+- effective_batch_size=$((BATCH_SIZE * GRAD_ACCUM_STEPS))
 EOF
 
 COMMON_ARGS=(
-  --batch_size 128
-  --grad_accum_steps 2
-  --max_steps 5000
+  --batch_size "${BATCH_SIZE}"
+  --grad_accum_steps "${GRAD_ACCUM_STEPS}"
+  --max_steps "${MAX_STEPS}"
   --epochs 100
   --log_every 20
   --eval_every 1000
-  --eval_batches 160
+  --eval_batches 0
   --eval_log_every 20
   --ckpt_every 1000
   --eval_scorer official
@@ -49,8 +55,8 @@ COMMON_ARGS=(
 run_one() {
   local run_id="$1"
   shift
-  if [[ -f "logs/${run_id}/step_5000.tar" ]]; then
-    echo "[$(date)] SKIP  ${run_id} (found logs/${run_id}/step_5000.tar)" | tee -a "${SWEEP_DIR}/timeline.log"
+  if [[ -f "logs/${run_id}/step_${MAX_STEPS}.tar" ]]; then
+    echo "[$(date)] SKIP  ${run_id} (found logs/${run_id}/step_${MAX_STEPS}.tar)" | tee -a "${SWEEP_DIR}/timeline.log"
     return 0
   fi
   echo "[$(date)] START ${run_id}" | tee -a "${SWEEP_DIR}/timeline.log"

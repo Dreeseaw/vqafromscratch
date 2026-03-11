@@ -220,7 +220,11 @@ def _run_mode(
         text_emb = model.lm._embed(batch["input_ids"])
         question_context: Optional[torch.Tensor] = None
         if bool(getattr(model.bridge, "supports_question_context", False)):
-            valid = (~batch["text_pad_mask"]).unsqueeze(-1).float()
+            if str(getattr(model, "question_context_mode", "all_text")) == "prompt_only" and "prompt_mask" in batch:
+                valid_mask = batch["prompt_mask"] & (~batch["text_pad_mask"])
+            else:
+                valid_mask = ~batch["text_pad_mask"]
+            valid = valid_mask.unsqueeze(-1).float()
             denom = valid.sum(dim=1).clamp_min(1.0)
             question_context = (text_emb * valid).sum(dim=1) / denom
 

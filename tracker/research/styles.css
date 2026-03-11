@@ -28,6 +28,8 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: baseline;
+  gap: 8px 16px;
+  flex-wrap: wrap;
 }
 
 h1 {
@@ -68,6 +70,18 @@ h2 {
   font-family: var(--mono);
   font-size: 18px;
   font-weight: 700;
+  line-height: 1.2;
+}
+
+.kpi-subvalue {
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.kpi-best .kpi-value {
+  font-size: 22px;
 }
 
 .panel {
@@ -81,13 +95,21 @@ h2 {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 8px 16px;
+  flex-wrap: wrap;
   margin-bottom: 8px;
+}
+
+.table-wrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 table {
   width: 100%;
   border-collapse: collapse;
   font-size: 13px;
+  min-width: 720px;
 }
 
 th, td {
@@ -106,6 +128,14 @@ tr:hover td {
   background: #fafcff;
 }
 
+.clickable-row {
+  cursor: pointer;
+}
+
+.clickable-row.is-selected td {
+  background: #eef5ff;
+}
+
 a {
   color: var(--accent);
   text-decoration: none;
@@ -118,6 +148,11 @@ a:hover {
 select {
   margin-left: 6px;
   padding: 2px 6px;
+}
+
+input[type="checkbox"] {
+  margin: 0 6px;
+  vertical-align: middle;
 }
 
 button {
@@ -139,12 +174,294 @@ button:disabled {
   display: flex;
   justify-content: flex-end;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   margin-top: 10px;
+}
+
+.detail-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.detail-panel[hidden] {
+  display: none !important;
+}
+
+.detail-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(120px, 1fr));
+  gap: 8px;
+}
+
+.detail-card,
+.chart-card {
+  background: #fbfcfe;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+}
+
+.detail-label,
+.detail-section-title {
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.detail-value {
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.charts-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(240px, 1fr));
+  gap: 10px;
+}
+
+.chart-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: baseline;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.chart-svg {
+  display: block;
+  width: 100%;
+  height: 150px;
+}
+
+.chart-baseline {
+  stroke: #d9e2f0;
+  stroke-width: 1;
+  fill: none;
+}
+
+.chart-line {
+  fill: none;
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.chart-line-ce {
+  stroke: #0a66c2;
+}
+
+.chart-line-acc {
+  stroke: #1c8c5e;
+}
+
+.detail-pre {
+  margin: 0;
+  padding: 10px;
+  background: #fbfcfe;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.doc-render.markdown-body {
+  max-width: none;
+  padding: 6px 2px 2px;
+  background: transparent !important;
+  color: var(--text);
+  font-family: var(--sans) !important;
+  font-size: 15px;
+  line-height: 1.72;
+}
+
+.doc-render.markdown-body > * {
+  max-width: 78ch;
+}
+
+.doc-render.markdown-body h1,
+.doc-render.markdown-body h2,
+.doc-render.markdown-body h3,
+.doc-render.markdown-body h4,
+.doc-render.markdown-body h5,
+.doc-render.markdown-body h6 {
+  font-family: var(--sans) !important;
+  color: var(--text);
+  line-height: 1.2;
+  margin-top: 1.5em;
+  margin-bottom: 0.55em;
+}
+
+.doc-render.markdown-body h1 {
+  font-size: 28px;
+  letter-spacing: -0.02em;
+}
+
+.doc-render.markdown-body h2 {
+  font-size: 22px;
+}
+
+.doc-render.markdown-body h3 {
+  font-size: 18px;
+}
+
+.doc-render.markdown-body p,
+.doc-render.markdown-body ul,
+.doc-render.markdown-body ol,
+.doc-render.markdown-body blockquote {
+  margin-top: 0;
+  margin-bottom: 0.95em;
+}
+
+.doc-render.markdown-body li + li {
+  margin-top: 0.22em;
+}
+
+.doc-render.markdown-body ol,
+.doc-render.markdown-body ul {
+  padding-left: 1.5em;
+}
+
+.doc-render.markdown-body li > ul,
+.doc-render.markdown-body li > ol {
+  margin-top: 0.35em;
+  margin-bottom: 0.1em;
+  padding-left: 1.35em;
+}
+
+.doc-render.markdown-body a {
+  color: #0b5cad;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+
+.doc-render.markdown-body strong {
+  color: #121925;
+}
+
+.doc-render.markdown-body blockquote {
+  color: #445066;
+  border-left: 3px solid #cfd9e8;
+  padding: 0.1em 0 0.1em 1em;
+  margin-left: 0;
+}
+
+.doc-render.markdown-body hr {
+  background: #dfe5ef;
+  height: 1px;
+  margin: 1.4em 0;
+}
+
+.doc-render.markdown-body table {
+  max-width: 100%;
+  min-width: 0;
+  font-size: 14px;
+}
+
+.doc-render.markdown-body th,
+.doc-render.markdown-body td {
+  padding: 8px 10px;
+}
+
+.doc-render.markdown-body code {
+  font-family: var(--mono) !important;
+  font-size: 0.92em;
+  background: #eef3f9;
+  border-radius: 5px;
+  padding: 0.12em 0.35em;
+}
+
+.doc-render.markdown-body pre {
+  max-width: 100%;
+  background: #fbfcfe;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px;
+  overflow-x: auto;
+}
+
+.doc-render.markdown-body pre code {
+  font-family: var(--mono) !important;
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+  font-size: 12px;
+  line-height: 1.55;
 }
 
 @media (max-width: 900px) {
   .kpis {
     grid-template-columns: repeat(2, minmax(140px, 1fr));
+  }
+
+  .detail-grid {
+    grid-template-columns: repeat(3, minmax(120px, 1fr));
+  }
+
+  .charts-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .doc-render.markdown-body {
+    font-size: 14px;
+    line-height: 1.66;
+  }
+}
+
+@media (max-width: 640px) {
+  .wrap {
+    width: min(100%, 100vw);
+    margin: 12px auto 24px;
+    padding: 0 10px;
+  }
+
+  .kpis {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .kpi {
+    padding: 9px;
+  }
+
+  .kpi-value {
+    font-size: 16px;
+  }
+
+  .kpi-best .kpi-value {
+    font-size: 18px;
+  }
+
+  .pager {
+    justify-content: space-between;
+  }
+
+  .detail-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .doc-render.markdown-body > * {
+    max-width: none;
+  }
+
+  .doc-render.markdown-body h1 {
+    font-size: 24px;
+  }
+
+  .doc-render.markdown-body h2 {
+    font-size: 20px;
   }
 }
