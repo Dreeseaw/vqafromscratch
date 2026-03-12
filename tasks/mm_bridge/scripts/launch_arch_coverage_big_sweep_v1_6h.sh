@@ -16,7 +16,6 @@ ln -sfn "${SWEEP_ID}" "logs/mmarch_coverage_big_v1_6h_latest"
 BATCH_SIZE="${BATCH_SIZE:-192}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
 DEFAULT_MAX_STEPS="$(mm_budget_steps_for_bs_ga "${BATCH_SIZE}" "${GRAD_ACCUM_STEPS}")"
-HORIZON_HOURS="${HORIZON_HOURS:-6}"
 RUN_PREFIX="${RUN_PREFIX:-mmarch_cov_v1_20260310}"
 MAX_STEPS_MAIN="${MAX_STEPS_MAIN:-${DEFAULT_MAX_STEPS}}"
 MAX_STEPS_EXP="${MAX_STEPS_EXP:-${DEFAULT_MAX_STEPS}}"
@@ -29,11 +28,8 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
 DRY_RUN="${DRY_RUN:-0}"
 
-START_TS="$(date +%s)"
-HORIZON_SEC="$(( HORIZON_HOURS * 3600 ))"
-
 cat > "${SWEEP_DIR}/README.md" <<EOF
-# Architecture Coverage Big Sweep V1 (6h Horizon)
+# Architecture Coverage Big Sweep V1
 
 Sweep ID: ${SWEEP_ID}
 Start time: $(date)
@@ -46,7 +42,6 @@ Key goals:
 
 Runtime knobs:
 - RUN_PREFIX=${RUN_PREFIX}
-- HORIZON_HOURS=${HORIZON_HOURS}
 - MAX_STEPS_MAIN=${MAX_STEPS_MAIN}
 - MAX_STEPS_EXP=${MAX_STEPS_EXP}
 - MAX_STEPS_HEAVY=${MAX_STEPS_HEAVY}
@@ -103,13 +98,6 @@ COMMON_ARGS=(
   --lr_min_ratio 0.15
 )
 
-within_horizon() {
-  local now elapsed
-  now="$(date +%s)"
-  elapsed="$((now - START_TS))"
-  [[ "${elapsed}" -lt "${HORIZON_SEC}" ]]
-}
-
 latest_ckpt_step() {
   local run_id="$1"
   local run_dir="logs/${run_id}"
@@ -134,11 +122,6 @@ run_one() {
   shift 2
   local run_id="${RUN_PREFIX}_${suffix}"
   local done_ckpt="logs/${run_id}/step_${target_step}.tar"
-
-  if ! within_horizon; then
-    echo "[$(date)] STOP horizon reached before ${run_id}" | tee -a "${SWEEP_DIR}/timeline.log"
-    return 1
-  fi
 
   if [[ -f "${done_ckpt}" ]]; then
     echo "[$(date)] SKIP  ${run_id} (complete: ${done_ckpt})" | tee -a "${SWEEP_DIR}/timeline.log"

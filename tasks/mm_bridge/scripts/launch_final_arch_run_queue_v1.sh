@@ -14,15 +14,11 @@ mkdir -pv "${SWEEP_DIR}"
 ln -sfn "${SWEEP_ID}" "logs/mmarch_final_queue_v1_latest"
 
 RUN_PREFIX="${RUN_PREFIX:-mmarch_final_v1_20260310}"
-HORIZON_HOURS="${HORIZON_HOURS:-10}"
 LOG_EVERY="${LOG_EVERY:-20}"
 CKPT_EVERY="${CKPT_EVERY:-1000}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
 DRY_RUN="${DRY_RUN:-0}"
-
-START_TS="$(date +%s)"
-HORIZON_SEC="$(( HORIZON_HOURS * 3600 ))"
 
 cat > "${SWEEP_DIR}/README.md" <<EOF
 # Final Architecture Run Queue V1
@@ -38,7 +34,6 @@ Policy:
 
 Runtime knobs:
 - RUN_PREFIX=${RUN_PREFIX}
-- HORIZON_HOURS=${HORIZON_HOURS}
 - LOG_EVERY=${LOG_EVERY}
 - CKPT_EVERY=${CKPT_EVERY}
 - NUM_WORKERS=${NUM_WORKERS}
@@ -81,13 +76,6 @@ COMMON_ARGS=(
   --lr_min_ratio 0.15
 )
 
-within_horizon() {
-  local now elapsed
-  now="$(date +%s)"
-  elapsed="$((now - START_TS))"
-  [[ "${elapsed}" -lt "${HORIZON_SEC}" ]]
-}
-
 latest_ckpt_step() {
   local run_id="$1"
   local run_dir="logs/${run_id}"
@@ -115,11 +103,6 @@ run_one() {
   target_step="$(mm_budget_steps_for_bs_ga "${batch_size}" "${grad_accum_steps}")"
   local run_id="${RUN_PREFIX}_${suffix}"
   local done_ckpt="logs/${run_id}/step_${target_step}.tar"
-
-  if ! within_horizon; then
-    echo "[$(date)] STOP horizon reached before ${run_id}" | tee -a "${SWEEP_DIR}/timeline.log"
-    return 1
-  fi
 
   if [[ -f "${done_ckpt}" ]]; then
     echo "[$(date)] SKIP  ${run_id} (complete: ${done_ckpt})" | tee -a "${SWEEP_DIR}/timeline.log"

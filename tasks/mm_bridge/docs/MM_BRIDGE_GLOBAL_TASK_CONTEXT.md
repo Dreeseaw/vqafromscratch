@@ -131,6 +131,20 @@ If memory is tight:
 - increase `grad_accum_steps`
 - keep effective batch fixed at `192`
 
+## Run Control Policy
+
+For standard bridge sweeps and long comparable runs:
+
+- do not use time-based stopping
+- do not use horizon-based clipping
+- do not wrap active training or final eval in timeout guards
+- rely on checkpoints and explicit reruns for pause/resume behavior instead
+
+If a run is intentionally stopped by the user:
+
+- the next launch should resume from the latest checkpoint
+- if training is complete but final eval is incomplete, the next launch should resume eval-only
+
 ## Exception Handling
 
 Allowed exceptions:

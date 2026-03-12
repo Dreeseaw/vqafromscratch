@@ -78,9 +78,9 @@ type RunDetail = {
   introLines: string[];
   trainCeSeries: SeriesPoint[];
   valAccuracySeries: SeriesPoint[];
-  valCeSeries: SeriesPoint[];
+  valStepsPerSecSeries: SeriesPoint[];
   latestEvalAccuracy: number | null;
-  latestValCe: number | null;
+  latestValStepsPerSec: number | null;
 };
 
 type ChatTurn = {
@@ -104,6 +104,15 @@ type QaMessage = {
   error?: boolean;
 };
 
+type SortDirection = "asc" | "desc";
+type SortState<K extends string> = {
+  key: K | null;
+  direction: SortDirection;
+};
+type SweepSortKey = "sweepId" | "status" | "activeRuns" | "runs" | "bestAccuracy" | "lastTrainCe" | "startedAt" | "endedAt";
+type RunSortKey = "runId" | "finalAccuracy" | "lastTrainCe" | "lastStep" | "lastStepsPerSec" | "numParams" | "hasFinalCheckpoint";
+type DocSortKey = "title" | "updatedAt" | "runRefs" | "topAccuracy";
+
 const $ = <T extends HTMLElement>(id: string): T => {
   const el = document.getElementById(id);
   if (!el) throw new Error(`Missing element #${id}`);
@@ -112,6 +121,7 @@ const $ = <T extends HTMLElement>(id: string): T => {
 
 const fmtAcc = (v: number | null) => (Number.isFinite(v ?? NaN) ? (v as number).toFixed(4) : "-");
 const fmtNum = (v: number | null) => (Number.isFinite(v ?? NaN) ? String(v) : "-");
+const fmtRate = (v: number | null) => (Number.isFinite(v ?? NaN) ? (v as number).toFixed(4) : "-");
 const fmtPct = (v: number | null) => (Number.isFinite(v ?? NaN) ? `${(v as number).toFixed(1)}%` : "-");
 const fmtParams = (total: number | null, trainable: number | null) => {
   if (!Number.isFinite(total ?? NaN)) return "-";
@@ -125,6 +135,7 @@ const RUNS_PAGE_SIZE = 10;
 const DOCS_PAGE_SIZE = 5;
 const BOOTSTRAP_REFRESH_MS = 10000;
 const RUN_DETAIL_REFRESH_MS = 10000;
+const COLLAPSE_STORAGE_KEY = "researchTrackerCollapsedSections";
 
 let state: Bootstrap | null = null;
 let selectedTaskId = getTaskFromUrl();
@@ -136,10 +147,15 @@ let docsPage = 0;
 let selectedRunId: string | null = null;
 let runDetail: RunDetail | null = null;
 let selectedDocFile: string | null = null;
+let selectedDocUpdatedAt: string | null = null;
 let bootstrapLoadInFlight = false;
 let runDetailLoadInFlight = false;
 let taskQaLoadInFlight = false;
+let sweepsSort: SortState<SweepSortKey> = { key: null, direction: "asc" };
+let runsSort: SortState<RunSortKey> = { key: "finalAccuracy", direction: "desc" };
+let docsSort: SortState<DocSortKey> = { key: null, direction: "asc" };
 const qaThreads = new Map<string, QaMessage[]>();
+let collapsedSections = new Set<string>();
 
 function getTaskFromUrl(): string {
   const url = new URL(window.location.href);
@@ -165,12 +181,60 @@ function apiUrl(path: string, extra: Record<string, string> = {}): string {
   return `${url.pathname}${url.search}`;
 }
 
-function shouldOpenDocsInNewTab(): boolean {
-  return window.matchMedia("(max-width: 700px)").matches;
-}
-
 function openDocInNewTab(file: string) {
   window.open(apiUrl("/doc", { file }), "_blank", "noopener,noreferrer");
+}
+
+function loadCollapsedSections(): Set<string> {
+  try {
+    const raw = window.localStorage.getItem(COLLAPSE_STORAGE_KEY);
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw) as string[];
+    return new Set(Array.isArray(parsed) ? parsed : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function saveCollapsedSections() {
+  try {
+    window.localStorage.setItem(COLLAPSE_STORAGE_KEY, JSON.stringify([...collapsedSections]));
+  } catch {
+    // ignore storage failures
+  }
+}
+
+function setSectionCollapsed(sectionId: string, collapsed: boolean) {
+  const button = document.querySelector<HTMLButtonElement>(`[data-section-id="${sectionId}"]`);
+  const contentId = button?.dataset.target;
+  const content = contentId ? document.getElementById(contentId) : null;
+  if (!button || !content) return;
+  content.hidden = collapsed;
+  button.textContent = collapsed ? "Expand" : "Collapse";
+  button.setAttribute("aria-expanded", String(!collapsed));
+  if (collapsed) collapsedSections.add(sectionId);
+  else collapsedSections.delete(sectionId);
+}
+
+function openSection(sectionId: string) {
+  setSectionCollapsed(sectionId, false);
+  saveCollapsedSections();
+}
+
+function setupCollapsibles() {
+  collapsedSections = loadCollapsedSections();
+  const buttons = document.querySelectorAll<HTMLButtonElement>(".collapse-button");
+  for (const button of buttons) {
+    const section = button.closest<HTMLElement>(".collapsible-section");
+    if (!section?.id) continue;
+    button.dataset.sectionId = section.id;
+    setSectionCollapsed(section.id, collapsedSections.has(section.id));
+    button.addEventListener("click", () => {
+      const nextCollapsed = !collapsedSections.has(section.id);
+      setSectionCollapsed(section.id, nextCollapsed);
+      saveCollapsedSections();
+    });
+  }
 }
 
 function resetTaskScopedUi() {
@@ -182,9 +246,141 @@ function resetTaskScopedUi() {
   selectedRunId = null;
   runDetail = null;
   selectedDocFile = null;
+  selectedDocUpdatedAt = null;
   $("runDetailPanel").hidden = true;
   $("docDetailPanel").hidden = true;
   $("docDetailOpen").hidden = true;
+}
+
+function toggleSort<K extends string>(sort: SortState<K>, key: K) {
+  if (sort.key === key) {
+    sort.direction = sort.direction === "asc" ? "desc" : "asc";
+  } else {
+    sort.key = key;
+    sort.direction = "asc";
+  }
+}
+
+function compareMaybeNumber(a: number | null, b: number | null, direction: SortDirection): number {
+  const aMissing = !Number.isFinite(a ?? NaN);
+  const bMissing = !Number.isFinite(b ?? NaN);
+  if (aMissing && bMissing) return 0;
+  if (aMissing) return 1;
+  if (bMissing) return -1;
+  return direction === "asc" ? (a as number) - (b as number) : (b as number) - (a as number);
+}
+
+function compareMaybeString(a: string | null, b: string | null, direction: SortDirection): number {
+  const av = String(a ?? "").trim();
+  const bv = String(b ?? "").trim();
+  if (!av && !bv) return 0;
+  if (!av) return 1;
+  if (!bv) return -1;
+  return direction === "asc" ? av.localeCompare(bv) : bv.localeCompare(av);
+}
+
+function compareBoolean(a: boolean, b: boolean, direction: SortDirection): number {
+  return direction === "asc" ? Number(a) - Number(b) : Number(b) - Number(a);
+}
+
+function compareMaybeDate(a: string | null, b: string | null, direction: SortDirection): number {
+  const av = a ? Date.parse(a) : NaN;
+  const bv = b ? Date.parse(b) : NaN;
+  return compareMaybeNumber(Number.isFinite(av) ? av : null, Number.isFinite(bv) ? bv : null, direction);
+}
+
+function getSortedSweeps(sweeps: SweepSummary[]): SweepSummary[] {
+  if (!sweepsSort.key) return sweeps.slice();
+  const rows = sweeps.slice();
+  rows.sort((a, b) => {
+    switch (sweepsSort.key) {
+      case "sweepId":
+      case "status":
+        return compareMaybeString(a[sweepsSort.key], b[sweepsSort.key], sweepsSort.direction);
+      case "activeRuns":
+        return compareMaybeNumber(a.activeRuns, b.activeRuns, sweepsSort.direction);
+      case "runs":
+        return compareMaybeNumber(a.runs.length, b.runs.length, sweepsSort.direction);
+      case "bestAccuracy":
+      case "lastTrainCe":
+        return compareMaybeNumber(a[sweepsSort.key], b[sweepsSort.key], sweepsSort.direction);
+      case "startedAt":
+      case "endedAt":
+        return compareMaybeDate(a[sweepsSort.key], b[sweepsSort.key], sweepsSort.direction);
+    }
+  });
+  return rows;
+}
+
+function getSortedRuns(runs: RunSummary[]): RunSummary[] {
+  const rows = runs.slice();
+  if (!runsSort.key) return rows;
+  rows.sort((a, b) => {
+    switch (runsSort.key) {
+      case "runId":
+        return compareMaybeString(a.runId, b.runId, runsSort.direction);
+      case "finalAccuracy":
+      case "lastTrainCe":
+      case "lastStep":
+      case "lastStepsPerSec":
+      case "numParams":
+        return compareMaybeNumber(a[runsSort.key], b[runsSort.key], runsSort.direction);
+      case "hasFinalCheckpoint":
+        return compareBoolean(a.hasFinalCheckpoint, b.hasFinalCheckpoint, runsSort.direction);
+    }
+  });
+  return rows;
+}
+
+function getSortedDocs(docs: DocSummary[]): DocSummary[] {
+  if (!docsSort.key) return docs.slice();
+  const rows = docs.slice();
+  rows.sort((a, b) => {
+    switch (docsSort.key) {
+      case "title":
+        return compareMaybeString(a.title, b.title, docsSort.direction);
+      case "updatedAt":
+        return compareMaybeDate(a.updatedAt, b.updatedAt, docsSort.direction);
+      case "runRefs":
+        return compareMaybeNumber(a.runRefs.length, b.runRefs.length, docsSort.direction);
+      case "topAccuracy": {
+        const aTop = a.mentionedAccuracies.length > 0 ? a.mentionedAccuracies[0] : null;
+        const bTop = b.mentionedAccuracies.length > 0 ? b.mentionedAccuracies[0] : null;
+        return compareMaybeNumber(aTop, bTop, docsSort.direction);
+      }
+    }
+  });
+  return rows;
+}
+
+function updateSortButton<K extends string>(id: string, sort: SortState<K>, key: K) {
+  const button = $(id) as HTMLButtonElement;
+  const label = button.dataset.label ?? button.textContent ?? "";
+  button.textContent = sort.key === key ? `${label} (${sort.direction})` : label;
+}
+
+function renderSortButtons() {
+  updateSortButton("sortSweepsSweep", sweepsSort, "sweepId");
+  updateSortButton("sortSweepsStatus", sweepsSort, "status");
+  updateSortButton("sortSweepsActive", sweepsSort, "activeRuns");
+  updateSortButton("sortSweepsRuns", sweepsSort, "runs");
+  updateSortButton("sortSweepsBestAcc", sweepsSort, "bestAccuracy");
+  updateSortButton("sortSweepsLastTrainCe", sweepsSort, "lastTrainCe");
+  updateSortButton("sortSweepsStarted", sweepsSort, "startedAt");
+  updateSortButton("sortSweepsEnded", sweepsSort, "endedAt");
+
+  updateSortButton("sortRunsRunId", runsSort, "runId");
+  updateSortButton("sortRunsFinalAcc", runsSort, "finalAccuracy");
+  updateSortButton("sortRunsLastTrainCe", runsSort, "lastTrainCe");
+  updateSortButton("sortRunsLastStep", runsSort, "lastStep");
+  updateSortButton("sortRunsStepsPerSec", runsSort, "lastStepsPerSec");
+  updateSortButton("sortRunsParams", runsSort, "numParams");
+  updateSortButton("sortRunsFinalCkpt", runsSort, "hasFinalCheckpoint");
+
+  updateSortButton("sortDocsDoc", docsSort, "title");
+  updateSortButton("sortDocsUpdated", docsSort, "updatedAt");
+  updateSortButton("sortDocsRunRefs", docsSort, "runRefs");
+  updateSortButton("sortDocsTopAcc", docsSort, "topAccuracy");
 }
 
 function syncSelectionToState(data: Bootstrap) {
@@ -196,9 +392,14 @@ function syncSelectionToState(data: Bootstrap) {
   }
   if (selectedDocFile && !data.docs.some((doc) => doc.file === selectedDocFile)) {
     selectedDocFile = null;
+    selectedDocUpdatedAt = null;
     $("docDetailPanel").hidden = true;
     $("docDetailOpen").hidden = true;
   }
+}
+
+function getDocSummary(data: Bootstrap, file: string): DocSummary | null {
+  return data.docs.find((doc) => doc.file === file) ?? null;
 }
 
 function getQaThread(taskId: string): QaMessage[] {
@@ -260,12 +461,125 @@ function renderKpis(data: Bootstrap) {
   }
 }
 
+function selectSweep(sweepId: string) {
+  openSection("sweepsSection");
+  openSection("runsSection");
+  selectedSweep = sweepId;
+  runsPage = 0;
+  const select = $("sweepFilter") as HTMLSelectElement;
+  select.value = sweepId;
+  if (state) {
+    renderSweeps(state);
+    renderRuns(state);
+  }
+}
+
+function selectRun(runId: string, scrollIntoView: boolean) {
+  selectedRunId = runId;
+  openSection("runsSection");
+  openSection("runDetailPanel");
+  if (state) {
+    const ownerSweep = state.sweeps.find((sweep) => sweep.runs.some((run) => run.runId === runId));
+    if (ownerSweep) {
+      selectedSweep = ownerSweep.sweepId;
+      const select = $("sweepFilter") as HTMLSelectElement;
+      select.value = ownerSweep.sweepId;
+    }
+    renderRuns(state);
+  }
+  void loadRunDetail(runId, scrollIntoView);
+}
+
+function selectDoc(file: string, scrollIntoView: boolean) {
+  openSection("docsSection");
+  openSection("docDetailPanel");
+  selectedDocFile = file;
+  selectedDocUpdatedAt = null;
+  if (state) renderDocs(state);
+  void loadDocDetail(file, scrollIntoView);
+}
+
+function renderHighlights(data: Bootstrap) {
+  const wrap = $("highlights");
+  wrap.innerHTML = "";
+  const bestRun = data.summary.bestRun ? data.runs.find((run) => run.runId === data.summary.bestRun?.runId) ?? null : null;
+  const latestSweep = data.sweeps[0] ?? null;
+  const latestDoc = data.docs[0] ?? null;
+  const bestAcc = data.summary.bestRun?.finalAccuracy ?? null;
+  const suspiciousRun =
+    bestAcc === null
+      ? null
+      : data.runs
+          .filter(
+            (run) =>
+              Number.isFinite(run.finalAccuracy ?? NaN) &&
+              Number.isFinite(run.lastTrainCe ?? NaN) &&
+              (run.finalAccuracy as number) < bestAcc * 0.92
+          )
+          .slice()
+          .sort((a, b) => (a.lastTrainCe ?? Number.POSITIVE_INFINITY) - (b.lastTrainCe ?? Number.POSITIVE_INFINITY))[0] ?? null;
+
+  const cards = [
+    bestRun
+      ? {
+          eyebrow: "Best Run",
+          title: bestRun.runId,
+          body: `Final acc ${fmtAcc(bestRun.finalAccuracy)} with train CE ${fmtAcc(bestRun.lastTrainCe)}.`,
+          action: "Open run",
+          onClick: () => selectRun(bestRun.runId, true),
+        }
+      : null,
+    latestSweep
+      ? {
+          eyebrow: "Freshest Sweep",
+          title: latestSweep.sweepId,
+          body: `${latestSweep.status} • ${latestSweep.runs.length} runs • best acc ${fmtAcc(latestSweep.bestAccuracy)}.`,
+          action: "Filter runs",
+          onClick: () => selectSweep(latestSweep.sweepId),
+        }
+      : null,
+    suspiciousRun
+      ? {
+          eyebrow: "Oddball",
+          title: suspiciousRun.runId,
+          body: `Low train CE ${fmtAcc(suspiciousRun.lastTrainCe)} but final acc only ${fmtAcc(suspiciousRun.finalAccuracy)}.`,
+          action: "Inspect run",
+          onClick: () => selectRun(suspiciousRun.runId, true),
+        }
+      : null,
+    latestDoc
+      ? {
+          eyebrow: "Latest Doc",
+          title: latestDoc.title,
+          body: `${latestDoc.file} • ${latestDoc.runRefs.length} run refs.`,
+          action: "Open doc",
+          onClick: () => selectDoc(latestDoc.file, true),
+        }
+      : null,
+  ].filter((card): card is { eyebrow: string; title: string; body: string; action: string; onClick: () => void } => Boolean(card));
+
+  for (const card of cards) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "highlight-card";
+    button.innerHTML = `
+      <div class="highlight-eyebrow">${card.eyebrow}</div>
+      <div class="highlight-title">${card.title}</div>
+      <div class="highlight-body">${card.body}</div>
+      <div class="highlight-action mono">${card.action}</div>
+    `;
+    button.addEventListener("click", card.onClick);
+    wrap.appendChild(button);
+  }
+}
+
 function renderSweeps(data: Bootstrap) {
   const body = $("sweepsBody");
   body.innerHTML = "";
-  const pages = Math.max(1, Math.ceil(data.sweeps.length / SWEEPS_PAGE_SIZE));
+  const rows = getSortedSweeps(data.sweeps);
+  const pages = Math.max(1, Math.ceil(rows.length / SWEEPS_PAGE_SIZE));
   sweepsPage = Math.min(sweepsPage, pages - 1);
-  const pageSweeps = data.sweeps.slice(sweepsPage * SWEEPS_PAGE_SIZE, (sweepsPage + 1) * SWEEPS_PAGE_SIZE);
+  const pageSweeps = rows.slice(sweepsPage * SWEEPS_PAGE_SIZE, (sweepsPage + 1) * SWEEPS_PAGE_SIZE);
   for (const sweep of pageSweeps) {
     const tr = document.createElement("tr");
     tr.className = sweep.sweepId === selectedSweep ? "is-selected clickable-row" : "clickable-row";
@@ -280,16 +594,11 @@ function renderSweeps(data: Bootstrap) {
       <td>${sweep.endedAt ?? "-"}</td>
     `;
     tr.addEventListener("click", () => {
-      selectedSweep = sweep.sweepId;
-      runsPage = 0;
-      const select = $("sweepFilter") as HTMLSelectElement;
-      select.value = sweep.sweepId;
-      renderSweeps(data);
-      renderRuns(data);
+      selectSweep(sweep.sweepId);
     });
     body.appendChild(tr);
   }
-  renderSweepsPager(data.sweeps.length);
+  renderSweepsPager(rows.length);
 }
 
 function renderSweepsPager(totalSweeps: number) {
@@ -336,9 +645,7 @@ function renderActiveToggle(data: Bootstrap) {
 function renderRuns(data: Bootstrap) {
   const body = $("runsBody");
   body.innerHTML = "";
-  const rows = getFilteredRuns(data)
-    .slice()
-    .sort((a, b) => (b.finalAccuracy ?? -1) - (a.finalAccuracy ?? -1));
+  const rows = getSortedRuns(getFilteredRuns(data));
   const pages = Math.max(1, Math.ceil(rows.length / RUNS_PAGE_SIZE));
   runsPage = Math.min(runsPage, pages - 1);
   const pageRows = rows.slice(runsPage * RUNS_PAGE_SIZE, (runsPage + 1) * RUNS_PAGE_SIZE);
@@ -355,9 +662,7 @@ function renderRuns(data: Bootstrap) {
       <td>${run.hasFinalCheckpoint ? "yes" : "no"}</td>
     `;
     tr.addEventListener("click", () => {
-      selectedRunId = run.runId;
-      renderRuns(data);
-      void loadRunDetail(run.runId, true);
+      selectRun(run.runId, true);
     });
     body.appendChild(tr);
   }
@@ -376,9 +681,10 @@ function renderRunsPager(totalRuns: number) {
 function renderDocs(data: Bootstrap) {
   const body = $("docsBody");
   body.innerHTML = "";
-  const pages = Math.max(1, Math.ceil(data.docs.length / DOCS_PAGE_SIZE));
+  const rows = getSortedDocs(data.docs);
+  const pages = Math.max(1, Math.ceil(rows.length / DOCS_PAGE_SIZE));
   docsPage = Math.min(docsPage, pages - 1);
-  const pageDocs = data.docs.slice(docsPage * DOCS_PAGE_SIZE, (docsPage + 1) * DOCS_PAGE_SIZE);
+  const pageDocs = rows.slice(docsPage * DOCS_PAGE_SIZE, (docsPage + 1) * DOCS_PAGE_SIZE);
   for (const doc of pageDocs) {
     const topAcc = doc.mentionedAccuracies.length > 0 ? doc.mentionedAccuracies[0].toFixed(4) : "-";
     const tr = document.createElement("tr");
@@ -393,17 +699,11 @@ function renderDocs(data: Bootstrap) {
       <td>${topAcc}</td>
     `;
     tr.addEventListener("click", () => {
-      if (shouldOpenDocsInNewTab()) {
-        openDocInNewTab(doc.file);
-        return;
-      }
-      selectedDocFile = doc.file;
-      renderDocs(data);
-      void loadDocDetail(doc.file, true);
+      selectDoc(doc.file, true);
     });
     body.appendChild(tr);
   }
-  renderDocsPager(data.docs.length);
+  renderDocsPager(rows.length);
 }
 
 function renderDocsPager(totalDocs: number) {
@@ -423,9 +723,7 @@ function renderTaskQa(data: Bootstrap) {
   const thread = getQaThread(taskId);
   const starterPrompts = [
     "Why does this task look weak right now?",
-    "What differs from the best completed runs?",
     "What should I try next?",
-    "Is there an active regression I should worry about?",
   ];
 
   starterWrap.innerHTML = "";
@@ -472,7 +770,9 @@ function renderTaskQa(data: Bootstrap) {
 function renderAll(data: Bootstrap) {
   syncSelectionToState(data);
   renderHeader(data);
+  renderSortButtons();
   renderKpis(data);
+  renderHighlights(data);
   renderTaskQa(data);
   renderSweeps(data);
   renderSweepFilter(data);
@@ -493,7 +793,10 @@ async function load() {
     selectedTaskId = data.selectedTask.id;
     renderAll(data);
     if (selectedRunId) await loadRunDetail(selectedRunId, false);
-    if (selectedDocFile) await loadDocDetail(selectedDocFile, false);
+    if (selectedDocFile) {
+      const doc = getDocSummary(data, selectedDocFile);
+      if (doc && doc.updatedAt !== selectedDocUpdatedAt) await loadDocDetail(selectedDocFile, false);
+    }
   } finally {
     bootstrapLoadInFlight = false;
     if (requestedTaskId && requestedTaskId !== getActiveTaskId()) {
@@ -535,6 +838,7 @@ function renderRunDetail(detail: RunDetail) {
   const title = $("runDetailTitle");
   const body = $("runDetailBody");
   panel.hidden = false;
+  openSection("runDetailPanel");
   title.textContent = detail.run.runId;
   body.innerHTML = "";
 
@@ -550,7 +854,7 @@ function renderRunDetail(detail: RunDetail) {
     ["Steps/s", fmtNum(detail.run.lastStepsPerSec)],
     ["Params", fmtParams(detail.run.numParams, detail.run.trainableParams)],
     ["Val Acc", fmtAcc(detail.latestEvalAccuracy)],
-    ["Val CE", fmtAcc(detail.latestValCe)],
+    ["Val Steps/s", fmtRate(detail.latestValStepsPerSec)],
   ];
   for (const [label, value] of cards) {
     const item = document.createElement("div");
@@ -564,7 +868,6 @@ function renderRunDetail(detail: RunDetail) {
   charts.className = "charts-grid";
   charts.appendChild(makeChartCard("Train CE", detail.trainCeSeries, "ce"));
   if (detail.valAccuracySeries.length > 0) charts.appendChild(makeChartCard("Val Acc", detail.valAccuracySeries, "acc"));
-  if (detail.valCeSeries.length > 0) charts.appendChild(makeChartCard("Val CE", detail.valCeSeries, "ce"));
   body.appendChild(charts);
 
   if (detail.introLines.length > 0) {
@@ -579,7 +882,7 @@ function renderRunDetail(detail: RunDetail) {
   }
 }
 
-function makeChartCard(title: string, points: SeriesPoint[], kind: "acc" | "ce") {
+function makeChartCard(title: string, points: SeriesPoint[], kind: "acc" | "ce" | "rate") {
   const card = document.createElement("div");
   card.className = "chart-card";
   if (points.length === 0) {
@@ -589,15 +892,15 @@ function makeChartCard(title: string, points: SeriesPoint[], kind: "acc" | "ce")
   const path = buildChartPath(points, 320, 140);
   const values = points.map((point) => point.value);
   const latest = values[values.length - 1];
-  const best = kind === "acc" ? Math.max(...values) : Math.min(...values);
+  const best = kind === "acc" || kind === "rate" ? Math.max(...values) : Math.min(...values);
   card.innerHTML = `
     <div class="chart-head">
       <div class="detail-section-title">${title}</div>
-      <div class="mono muted">latest ${latest.toFixed(4)} | ${kind === "acc" ? "best" : "min"} ${best.toFixed(4)}</div>
+      <div class="mono muted">latest ${latest.toFixed(4)} | ${kind === "ce" ? "min" : "best"} ${best.toFixed(4)}</div>
     </div>
     <svg class="chart-svg" viewBox="0 0 320 140" preserveAspectRatio="none" aria-label="${title}">
       <path class="chart-baseline" d="M 0 132 H 320"></path>
-      <path class="chart-line ${kind === "acc" ? "chart-line-acc" : "chart-line-ce"}" d="${path}"></path>
+      <path class="chart-line ${kind === "acc" ? "chart-line-acc" : kind === "rate" ? "chart-line-rate" : "chart-line-ce"}" d="${path}"></path>
     </svg>
   `;
   return card;
@@ -634,6 +937,7 @@ async function loadDocDetail(file: string, scrollIntoView: boolean) {
     if (!res.ok) throw new Error(`doc failed: ${res.status}`);
     const markdown = await res.text();
     if (selectedDocFile !== file || taskId !== getActiveTaskId()) return;
+    selectedDocUpdatedAt = getDocSummary(state as Bootstrap, file)?.updatedAt ?? selectedDocUpdatedAt;
     renderDocDetail(file, markdown);
     if (scrollIntoView) panel.scrollIntoView({ behavior: "smooth", block: "start" });
   } catch (error) {
@@ -648,6 +952,7 @@ function renderDocDetail(file: string, markdown: string) {
   const body = $("docDetailBody");
   const openBtn = $("docDetailOpen") as HTMLButtonElement;
   panel.hidden = false;
+  openSection("docDetailPanel");
   title.textContent = file;
   openBtn.hidden = false;
   openBtn.onclick = () => openDocInNewTab(file);
@@ -714,6 +1019,7 @@ async function submitTaskQa(question: string) {
 }
 
 function setup() {
+  setupCollapsibles();
   const taskSelect = $("taskSelect") as HTMLSelectElement;
   taskSelect.addEventListener("change", () => {
     if (!taskSelect.value || taskSelect.value === getActiveTaskId()) return;
@@ -733,6 +1039,26 @@ function setup() {
 
   const sweepsPrevBtn = $("sweepsPrev") as HTMLButtonElement;
   const sweepsNextBtn = $("sweepsNext") as HTMLButtonElement;
+  const sweepSortButtons: Array<[string, SweepSortKey]> = [
+    ["sortSweepsSweep", "sweepId"],
+    ["sortSweepsStatus", "status"],
+    ["sortSweepsActive", "activeRuns"],
+    ["sortSweepsRuns", "runs"],
+    ["sortSweepsBestAcc", "bestAccuracy"],
+    ["sortSweepsLastTrainCe", "lastTrainCe"],
+    ["sortSweepsStarted", "startedAt"],
+    ["sortSweepsEnded", "endedAt"],
+  ];
+  for (const [id, key] of sweepSortButtons) {
+    ($(id) as HTMLButtonElement).addEventListener("click", () => {
+      toggleSort(sweepsSort, key);
+      sweepsPage = 0;
+      if (state) {
+        renderSortButtons();
+        renderSweeps(state);
+      }
+    });
+  }
   sweepsPrevBtn.addEventListener("click", () => {
     if (!state || sweepsPage === 0) return;
     sweepsPage -= 1;
@@ -771,6 +1097,7 @@ function setup() {
   const closeDocBtn = $("docDetailClose") as HTMLButtonElement;
   closeDocBtn.addEventListener("click", () => {
     selectedDocFile = null;
+    selectedDocUpdatedAt = null;
     $("docDetailPanel").hidden = true;
     $("docDetailOpen").hidden = true;
     if (state) renderDocs(state);
@@ -778,6 +1105,25 @@ function setup() {
 
   const runsPrevBtn = $("runsPrev") as HTMLButtonElement;
   const runsNextBtn = $("runsNext") as HTMLButtonElement;
+  const runSortButtons: Array<[string, RunSortKey]> = [
+    ["sortRunsRunId", "runId"],
+    ["sortRunsFinalAcc", "finalAccuracy"],
+    ["sortRunsLastTrainCe", "lastTrainCe"],
+    ["sortRunsLastStep", "lastStep"],
+    ["sortRunsStepsPerSec", "lastStepsPerSec"],
+    ["sortRunsParams", "numParams"],
+    ["sortRunsFinalCkpt", "hasFinalCheckpoint"],
+  ];
+  for (const [id, key] of runSortButtons) {
+    ($(id) as HTMLButtonElement).addEventListener("click", () => {
+      toggleSort(runsSort, key);
+      runsPage = 0;
+      if (state) {
+        renderSortButtons();
+        renderRuns(state);
+      }
+    });
+  }
   runsPrevBtn.addEventListener("click", () => {
     if (!state || runsPage === 0) return;
     runsPage -= 1;
@@ -793,6 +1139,22 @@ function setup() {
 
   const docsPrevBtn = $("docsPrev") as HTMLButtonElement;
   const docsNextBtn = $("docsNext") as HTMLButtonElement;
+  const docSortButtons: Array<[string, DocSortKey]> = [
+    ["sortDocsDoc", "title"],
+    ["sortDocsUpdated", "updatedAt"],
+    ["sortDocsRunRefs", "runRefs"],
+    ["sortDocsTopAcc", "topAccuracy"],
+  ];
+  for (const [id, key] of docSortButtons) {
+    ($(id) as HTMLButtonElement).addEventListener("click", () => {
+      toggleSort(docsSort, key);
+      docsPage = 0;
+      if (state) {
+        renderSortButtons();
+        renderDocs(state);
+      }
+    });
+  }
   docsPrevBtn.addEventListener("click", () => {
     if (!state || docsPage === 0) return;
     docsPage -= 1;

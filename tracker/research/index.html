@@ -23,130 +23,174 @@
       </div>
     </header>
 
-    <section class="kpis" id="kpis"></section>
+    <section id="overviewSection" class="panel collapsible-section">
+      <div class="panel-head">
+        <h2>Overview</h2>
+        <button id="toggleOverviewSection" class="collapse-button" type="button" data-target="overviewContent" data-label="Overview">Collapse</button>
+      </div>
+      <div id="overviewContent" class="section-content">
+        <section class="kpis" id="kpis"></section>
+      </div>
+    </section>
 
-    <section class="panel">
+    <section id="highlightsSection" class="panel collapsible-section">
+      <div class="panel-head">
+        <h2>Highlights</h2>
+        <button id="toggleHighlightsSection" class="collapse-button" type="button" data-target="highlightsContent" data-label="Highlights">Collapse</button>
+      </div>
+      <div id="highlightsContent" class="section-content">
+        <section class="highlights" id="highlights"></section>
+      </div>
+    </section>
+
+    <section id="taskQaSection" class="panel collapsible-section">
       <div class="panel-head">
         <div>
           <h2>Task QA</h2>
           <div id="taskQaHint" class="muted">Ask about the task as a whole.</div>
         </div>
+        <button id="toggleTaskQaSection" class="collapse-button" type="button" data-target="taskQaContent" data-label="Task QA">Collapse</button>
       </div>
-      <div id="taskQaStarters" class="qa-starters"></div>
-      <div id="taskQaThread" class="qa-thread"></div>
-      <form id="taskQaForm" class="qa-form">
-        <textarea id="taskQaInput" rows="3" placeholder="Ask why the task is weak, what changed, or what to try next."></textarea>
-        <div class="qa-form-actions">
-          <span id="taskQaStatus" class="muted mono"></span>
-          <button id="taskQaSubmit" type="submit">Ask</button>
-        </div>
-      </form>
+      <div id="taskQaContent" class="section-content">
+        <div id="taskQaStarters" class="qa-starters"></div>
+        <div id="taskQaThread" class="qa-thread"></div>
+        <form id="taskQaForm" class="qa-form">
+          <textarea id="taskQaInput" rows="3" placeholder="Ask why the task is weak, what changed, or what to try next."></textarea>
+          <div class="qa-form-actions">
+            <span id="taskQaStatus" class="muted mono"></span>
+            <button id="taskQaSubmit" type="submit">Ask</button>
+          </div>
+        </form>
+      </div>
     </section>
 
-    <section class="panel">
+    <section id="sweepsSection" class="panel collapsible-section">
       <div class="panel-head">
         <h2>Sweeps</h2>
-        <label class="muted mono">Filter
-          <select id="sweepFilter"></select>
-        </label>
+        <div class="section-actions">
+          <label class="muted mono">Filter
+            <select id="sweepFilter"></select>
+          </label>
+          <button id="toggleSweepsSection" class="collapse-button" type="button" data-target="sweepsContent" data-label="Sweeps">Collapse</button>
+        </div>
       </div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Sweep</th>
-              <th>Status</th>
-              <th>Active</th>
-              <th>Runs</th>
-              <th>Best Acc</th>
-              <th>Last Train CE</th>
-              <th>Started</th>
-              <th>Ended</th>
-            </tr>
-          </thead>
-          <tbody id="sweepsBody"></tbody>
-        </table>
-      </div>
-      <div class="pager">
-        <button id="sweepsPrev" type="button">Prev</button>
-        <span id="sweepsPageLabel" class="muted mono">Page 1 / 1</span>
-        <button id="sweepsNext" type="button">Next</button>
+      <div id="sweepsContent" class="section-content">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th><button id="sortSweepsSweep" class="sort-button" type="button" data-label="Sweep">Sweep</button></th>
+                <th><button id="sortSweepsStatus" class="sort-button" type="button" data-label="Status">Status</button></th>
+                <th><button id="sortSweepsActive" class="sort-button" type="button" data-label="Active">Active</button></th>
+                <th><button id="sortSweepsRuns" class="sort-button" type="button" data-label="Runs">Runs</button></th>
+                <th><button id="sortSweepsBestAcc" class="sort-button" type="button" data-label="Best Acc">Best Acc</button></th>
+                <th><button id="sortSweepsLastTrainCe" class="sort-button" type="button" data-label="Last Train CE">Last Train CE</button></th>
+                <th><button id="sortSweepsStarted" class="sort-button" type="button" data-label="Started">Started</button></th>
+                <th><button id="sortSweepsEnded" class="sort-button" type="button" data-label="Ended">Ended</button></th>
+              </tr>
+            </thead>
+            <tbody id="sweepsBody"></tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <button id="sweepsPrev" type="button">Prev</button>
+          <span id="sweepsPageLabel" class="muted mono">Page 1 / 1</span>
+          <button id="sweepsNext" type="button">Next</button>
+        </div>
       </div>
     </section>
 
-    <section class="panel">
+    <section id="runsSection" class="panel collapsible-section">
       <div class="panel-head">
         <h2>Runs</h2>
-        <label class="muted mono">Active
-          <input id="activeOnly" type="checkbox" />
-          <span id="activeCount">0 active</span>
-        </label>
+        <div class="section-actions">
+          <label class="muted mono">Active
+            <input id="activeOnly" type="checkbox" />
+            <span id="activeCount">0 active</span>
+          </label>
+          <button id="toggleRunsSection" class="collapse-button" type="button" data-target="runsContent" data-label="Runs">Collapse</button>
+        </div>
       </div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Run / Model</th>
-              <th>Final Acc</th>
-              <th>Last Train CE</th>
-              <th>Last Step</th>
-              <th>Steps/s</th>
-              <th>Params</th>
-              <th>Final Ckpt</th>
-            </tr>
-          </thead>
-          <tbody id="runsBody"></tbody>
-        </table>
-      </div>
-      <div class="pager">
-        <button id="runsPrev" type="button">Prev</button>
-        <span id="runsPageLabel" class="muted mono">Page 1 / 1</span>
-        <button id="runsNext" type="button">Next</button>
+      <div id="runsContent" class="section-content">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th><button id="sortRunsRunId" class="sort-button" type="button" data-label="Run / Model">Run / Model</button></th>
+                <th><button id="sortRunsFinalAcc" class="sort-button" type="button" data-label="Final Acc">Final Acc</button></th>
+                <th><button id="sortRunsLastTrainCe" class="sort-button" type="button" data-label="Last Train CE">Last Train CE</button></th>
+                <th><button id="sortRunsLastStep" class="sort-button" type="button" data-label="Last Step">Last Step</button></th>
+                <th><button id="sortRunsStepsPerSec" class="sort-button" type="button" data-label="Steps/s">Steps/s</button></th>
+                <th><button id="sortRunsParams" class="sort-button" type="button" data-label="Params">Params</button></th>
+                <th><button id="sortRunsFinalCkpt" class="sort-button" type="button" data-label="Final Ckpt">Final Ckpt</button></th>
+              </tr>
+            </thead>
+            <tbody id="runsBody"></tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <button id="runsPrev" type="button">Prev</button>
+          <span id="runsPageLabel" class="muted mono">Page 1 / 1</span>
+          <button id="runsNext" type="button">Next</button>
+        </div>
       </div>
     </section>
 
-    <section id="runDetailPanel" class="panel detail-panel" hidden>
+    <section id="runDetailPanel" class="panel detail-panel collapsible-section" hidden>
       <div class="panel-head">
         <h2 id="runDetailTitle">Run Detail</h2>
-        <button id="runDetailClose" type="button">Close</button>
+        <div class="section-actions">
+          <button id="toggleRunDetailSection" class="collapse-button" type="button" data-target="runDetailContent" data-label="Run Detail">Collapse</button>
+          <button id="runDetailClose" type="button">Close</button>
+        </div>
       </div>
-      <div id="runDetailBody"></div>
+      <div id="runDetailContent" class="section-content">
+        <div id="runDetailBody"></div>
+      </div>
     </section>
 
-    <section class="panel">
+    <section id="docsSection" class="panel collapsible-section">
       <div class="panel-head">
         <h2>Docs</h2>
-        <span id="docsHint" class="muted mono">Auto-discovered from task docs directory</span>
+        <div class="section-actions">
+          <span id="docsHint" class="muted mono">Auto-discovered from task docs directory</span>
+          <button id="toggleDocsSection" class="collapse-button" type="button" data-target="docsContent" data-label="Docs">Collapse</button>
+        </div>
       </div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Doc</th>
-              <th>Updated</th>
-              <th>Run Refs</th>
-              <th>Top Mentioned Acc</th>
-            </tr>
-          </thead>
-          <tbody id="docsBody"></tbody>
-        </table>
-      </div>
-      <div class="pager">
-        <button id="docsPrev" type="button">Prev</button>
-        <span id="docsPageLabel" class="muted mono">Page 1 / 1</span>
-        <button id="docsNext" type="button">Next</button>
+      <div id="docsContent" class="section-content">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th><button id="sortDocsDoc" class="sort-button" type="button" data-label="Doc">Doc</button></th>
+                <th><button id="sortDocsUpdated" class="sort-button" type="button" data-label="Updated">Updated</button></th>
+                <th><button id="sortDocsRunRefs" class="sort-button" type="button" data-label="Run Refs">Run Refs</button></th>
+                <th><button id="sortDocsTopAcc" class="sort-button" type="button" data-label="Top Mentioned Acc">Top Mentioned Acc</button></th>
+              </tr>
+            </thead>
+            <tbody id="docsBody"></tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <button id="docsPrev" type="button">Prev</button>
+          <span id="docsPageLabel" class="muted mono">Page 1 / 1</span>
+          <button id="docsNext" type="button">Next</button>
+        </div>
       </div>
     </section>
 
-    <section id="docDetailPanel" class="panel detail-panel" hidden>
+    <section id="docDetailPanel" class="panel detail-panel collapsible-section" hidden>
       <div class="panel-head">
         <h2 id="docDetailTitle">Doc Detail</h2>
-        <div class="detail-actions">
+        <div class="detail-actions section-actions">
+          <button id="toggleDocDetailSection" class="collapse-button" type="button" data-target="docDetailContent" data-label="Doc Detail">Collapse</button>
           <button id="docDetailOpen" type="button" hidden>Open ↗</button>
           <button id="docDetailClose" type="button">Close</button>
         </div>
       </div>
-      <div id="docDetailBody"></div>
+      <div id="docDetailContent" class="section-content">
+        <div id="docDetailBody"></div>
+      </div>
     </section>
   </main>
 

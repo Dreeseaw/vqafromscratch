@@ -16,7 +16,6 @@ ln -sfn "${SWEEP_ID}" "logs/mmnight_bridge_v2_8h_latest"
 BATCH_SIZE="${BATCH_SIZE:-192}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
 DEFAULT_MAX_STEPS="$(mm_budget_steps_for_bs_ga "${BATCH_SIZE}" "${GRAD_ACCUM_STEPS}")"
-HORIZON_HOURS="${HORIZON_HOURS:-8}"
 MAX_STEPS_MAIN="${MAX_STEPS_MAIN:-${DEFAULT_MAX_STEPS}}"
 MAX_STEPS_EXP="${MAX_STEPS_EXP:-${DEFAULT_MAX_STEPS}}"
 EVAL_EVERY="${EVAL_EVERY:-1000}"
@@ -27,15 +26,11 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
 DRY_RUN="${DRY_RUN:-0}"
 
-START_TS="$(date +%s)"
-HORIZON_SEC="$(( HORIZON_HOURS * 3600 ))"
-
 cat > "${SWEEP_DIR}/README.md" <<EOF
-# Night Bridge Sweep V2 (8h Horizon)
+# Night Bridge Sweep V2
 
 Sweep ID: ${SWEEP_ID}
 Start time: $(date)
-Horizon hours: ${HORIZON_HOURS}
 
 Priority updates from latest findings:
 - Perceiver-style bridge (depth 3) is current top performer.
@@ -91,21 +86,10 @@ COMMON_ARGS=(
   --lr_min_ratio 0.15
 )
 
-within_horizon() {
-  local now elapsed
-  now="$(date +%s)"
-  elapsed="$((now - START_TS))"
-  [[ "${elapsed}" -lt "${HORIZON_SEC}" ]]
-}
-
 run_one() {
   local suffix="$1"
   shift
   local run_id="${SWEEP_ID}_${suffix}"
-  if ! within_horizon; then
-    echo "[$(date)] STOP horizon reached before ${run_id}" | tee -a "${SWEEP_DIR}/timeline.log"
-    return 1
-  fi
   echo "[$(date)] START ${run_id}" | tee -a "${SWEEP_DIR}/timeline.log"
   echo "[$(date)] CMD ./runmm.sh ${run_id} ${COMMON_ARGS[*]} $*" >> "${SWEEP_DIR}/timeline.log"
   if [[ "${DRY_RUN}" == "1" ]]; then

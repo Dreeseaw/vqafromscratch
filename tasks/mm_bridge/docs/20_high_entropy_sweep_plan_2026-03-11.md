@@ -218,3 +218,23 @@ If I had to pick the single best next sweep theme in one line:
 - run a slope-validation sweep around `safe qcond`, with `structured roles` and `early-layer` as the two main challengers, then spend the remaining budget on one or two stack tests
 
 That is the highest-value next move for the project.
+
+## Final Draft Order
+
+Final draft order for the next sweep:
+
+1. `safe qcond frontier harden`
+2. `structured roles frontier harden`
+3. `early-layer encoder frontier harden`
+4. `safe qcond + early-layer encoder`
+5. `safe qcond + geometry-aware calibration`
+6. `structured roles + geometry-aware calibration`
+
+Why this final order:
+
+- `safe qcond` goes first because it is the strongest current bet to become the new mainline.
+- `structured roles` goes second because it is the best novelty-positive branch and deserves an immediate ceiling check.
+- `early-layer encoder` goes third because it is the cleanest representational challenger and could redirect feature-source strategy.
+- `safe qcond + early-layer` goes fourth because it is the highest-value stack test in the current search space.
+- `safe qcond + geometry-aware calibration` goes fifth because it is still very worthwhile, but slightly less foundational than the qcond+evidence stack.
+- `structured roles + geometry-aware calibration` goes sixth because it is useful, but the least essential of the selected runs if the horizon gets cut short.
