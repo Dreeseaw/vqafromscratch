@@ -131,6 +131,32 @@ If memory is tight:
 - increase `grad_accum_steps`
 - keep effective batch fixed at `192`
 
+## Batch-Probing Protocol
+
+When selecting the raw in-memory `batch_size` for a new bridge architecture:
+
+- prefer the largest stable raw `batch_size` that fits on the current GPU
+- preserve effective batch `192` by adjusting `grad_accum_steps`
+- do not downshift raw `batch_size` just because a smaller setting improves eval-batch `steps/s` if the larger setting still fits and trains cleanly
+
+Minimum probe protocol:
+
+- let the candidate run reach at least `60` training steps
+- let it run for at least about `1` minute of real time
+- inspect GPU behavior directly with `nvidia-smi`
+
+Acceptance rule on a `16 GB` card:
+
+- if memory use remains below roughly `15 GB`
+- and compute is not clearly thrashing or repeatedly stalling
+- and the run is otherwise stable
+- then try the next larger raw `batch_size`
+
+Interpretation rule:
+
+- if the user asks for the largest batch size that fits, maximize raw `batch_size` first
+- only fall back to a smaller raw `batch_size` when the larger one fails memory/stability or the user explicitly asks for a different optimization target
+
 ## Run Control Policy
 
 For standard bridge sweeps and long comparable runs:

@@ -80,9 +80,13 @@ Recommended layouts:
 Anchor note:
 
 - `anchor_safeqcond_earlylayer_geomcal` was not re-probed separately
-- the final launcher assigns it the same `64 x 3` layout as the bridge-only
-  qquery family because it shares the same prompt-conditioned bridge-only eval
-  path and is the conservative compliant choice
+- the high-entropy frontier run already demonstrated that the same stack clears
+  the throughput bar at `192 x 1`
+- recorded high-entropy frontier evidence:
+  - train `steps_per_s=4.88`
+  - periodic mini-eval `100 / 54.1s = 1.85 eval steps/s`
+  - full eval `1100 / 618.5s = 1.78 eval steps/s`
+- the final launcher therefore keeps the anchor at `192 x 1`
 
 Default omission:
 

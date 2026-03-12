@@ -228,6 +228,7 @@ def _apply_runtime_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "max_answer_length": 16,
         "max_text_tokens": 256,
         "batch_size": 16,
+        "eval_batch_size": 0,
         "num_workers": 2,
         "prefetch_factor": 2,
         "pin_memory": True,
@@ -1219,7 +1220,11 @@ def build_loader(
         max_text_tokens=args.max_text_tokens,
     )
     kwargs: Dict[str, Any] = {
-        "batch_size": int(args.batch_size),
+        "batch_size": (
+            int(args.batch_size)
+            if bool(train_mode) or int(getattr(args, "eval_batch_size", 0)) <= 0
+            else int(args.eval_batch_size)
+        ),
         "shuffle": bool(train_mode),
         "drop_last": bool(train_mode),
         "num_workers": int(args.num_workers),
@@ -1884,7 +1889,9 @@ def log_startup_config(
         f"[mm] seq_lens q={args.max_question_length} a={args.max_answer_length} text={args.max_text_tokens}"
     )
     logger.log(
-        f"[mm] dataloader batch_size={args.batch_size} num_workers={args.num_workers} "
+        f"[mm] dataloader batch_size={args.batch_size} "
+        f"eval_batch_size={(int(args.eval_batch_size) if int(getattr(args, 'eval_batch_size', 0)) > 0 else int(args.batch_size))} "
+        f"num_workers={args.num_workers} "
         f"prefetch_factor={args.prefetch_factor} pin_memory={int(bool(args.pin_memory))} "
         f"grad_accum_steps={args.grad_accum_steps} effective_batch_size={int(args.batch_size) * max(1, int(args.grad_accum_steps))}"
     )
@@ -2188,6 +2195,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--loss_on_answer_only", action=argparse.BooleanOptionalAction, default=True)
 
     ap.add_argument("--batch_size", type=int, default=16)
+    ap.add_argument(
+        "--eval_batch_size",
+        type=int,
+        default=0,
+        help="Eval dataloader batch size. <=0 reuses --batch_size.",
+    )
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--max_steps", type=int, default=0)
     ap.add_argument(

@@ -10,10 +10,14 @@ ln -sfn "${SWEEP_ID}" "logs/mmhammer_v1_latest"
 RUN_PREFIX="${RUN_PREFIX:-mmhammer_v1_20260312}"
 TARGET_STEP="${TARGET_STEP:-9000}"
 
-BRIDGE_ONLY_BS="${BRIDGE_ONLY_BS:-64}"
-BRIDGE_ONLY_GA="${BRIDGE_ONLY_GA:-3}"
+ANCHOR_BS="${ANCHOR_BS:-192}"
+ANCHOR_GA="${ANCHOR_GA:-1}"
+BRIDGE_ONLY_BS="${BRIDGE_ONLY_BS:-192}"
+BRIDGE_ONLY_GA="${BRIDGE_ONLY_GA:-1}"
+QQUERY_EVAL_BS="${QQUERY_EVAL_BS:-64}"
 ADAPTER_BS="${ADAPTER_BS:-192}"
 ADAPTER_GA="${ADAPTER_GA:-1}"
+NONCOMPLIANT_DYN_EVAL_BS="${NONCOMPLIANT_DYN_EVAL_BS:-64}"
 
 LOG_EVERY="${LOG_EVERY:-20}"
 EVAL_EVERY="${EVAL_EVERY:-1000}"
@@ -24,7 +28,12 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
 DRY_RUN="${DRY_RUN:-0}"
 INCLUDE_NONCOMPLIANT="${INCLUDE_NONCOMPLIANT:-0}"
+SKIP_ANCHOR="${SKIP_ANCHOR:-0}"
 
+if (( ANCHOR_BS * ANCHOR_GA != 192 )); then
+  echo "[hammer] ERROR anchor effective batch must be 192, got $((ANCHOR_BS * ANCHOR_GA))"
+  exit 1
+fi
 if (( BRIDGE_ONLY_BS * BRIDGE_ONLY_GA != 192 )); then
   echo "[hammer] ERROR bridge-only effective batch must be 192, got $((BRIDGE_ONLY_BS * BRIDGE_ONLY_GA))"
   exit 1
@@ -48,11 +57,16 @@ Performance-tuning source:
 - logs/mmhammer_perfprobe_v1_latest/recommended_layouts.tsv
 
 Default queue policy:
-- run the Hammer anchor plus every architecture family that cleared
+- keep the Hammer anchor as a same-sweep control at its already-proven
+  ${ANCHOR_BS}x${ANCHOR_GA} layout from the high-entropy frontier run
+- run every new architecture family that cleared
   train steps/s > 3.0 and eval steps/s > 0.8 at effective batch 192
 - keep bridge-only qquery-family runs at ${BRIDGE_ONLY_BS}x${BRIDGE_ONLY_GA}
+- evaluate `qquery_earlylayer_geomcal` at batch ${QQUERY_EVAL_BS}
 - keep adapter-family runs at ${ADAPTER_BS}x${ADAPTER_GA}
 - omit noncompliant dynbudget-only runs unless INCLUDE_NONCOMPLIANT=1
+- if enabled, evaluate dynbudget-only noncompliant runs at batch ${NONCOMPLIANT_DYN_EVAL_BS}
+- set SKIP_ANCHOR=1 if you do not want to rerun the carry-forward control
 
 Omitted by default:
 - dynbudget_qscore_earlylayer_geomcal
@@ -201,21 +215,25 @@ run_one() {
     return 0
   fi
 
+  local status=0
   if "${cmd[@]}" >> "${SWEEP_DIR}/${run_id}.stdout.log" 2>&1; then
     echo "[$(date)] END   ${run_id}" | tee -a "${SWEEP_DIR}/timeline.log"
     return 0
+  else
+    status=$?
+    echo "[$(date)] FAIL  ${run_id} (see ${SWEEP_DIR}/${run_id}.stdout.log)" | tee -a "${SWEEP_DIR}/timeline.log"
+    return "${status}"
   fi
-
-  local status=$?
-  echo "[$(date)] FAIL  ${run_id} (see ${SWEEP_DIR}/${run_id}.stdout.log)" | tee -a "${SWEEP_DIR}/timeline.log"
-  return "${status}"
 }
 
 # 1) hammer control anchor
-run_one "anchor_safeqcond_earlylayer_geomcal" "${BRIDGE_ONLY_BS}" "${BRIDGE_ONLY_GA}"
+if [[ "${SKIP_ANCHOR}" != "1" ]]; then
+  run_one "anchor_safeqcond_earlylayer_geomcal" "${ANCHOR_BS}" "${ANCHOR_GA}"
+fi
 
 # 2) question-conditioned query bank
 run_one "qquery_earlylayer_geomcal" "${BRIDGE_ONLY_BS}" "${BRIDGE_ONLY_GA}" \
+  --eval_batch_size "${QQUERY_EVAL_BS}" \
   --bridge_query_bank_mode question_mix \
   --bridge_qquery_basis_count 4 \
   --bridge_qquery_scale 1.0
@@ -230,6 +248,7 @@ run_one "adapter_safeqcond_earlylayer_geomcal" "${ADAPTER_BS}" "${ADAPTER_GA}" \
 
 if [[ "${INCLUDE_NONCOMPLIANT}" == "1" ]]; then
   run_one "dynbudget_qscore_earlylayer_geomcal" 64 3 \
+    --eval_batch_size "${NONCOMPLIANT_DYN_EVAL_BS}" \
     --bridge_token_selector_type qadaptive \
     --bridge_token_select_k 64 \
     --bridge_token_select_k_min 24
@@ -248,6 +267,7 @@ run_one "qquery_adapter_earlylayer_geomcal" "${ADAPTER_BS}" "${ADAPTER_GA}" \
 
 if [[ "${INCLUDE_NONCOMPLIANT}" == "1" ]]; then
   run_one "qquery_dynbudget_earlylayer_geomcal" 64 3 \
+    --eval_batch_size "${NONCOMPLIANT_DYN_EVAL_BS}" \
     --bridge_query_bank_mode question_mix \
     --bridge_qquery_basis_count 4 \
     --bridge_qquery_scale 1.0 \
