@@ -757,6 +757,12 @@ class TransformerEncoderBlock(nn.Module):
         )
         h = h.transpose(1, 2).contiguous().view(B, S, E)
         attn_out = _apply_layerscale(self._out_proj(h), self._ls_attn)
+        attn_out = cap_vector_norm(
+            attn_out,
+            self._cap_attn_out_norm,
+            keep_mask=None,
+            mode=self._cap_out_mode,
+        )
         x = x_residual + self._resid_dropout(attn_out)
         if self._resid_max_norm > 0.0:
             x = clamp_residual(x, self._resid_max_norm)
@@ -764,6 +770,12 @@ class TransformerEncoderBlock(nn.Module):
         x_residual = x
         x = _rms_norm_last_dim(x, eps=self._rmsnorm_eps)
         mlp_out = _apply_layerscale(self._mlp(x), self._ls_mlp)
+        mlp_out = cap_vector_norm(
+            mlp_out,
+            self._cap_mlp_out_norm,
+            keep_mask=None,
+            mode=self._cap_out_mode,
+        )
         x = x_residual + self._mlp_dropout(mlp_out)
         if self._resid_max_norm > 0.0:
             x = clamp_residual(x, self._resid_max_norm)

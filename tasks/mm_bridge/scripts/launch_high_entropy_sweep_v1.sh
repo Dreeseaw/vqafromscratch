@@ -232,4 +232,36 @@ run_one "structuredroles_geomcal_frontier" \
   --prefix_geom_mlp_ratio 0.5 \
   --prefix_geom_token_mixer_layers 1
 
+# 7) safe qcond + early-layer encoder + geometry-aware calibration
+run_one "safeqcond_earlylayer_geomcal_frontier" \
+  --vision_feature_source encoder \
+  --bridge_token_reduce adaptive_pool \
+  --bridge_question_conditioning \
+  --bridge_question_context_mode prompt_only \
+  --bridge_token_selector_type none \
+  --bridge_token_select_k 0 \
+  --prefix_geom_mlp_ratio 0.5 \
+  --prefix_geom_token_mixer_layers 1
+
+# 8) safe qcond + multiscale perceiver
+run_one "safeqcond_multiscale_frontier" \
+  --vision_feature_source encoder_plus_posterior_mu \
+  --bridge_type multiscale_perceiver \
+  --bridge_token_reduce adaptive_pool \
+  --bridge_question_conditioning \
+  --bridge_question_context_mode prompt_only \
+  --bridge_token_selector_type none \
+  --bridge_token_select_k 0
+
+# 9) safe qcond + hybrid constant/image bridge
+run_one "safeqcond_hybrid_tok075_frontier" \
+  --bridge_type hybrid_const_image \
+  --bridge_hybrid_image_bridge_type perceiver_resampler \
+  --bridge_hybrid_alpha_mode token \
+  --bridge_hybrid_alpha_init 0.75 \
+  --bridge_question_conditioning \
+  --bridge_question_context_mode prompt_only \
+  --bridge_token_selector_type none \
+  --bridge_token_select_k 0
+
 echo "[$(date)] SWEEP COMPLETE ${SWEEP_ID}" | tee -a "${SWEEP_DIR}/timeline.log"

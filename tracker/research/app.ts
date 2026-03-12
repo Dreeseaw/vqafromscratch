@@ -76,6 +76,7 @@ type RunDetail = {
   run: RunSummary;
   updatedAt: string | null;
   introLines: string[];
+  tailLines: string[];
   trainCeSeries: SeriesPoint[];
   valAccuracySeries: SeriesPoint[];
   valStepsPerSecSeries: SeriesPoint[];
@@ -879,6 +880,17 @@ function renderRunDetail(detail: RunDetail) {
     pre.textContent = detail.introLines.join("\n");
     introWrap.appendChild(pre);
     body.appendChild(introWrap);
+  }
+
+  if (detail.tailLines.length > 0) {
+    const tailWrap = document.createElement("div");
+    tailWrap.className = "detail-tail";
+    tailWrap.innerHTML = `<div class="detail-section-title">Log Tail</div>`;
+    const pre = document.createElement("pre");
+    pre.className = "detail-pre";
+    pre.textContent = detail.tailLines.join("\n");
+    tailWrap.appendChild(pre);
+    body.appendChild(tailWrap);
   }
 }
 

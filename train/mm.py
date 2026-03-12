@@ -857,74 +857,72 @@ class MultimodalPrefixLM(nn.Module):
         )
         if can_use_kv_cache:
             assert cached_visual_prefix is not None
-            prompt_input_ids, prompt_text_pad_mask, _prompt_mask = _pack_text_batch(prompt_ids)
-            prompt_text_emb = self.lm._embed_dropout(self.lm._embed(prompt_input_ids))
-            logits, prefix_k, kv_cache = self._prefill_decode_with_visual_prefix(
-                text_emb=prompt_text_emb,
-                text_pad_mask=prompt_text_pad_mask,
+            generated_ids: List[List[int]] = [[] for _ in seqs]
+            # Preserve exact historical first-token behavior by using the original
+            # mixed-length full-batch decode once before switching to cached continuation.
+            input_ids, text_pad_mask, prompt_mask = _pack_text_batch(
+                seqs,
+                legacy_prompt_mask=False,
+            )
+            text_emb = self.lm._embed_dropout(self.lm._embed(input_ids))
+            logits, prefix_k = self._decode_with_visual_prefix(
+                input_ids=input_ids,
+                text_emb=text_emb,
+                text_pad_mask=text_pad_mask,
                 visual_prefix=cached_visual_prefix,
             )
             text_logits = logits[:, prefix_k:, :]
-            generated_ids: List[List[int]] = [[] for _ in seqs]
             done = [False for _ in seqs]
             for i in range(len(seqs)):
-                last_pos = max(0, len(prompt_ids[i]) - 1)
-                next_id = int(torch.argmax(text_logits[i, last_pos]).item())
+                next_id = int(torch.argmax(text_logits[i, len(seqs[i]) - 1]).item())
                 if next_id == int(eos_id):
                     done[i] = True
-                else:
-                    seqs[i].append(next_id)
-                    generated_ids[i].append(next_id)
+                    continue
+                seqs[i].append(next_id)
+                generated_ids[i].append(next_id)
 
-            cache_lens = torch.tensor(
-                [int(prefix_k + len(x)) for x in prompt_ids],
-                dtype=torch.long,
-                device=device,
-            )
-            full_pad = torch.cat(
-                [
-                    torch.zeros((len(seqs), prefix_k), dtype=torch.bool, device=device),
-                    prompt_text_pad_mask,
-                ],
-                dim=1,
-            )
-            steps_done = 1
-            while steps_done < int(max_new_tokens) and not all(done):
-                step_ids: List[int] = []
-                new_key_pad: List[bool] = []
-                for i in range(len(seqs)):
-                    if done[i] or not generated_ids[i]:
-                        step_ids.append(int(pad_id))
-                        new_key_pad.append(True)
-                    else:
-                        step_ids.append(int(generated_ids[i][-1]))
-                        new_key_pad.append(False)
-                step_input_ids = torch.tensor(step_ids, dtype=torch.long, device=device).unsqueeze(1)
-                step_text_emb = self.lm._embed_dropout(self.lm._embed(step_input_ids))
-                step_q_pad = torch.tensor(new_key_pad, dtype=torch.bool, device=device).unsqueeze(1)
-                full_pad = torch.cat(
-                    [full_pad, torch.tensor(new_key_pad, dtype=torch.bool, device=device).unsqueeze(1)],
-                    dim=1,
+            if int(max_new_tokens) <= 1:
+                return generated_ids
+
+            for i in range(len(seqs)):
+                if done[i]:
+                    continue
+                cur_ids = list(seqs[i])
+                cur_len = int(len(cur_ids))
+                single_input_ids = torch.tensor(cur_ids, dtype=torch.long, device=device).unsqueeze(0)
+                single_text_pad_mask = torch.zeros((1, cur_len), dtype=torch.bool, device=device)
+                single_text_emb = self.lm._embed_dropout(self.lm._embed(single_input_ids))
+                single_visual_prefix = cached_visual_prefix[i : i + 1]
+                logits_i, prefix_k_i, kv_cache = self._prefill_decode_with_visual_prefix(
+                    text_emb=single_text_emb,
+                    text_pad_mask=single_text_pad_mask,
+                    visual_prefix=single_visual_prefix,
                 )
-                hidden, kv_cache = self.lm._decode_only_incremental(
-                    step_text_emb,
-                    kv_cache=kv_cache,
-                    pad_mask=full_pad,
-                    q_pad_mask=step_q_pad,
-                    start_pos=cache_lens,
-                )
-                cache_lens = cache_lens + (~step_q_pad.squeeze(1)).long()
-                step_logits = self._lm_head_with_amp(hidden)[:, 0, :]
-                for i in range(len(seqs)):
-                    if done[i]:
-                        continue
-                    next_id = int(torch.argmax(step_logits[i]).item())
+                steps_done = 1
+                next_id = int(torch.argmax(logits_i[0, prefix_k_i + cur_len - 1]).item())
+                if next_id == int(eos_id):
+                    continue
+                seqs[i].append(next_id)
+                generated_ids[i].append(next_id)
+                step_pos = int(prefix_k_i + cur_len)
+
+                while (steps_done + 1) < int(max_new_tokens):
+                    step_input_ids = torch.tensor([[next_id]], dtype=torch.long, device=device)
+                    step_text_emb = self.lm._embed_dropout(self.lm._embed(step_input_ids))
+                    hidden, kv_cache = self.lm._decode_only_incremental(
+                        step_text_emb,
+                        kv_cache=kv_cache,
+                        pad_mask=None,
+                        q_pad_mask=None,
+                        start_pos=step_pos,
+                    )
+                    step_pos += 1
+                    next_id = int(torch.argmax(self._lm_head_with_amp(hidden)[0, 0]).item())
                     if next_id == int(eos_id):
-                        done[i] = True
-                        continue
+                        break
                     seqs[i].append(next_id)
                     generated_ids[i].append(next_id)
-                steps_done += 1
+                    steps_done += 1
             return generated_ids
 
         for _ in range(int(max_new_tokens)):
@@ -1334,6 +1332,7 @@ def run_generation_predictions(
     logger: Optional[Logger] = None,
     split_name: str = "eval",
     log_every: int = 10,
+    cuda_empty_cache_every: int = 0,
 ) -> List[Dict[str, Any]]:
     model.eval()
     records: List[Dict[str, Any]] = []
@@ -1378,6 +1377,12 @@ def run_generation_predictions(
                 logger.log(msg)
             else:
                 print(msg)
+        if int(cuda_empty_cache_every) > 0 and ((bidx + 1) % int(cuda_empty_cache_every) == 0):
+            if torch.cuda.is_available():
+                gc.collect()
+                torch.cuda.empty_cache()
+                if logger is not None:
+                    logger.log(f"[mm] cuda empty_cache during eval batch={bidx + 1}")
         if max_batches > 0 and (bidx + 1) >= int(max_batches):
             break
     return records
@@ -1634,6 +1639,24 @@ def maybe_cuda_empty_cache(logger: Logger, *, enabled: bool, tag: str) -> None:
     gc.collect()
     torch.cuda.empty_cache()
     logger.log(f"[mm] cuda empty_cache after {tag}")
+
+
+def maybe_shutdown_loader_workers(logger: Logger, loader: Optional[DataLoader], *, tag: str) -> None:
+    if loader is None:
+        return
+    iterator = getattr(loader, "_iterator", None)
+    shutdown = getattr(iterator, "_shutdown_workers", None) if iterator is not None else None
+    if not callable(shutdown):
+        return
+    try:
+        shutdown()
+        try:
+            loader._iterator = None
+        except Exception:
+            pass
+        logger.log(f"[mm] dataloader workers shut down for {tag}")
+    except Exception as e:
+        logger.log(f"[mm] dataloader worker shutdown skipped for {tag}: {e}")
 
 
 def log_startup_config(
@@ -2197,6 +2220,7 @@ def main() -> None:
             logger=logger,
             split_name=args.eval_split,
             log_every=int(args.eval_log_every),
+            cuda_empty_cache_every=(400 if int(args.eval_batches) == 0 else 0),
         )
         summary = evaluate_records(
             records,
@@ -2217,6 +2241,11 @@ def main() -> None:
             logger,
             enabled=bool(args.cuda_empty_cache_after_eval),
             tag="eval_only_post_eval",
+        )
+        maybe_shutdown_loader_workers(
+            logger,
+            val_loader,
+            tag="val_loader_post_eval_only",
         )
         if args.save_predictions_jsonl:
             with open(args.save_predictions_jsonl, "w", encoding="utf-8") as f:
@@ -2367,6 +2396,11 @@ def main() -> None:
                 enabled=bool(args.cuda_empty_cache_after_eval),
                 tag=f"periodic_eval_post_step_{global_step}",
             )
+            maybe_shutdown_loader_workers(
+                logger,
+                val_loader,
+                tag=f"val_loader_post_periodic_eval_step_{global_step}",
+            )
 
         if int(args.ckpt_every) > 0 and global_step % int(args.ckpt_every) == 0:
             ckpt_path = _checkpoint_path(args.run_id, global_step)
@@ -2495,6 +2529,14 @@ def main() -> None:
     )
     logger.log(f"[mm] final checkpoint: {final_ckpt}")
 
+    maybe_shutdown_loader_workers(
+        logger,
+        train_loader,
+        tag="train_loader_pre_final_eval",
+    )
+    train_loader = None
+    gc.collect()
+
     maybe_cuda_empty_cache(
         logger,
         enabled=bool(args.cuda_empty_cache_after_eval),
@@ -2511,6 +2553,7 @@ def main() -> None:
         logger=logger,
         split_name=args.eval_split,
         log_every=int(args.eval_log_every),
+        cuda_empty_cache_every=(400 if int(args.final_eval_batches) == 0 else 0),
     )
     summary = evaluate_records(
         records,
@@ -2531,6 +2574,11 @@ def main() -> None:
         logger,
         enabled=bool(args.cuda_empty_cache_after_eval),
         tag="final_eval_post",
+    )
+    maybe_shutdown_loader_workers(
+        logger,
+        val_loader,
+        tag="val_loader_post_final_eval",
     )
     if args.save_predictions_jsonl:
         with open(args.save_predictions_jsonl, "w", encoding="utf-8") as f:

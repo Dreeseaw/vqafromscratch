@@ -238,3 +238,71 @@ Why this final order:
 - `safe qcond + early-layer` goes fourth because it is the highest-value stack test in the current search space.
 - `safe qcond + geometry-aware calibration` goes fifth because it is still very worthwhile, but slightly less foundational than the qcond+evidence stack.
 - `structured roles + geometry-aware calibration` goes sixth because it is useful, but the least essential of the selected runs if the horizon gets cut short.
+
+## Late Additions
+
+Three additional safeqcond-family runs were added afterward to widen the sweep without collapsing into low-entropy variants.
+
+### `safe qcond + early-layer encoder + geometry-aware calibration`
+
+Why it was added:
+
+- this is the densest high-value stack inside the current safeqcond line without drifting into a low-entropy micro-ablation
+- it combines the three most project-relevant ideas in the current bridge family: question-aware extraction, stronger visual detail, and better bridge-to-LM interface geometry
+
+What it answers:
+
+- do the gains from `safe qcond`, `early-layer`, and `geometry-aware calibration` stack cleanly
+- is the best near-term frontier likely to come from a reinforced safeqcond mainline rather than a brand new bridge family
+
+Why it is high-value:
+
+- this is the strongest "frontier hardening" combinational run in the sweep
+- if it wins, it gives a clear next mainline instead of just another branch-specific result
+
+### `safe qcond + multiscale perceiver`
+
+Why it was added:
+
+- this is the cleanest way to test whether q-conditioned evidence extraction gets stronger when fed both earlier and later visual signals
+- it extends the qcond family into a genuinely different evidence-source regime, not just another perceiver modifier
+
+What it answers:
+
+- does qcond benefit from semantic+detail fusion more than plain single-scale qcond
+- is the next bridge direction "question-guided multiscale evidence extraction"
+
+Why it is high-value:
+
+- this is one of the most direct ways to combine the strongest current branch with one of the most research-backed feature-source upgrades
+
+### `safe qcond + hybrid constant/image bridge`
+
+Why it was added:
+
+- hybrid bridges have been competitive before, and this run tests whether q-conditioning can stabilize or improve that family
+- it gives the sweep one additional non-pure-perceiver safeqcond branch
+
+What it answers:
+
+- can q-guided image extraction stack with a learned constant/image mixture
+- is there still headroom in hybrid prefix construction once qcond is working
+
+Why it is high-value:
+
+- this is not a micro-ablation
+- it checks whether safeqcond is strong only inside the plain perceiver line or whether it transfers to a broader bridge family
+
+## Final Executed Order
+
+The sweep that was actually executed used this final order:
+
+1. `safe qcond frontier harden`
+2. `structured roles frontier harden`
+3. `early-layer encoder frontier harden`
+4. `safe qcond + early-layer encoder`
+5. `safe qcond + geometry-aware calibration`
+6. `structured roles + geometry-aware calibration`
+7. `safe qcond + early-layer encoder + geometry-aware calibration`
+8. `safe qcond + multiscale perceiver`
+9. `safe qcond + hybrid constant/image bridge`

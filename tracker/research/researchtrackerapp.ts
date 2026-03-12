@@ -2,6 +2,7 @@ import { serve } from "bun";
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { parseRunLog, type SeriesPoint } from "./logstitch";
 
 type RunSummary = {
   runId: string;
@@ -44,15 +45,11 @@ type DocSummary = {
   mentionedAccuracies: number[];
 };
 
-type SeriesPoint = {
-  step: number;
-  value: number;
-};
-
 type RunDetail = {
   run: RunSummary;
   updatedAt: string | null;
   introLines: string[];
+  tailLines: string[];
   trainCeSeries: SeriesPoint[];
   valAccuracySeries: SeriesPoint[];
   valStepsPerSecSeries: SeriesPoint[];
@@ -262,175 +259,6 @@ function resolveTaskContext(taskId: string | null | undefined): TaskContext | nu
   return tasksById.get(requested) ?? null;
 }
 
-type RunLogSegment = {
-  file: string;
-  fullPath: string;
-  resumeStep: number;
-  mtimeMs: number;
-};
-
-type ParsedRunLogData = {
-  logfile: string | null;
-  logfileMtimeMs: number | null;
-  introLines: string[];
-  finalAccuracy: number | null;
-  bestAccuracy: number | null;
-  lastTrainCe: number | null;
-  lastStep: number | null;
-  lastStepsPerSec: number | null;
-  numParams: number | null;
-  trainableParams: number | null;
-  hasFinalCheckpoint: boolean;
-  trainCeSeries: SeriesPoint[];
-  valAccuracySeries: SeriesPoint[];
-  valStepsPerSecSeries: SeriesPoint[];
-};
-
-function listRunLogSegments(task: TaskContext, runId: string): RunLogSegment[] {
-  const runDir = path.join(task.logsRoot, runId);
-  if (!fs.existsSync(runDir) || !fs.statSync(runDir).isDirectory()) return [];
-  return fs
-    .readdirSync(runDir)
-    .filter((file) => /^logfile.*\.txt$/i.test(file))
-    .map((file) => {
-      const fullPath = path.join(runDir, file);
-      const resumeStep = Number(file.match(/^logfile_from_(\d+)\.txt$/i)?.[1] ?? 0);
-      return {
-        file,
-        fullPath,
-        resumeStep,
-        mtimeMs: fs.statSync(fullPath).mtimeMs,
-      };
-    })
-    .sort((a, b) => a.resumeStep - b.resumeStep || a.mtimeMs - b.mtimeMs || a.file.localeCompare(b.file));
-}
-
-function parseMergedRunLog(task: TaskContext, runId: string): ParsedRunLogData {
-  const segments = listRunLogSegments(task, runId);
-  const latestSegment = segments.slice().sort((a, b) => b.mtimeMs - a.mtimeMs)[0] ?? null;
-  const empty: ParsedRunLogData = {
-    logfile: latestSegment?.file ?? null,
-    logfileMtimeMs: latestSegment?.mtimeMs ?? null,
-    introLines: [],
-    finalAccuracy: null,
-    bestAccuracy: null,
-    lastTrainCe: null,
-    lastStep: null,
-    lastStepsPerSec: null,
-    numParams: null,
-    trainableParams: null,
-    hasFinalCheckpoint: false,
-    trainCeSeries: [],
-    valAccuracySeries: [],
-    valStepsPerSecSeries: [],
-  };
-  if (segments.length === 0) return empty;
-
-  const introLines = readText(segments[0].fullPath)
-    .split(/\r?\n/)
-    .filter((line) => line.trim().length > 0)
-    .slice(0, 20);
-  const trainPoints = new Map<number, { ce: number; stepsPerSec: number | null }>();
-  const valAccPoints = new Map<number, number>();
-  const valRatePoints = new Map<number, number>();
-  let finalAccuracy: number | null = null;
-  let bestAccuracy: number | null = null;
-  let numParams: number | null = null;
-  let trainableParams: number | null = null;
-  let hasFinalCheckpoint = false;
-
-  for (const segment of segments) {
-    const text = readText(segment.fullPath);
-    if (!text) continue;
-
-    const trainableParamsMatch = text.match(/\btrainable_params=([\d,]+)/i);
-    if (trainableParamsMatch) trainableParams = Number(trainableParamsMatch[1].replaceAll(",", ""));
-    const totalParamsMatch = text.match(/\btotal_params=([\d,]+)/i) ?? text.match(/\bTotal params:\s*([\d,]+)/i);
-    if (totalParamsMatch) numParams = Number(totalParamsMatch[1].replaceAll(",", ""));
-    if (/\[mm\]\s+final checkpoint:\s+/m.test(text)) hasFinalCheckpoint = true;
-
-    let lastStepSeen: number | null = segment.resumeStep > 0 ? segment.resumeStep : null;
-    for (const line of text.split(/\r?\n/)) {
-      const mmStep = line.match(/\[mm\]\s+step=(\d+)/);
-      const mmStepsPerSec = line.match(/\bsteps_per_s=([0-9]*\.?[0-9]+)/);
-      if (mmStep && mmStepsPerSec) {
-        lastStepSeen = Number(mmStep[1]);
-        const lossCe = line.match(/\bloss_ce=([0-9]*\.?[0-9]+)/);
-        const loss = line.match(/\bloss=([0-9]*\.?[0-9]+)/);
-        const ce = Number((lossCe ?? loss)?.[1] ?? NaN);
-        const stepsPerSec = Number(mmStepsPerSec[1]);
-        if (Number.isFinite(ce)) {
-          trainPoints.set(lastStepSeen, {
-            ce,
-            stepsPerSec: Number.isFinite(stepsPerSec) ? stepsPerSec : null,
-          });
-        }
-        continue;
-      }
-
-      const lmStep = line.match(/\bStep:\s*(\d+),/);
-      const lmTrainCe = line.match(/\bTrain CE:\s*([0-9]*\.?[0-9]+)/);
-      const lmTokensPerSec = line.match(/\bTokens\/s:\s*([0-9]*\.?[0-9]+)/);
-      if (lmStep && lmTrainCe) {
-        lastStepSeen = Number(lmStep[1]);
-        trainPoints.set(lastStepSeen, {
-          ce: Number(lmTrainCe[1]),
-          stepsPerSec: lmTokensPerSec ? Number(lmTokensPerSec[1]) : null,
-        });
-        continue;
-      }
-
-      const valRateMatch = line.match(/\[eval:val\]\s+batch=(\d+)(?:\/(\d+))?\s+samples=(\d+)\s+elapsed_s=([0-9]*\.?[0-9]+)/);
-      if (valRateMatch && lastStepSeen !== null) {
-        const currentBatch = Number(valRateMatch[1]);
-        const totalBatches = Number(valRateMatch[2] ?? NaN);
-        const elapsed = Number(valRateMatch[4]);
-        const batches = Number.isFinite(totalBatches) && totalBatches > 0 ? totalBatches : currentBatch;
-        if (Number.isFinite(batches) && Number.isFinite(elapsed) && elapsed > 0) {
-          valRatePoints.set(lastStepSeen, batches / elapsed);
-        }
-        continue;
-      }
-
-      const valAccMatch = line.match(/\[eval:val\]\s+overall_accuracy=([0-9]*\.?[0-9]+)/);
-      if (valAccMatch) {
-        const value = Number(valAccMatch[1]);
-        finalAccuracy = value;
-        bestAccuracy = bestAccuracy === null ? value : Math.max(bestAccuracy, value);
-        if (lastStepSeen !== null) valAccPoints.set(lastStepSeen, value);
-      }
-    }
-  }
-
-  const trainCeSeries = [...trainPoints.entries()]
-    .sort((a, b) => a[0] - b[0])
-    .map(([step, point]) => ({ step, value: point.ce }));
-  const valAccuracySeries = [...valAccPoints.entries()]
-    .sort((a, b) => a[0] - b[0])
-    .map(([step, value]) => ({ step, value }));
-  const valStepsPerSecSeries = [...valRatePoints.entries()]
-    .sort((a, b) => a[0] - b[0])
-    .map(([step, value]) => ({ step, value }));
-  const lastTrainPoint = trainPoints.size > 0 ? [...trainPoints.entries()].sort((a, b) => a[0] - b[0]).at(-1) ?? null : null;
-
-  return {
-    logfile: latestSegment?.file ?? null,
-    logfileMtimeMs: latestSegment?.mtimeMs ?? null,
-    introLines,
-    finalAccuracy,
-    bestAccuracy,
-    lastTrainCe: lastTrainPoint?.[1].ce ?? null,
-    lastStep: lastTrainPoint?.[0] ?? null,
-    lastStepsPerSec: lastTrainPoint?.[1].stepsPerSec ?? null,
-    numParams,
-    trainableParams,
-    hasFinalCheckpoint,
-    trainCeSeries,
-    valAccuracySeries,
-    valStepsPerSecSeries,
-  };
-}
-
 function parseRunSummary(task: TaskContext, runId: string): RunSummary {
   const runDir = path.join(task.logsRoot, runId);
   const out: RunSummary = {
@@ -449,7 +277,7 @@ function parseRunSummary(task: TaskContext, runId: string): RunSummary {
     logfileMtimeMs: null,
   };
   if (!fs.existsSync(runDir) || !fs.statSync(runDir).isDirectory()) return out;
-  const parsed = parseMergedRunLog(task, runId);
+  const parsed = parseRunLog(runDir);
   out.logfile = parsed.logfile;
   out.logfileMtimeMs = parsed.logfileMtimeMs;
   out.finalAccuracy = parsed.finalAccuracy;
@@ -464,7 +292,7 @@ function parseRunSummary(task: TaskContext, runId: string): RunSummary {
 }
 
 function parseRunDetail(task: TaskContext, runId: string): RunDetail | null {
-  const parsed = parseMergedRunLog(task, runId);
+  const parsed = parseRunLog(path.join(task.logsRoot, runId));
   const run = parseRunSummary(task, runId);
   if (run.lastStep === null) return null;
 
@@ -472,6 +300,7 @@ function parseRunDetail(task: TaskContext, runId: string): RunDetail | null {
     run,
     updatedAt: run.logfileMtimeMs ? toIso(run.logfileMtimeMs) : null,
     introLines: parsed.introLines,
+    tailLines: parsed.tailLines,
     trainCeSeries: parsed.trainCeSeries,
     valAccuracySeries: parsed.valAccuracySeries,
     valStepsPerSecSeries: parsed.valStepsPerSecSeries,

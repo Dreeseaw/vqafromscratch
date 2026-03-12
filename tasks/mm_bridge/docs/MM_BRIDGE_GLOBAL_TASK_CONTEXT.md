@@ -145,6 +145,15 @@ If a run is intentionally stopped by the user:
 - the next launch should resume from the latest checkpoint
 - if training is complete but final eval is incomplete, the next launch should resume eval-only
 
+## Tracker Tooling Note
+
+The research tracker now has a shared Bun/TypeScript log stitcher for canonical MM run logs:
+
+- module: `tracker/research/logstitch.ts`
+- CLI: `bun run tracker/research/logstitchcli.ts -f logs/<run_id> -o logs/<run_id>/logfile_stitched.txt --summary-json`
+
+Use this when a run has been resumed across `logfile.txt` plus `logfile_from_<step>.txt` segments and a legacy consumer needs one cleaned materialized logfile. The stitcher only treats `logfile.txt` and `logfile_from_<step>.txt` as canonical segments; renamed junk files should not be relied on for comparison metrics.
+
 ## Exception Handling
 
 Allowed exceptions:
