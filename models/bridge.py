@@ -38,9 +38,13 @@ class BridgeConfig:
     bridge_hybrid_image_bridge_type: str = "learned_query"
     bridge_question_conditioning: bool = False
     bridge_qcond_scale: float = 0.5
+    bridge_query_bank_mode: str = "learned"  # learned | question_mix
+    bridge_qquery_basis_count: int = 4
+    bridge_qquery_scale: float = 1.0
     bridge_question_context_mode: str = "all_text"  # all_text | prompt_only
-    bridge_token_selector_type: str = "none"  # none | topk
+    bridge_token_selector_type: str = "none"  # none | topk | qtopk | qadaptive
     bridge_token_select_k: int = 0
+    bridge_token_select_k_min: int = 0
     bridge_num_roles: int = 4
     bridge_evidence_topk: int = 0
 
@@ -232,17 +236,40 @@ class _QueryBridgeBase(nn.Module):
         selector_k = int(getattr(cfg, "bridge_token_select_k", 0))
         self._selector_type = selector_type
         self._selector_k = max(0, selector_k)
+        self._selector_k_min = max(0, int(getattr(cfg, "bridge_token_select_k_min", 0)))
+        self.supports_question_context = selector_type in ("qtopk", "qadaptive")
         if selector_type == "none" or self._selector_k <= 0:
             self.token_selector = None
+            self.token_selector_qproj = None
+            self.token_budget = None
         elif selector_type == "topk":
             d = int(cfg.lm_hidden_size)
             self.token_selector = nn.Sequential(
                 nn.LayerNorm(d),
                 nn.Linear(d, 1),
             )
+            self.token_selector_qproj = None
+            self.token_budget = None
+        elif selector_type in ("qtopk", "qadaptive"):
+            d = int(cfg.lm_hidden_size)
+            self.token_selector = nn.Sequential(
+                nn.LayerNorm(d),
+                nn.GELU(),
+                nn.Linear(d, 1),
+            )
+            self.token_selector_qproj = nn.Linear(d, d)
+            self.token_budget = (
+                nn.Sequential(
+                    nn.LayerNorm(d),
+                    nn.Linear(d, 1),
+                )
+                if selector_type == "qadaptive"
+                else None
+            )
         else:
             raise ValueError(
-                f"Unsupported bridge_token_selector_type={selector_type}. Supported: none, topk"
+                "Unsupported bridge_token_selector_type="
+                f"{selector_type}. Supported: none, topk, qtopk, qadaptive"
             )
 
     def _token_pos_emb(self, nv: int, d_model: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -254,7 +281,12 @@ class _QueryBridgeBase(nn.Module):
         self._pos_cache[key] = emb
         return emb
 
-    def _prepare_visual_tokens(self, visual_features: torch.Tensor) -> torch.Tensor:
+    def _prepare_visual_tokens(
+        self,
+        visual_features: torch.Tensor,
+        *,
+        question_context: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         x = _as_token_sequence(visual_features)
         x = self.visual_proj(x)
         if bool(self.cfg.add_2d_pos_emb):
@@ -265,22 +297,54 @@ class _QueryBridgeBase(nn.Module):
                 dtype=x.dtype,
             ).unsqueeze(0)
         x = self.spatial_mixer(x)
-        x = self._maybe_select_tokens(x)
+        x = self._maybe_select_tokens(x, question_context=question_context)
         return x
 
-    def _maybe_select_tokens(self, x: torch.Tensor) -> torch.Tensor:
+    def _maybe_select_tokens(
+        self,
+        x: torch.Tensor,
+        *,
+        question_context: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if self.token_selector is None:
             return x
+        b = int(x.shape[0])
         n = int(x.shape[1])
-        k = min(max(1, int(self._selector_k)), n)
-        if k >= n:
+        max_k = min(max(1, int(self._selector_k)), n)
+        if max_k >= n:
             return x
-        scores = self.token_selector(x).squeeze(-1)  # [B, N]
-        top_vals, top_idx = torch.topk(scores, k=k, dim=1)
+
+        if self._selector_type == "topk":
+            scores = self.token_selector(x).squeeze(-1)
+            kept_k = torch.full((b,), max_k, device=x.device, dtype=torch.long)
+        else:
+            if question_context is None:
+                raise ValueError(
+                    f"bridge_token_selector_type={self._selector_type} requires question_context, but got None."
+                )
+            assert self.token_selector_qproj is not None
+            q_bias = self.token_selector_qproj(question_context).unsqueeze(1)
+            scores = self.token_selector(torch.tanh(x + q_bias)).squeeze(-1)
+            if self._selector_type == "qadaptive" and self.token_budget is not None:
+                min_k = min(max_k, max(1, int(self._selector_k_min) or max_k // 2))
+                if min_k >= max_k:
+                    kept_k = torch.full((b,), max_k, device=x.device, dtype=torch.long)
+                else:
+                    alpha = torch.sigmoid(self.token_budget(question_context)).squeeze(-1)
+                    kept_k = torch.round(min_k + alpha * float(max_k - min_k)).to(torch.long)
+                    kept_k = kept_k.clamp(min=min_k, max=max_k)
+            else:
+                kept_k = torch.full((b,), max_k, device=x.device, dtype=torch.long)
+
+        top_vals, top_idx = torch.topk(scores, k=max_k, dim=1)
         gather_idx = top_idx.unsqueeze(-1).expand(-1, -1, int(x.shape[-1]))
         selected = torch.gather(x, dim=1, index=gather_idx)
         # Gate selected tokens by learned confidence while keeping hard top-k selection.
         gate = torch.sigmoid(top_vals).unsqueeze(-1)
+        if self._selector_type == "qadaptive":
+            rank = torch.arange(max_k, device=x.device, dtype=torch.long).unsqueeze(0)
+            active = (rank < kept_k.unsqueeze(1)).unsqueeze(-1)
+            gate = gate * active.to(dtype=gate.dtype)
         return selected * gate
 
 
@@ -291,6 +355,7 @@ class _PerceiverCore(nn.Module):
         k = int(cfg.num_visual_tokens)
         std = float(cfg.learned_init_std)
         rounds = max(1, int(cfg.bridge_query_depth))
+        query_bank_mode = str(getattr(cfg, "bridge_query_bank_mode", "learned"))
         self.latents = nn.Parameter(torch.randn(1, k, d_lm) * std)
         self.cross_blocks = nn.ModuleList(
             [
@@ -312,21 +377,49 @@ class _PerceiverCore(nn.Module):
                 for _ in range(rounds)
             ]
         )
-        self.supports_question_context = bool(getattr(cfg, "bridge_question_conditioning", False))
+        self.uses_question_queries = query_bank_mode == "question_mix"
+        self.uses_question_conditioning = bool(getattr(cfg, "bridge_question_conditioning", False))
+        if query_bank_mode not in ("learned", "question_mix"):
+            raise ValueError(
+                f"Unsupported bridge_query_bank_mode={query_bank_mode}. Supported: learned, question_mix"
+            )
+        self.supports_question_context = self.uses_question_conditioning or self.uses_question_queries
         self.qcond_scale = float(getattr(cfg, "bridge_qcond_scale", 0.5))
-        if self.supports_question_context:
+        self.qquery_scale = float(getattr(cfg, "bridge_qquery_scale", 1.0))
+        if self.uses_question_conditioning:
             self.qcond_ln = nn.LayerNorm(d_lm)
             self.qcond_proj = nn.Linear(d_lm, 2 * d_lm)
         else:
             self.qcond_ln = None
             self.qcond_proj = None
+        if self.uses_question_queries:
+            basis_count = max(1, int(getattr(cfg, "bridge_qquery_basis_count", 4)))
+            self.qquery_ln = nn.LayerNorm(d_lm)
+            self.qquery_mix = nn.Linear(d_lm, basis_count)
+            self.qquery_basis = nn.Parameter(torch.randn(basis_count, k, d_lm) * std)
+        else:
+            self.qquery_ln = None
+            self.qquery_mix = None
+            self.qquery_basis = None
+
+    def _apply_question_queries(
+        self,
+        latents: torch.Tensor,
+        question_context: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if not self.uses_question_queries or question_context is None:
+            return latents
+        assert self.qquery_ln is not None and self.qquery_mix is not None and self.qquery_basis is not None
+        weights = torch.softmax(self.qquery_mix(self.qquery_ln(question_context)), dim=-1)
+        delta = torch.einsum("br,rkd->bkd", weights, self.qquery_basis)
+        return latents + float(self.qquery_scale) * delta
 
     def _apply_question_conditioning(
         self,
         latents: torch.Tensor,
         question_context: torch.Tensor | None,
     ) -> torch.Tensor:
-        if not self.supports_question_context or question_context is None:
+        if not self.uses_question_conditioning or question_context is None:
             return latents
         if question_context.ndim != 2:
             raise ValueError(f"Expected question_context [B,D], got {tuple(question_context.shape)}")
@@ -348,6 +441,7 @@ class _PerceiverCore(nn.Module):
     ) -> torch.Tensor:
         if latents is None:
             latents = self.latents.expand(int(visual_tokens.shape[0]), -1, -1)
+        latents = self._apply_question_queries(latents, question_context)
         latents = self._apply_question_conditioning(latents, question_context)
         for cross_blk, self_blk in zip(self.cross_blocks, self.self_blocks):
             latents = cross_blk(latents, visual_tokens)
@@ -521,8 +615,12 @@ class LearnedQueryCrossAttentionBridge(_QueryBridgeBase):
             ]
         )
 
-    def forward(self, visual_features: torch.Tensor) -> torch.Tensor:
-        visual_tokens = self._prepare_visual_tokens(visual_features)
+    def forward(
+        self,
+        visual_features: torch.Tensor,
+        question_context: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        visual_tokens = self._prepare_visual_tokens(visual_features, question_context=question_context)
         q = self.query_tokens.expand(int(visual_tokens.shape[0]), -1, -1)
         q = self.cross(q, visual_tokens)
         for blk in self.refine:
@@ -538,14 +636,14 @@ class PerceiverResamplerBridge(_QueryBridgeBase):
     def __init__(self, cfg: BridgeConfig):
         super().__init__(cfg)
         self.core = _PerceiverCore(cfg)
-        self.supports_question_context = bool(self.core.supports_question_context)
+        self.supports_question_context = bool(self.supports_question_context or self.core.supports_question_context)
 
     def forward(
         self,
         visual_features: torch.Tensor,
         question_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        visual_tokens = self._prepare_visual_tokens(visual_features)
+        visual_tokens = self._prepare_visual_tokens(visual_features, question_context=question_context)
         return self.core(visual_tokens, question_context=question_context)
 
 
@@ -638,8 +736,12 @@ class StructuredRolesBridge(_QueryBridgeBase):
             ]
         )
 
-    def forward(self, visual_features: torch.Tensor) -> torch.Tensor:
-        visual_tokens = self._prepare_visual_tokens(visual_features)
+    def forward(
+        self,
+        visual_features: torch.Tensor,
+        question_context: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        visual_tokens = self._prepare_visual_tokens(visual_features, question_context=question_context)
         role_emb = self.role_embeddings[self.role_ids].unsqueeze(0)
         q = self.query_tokens.expand(int(visual_tokens.shape[0]), -1, -1) + role_emb
         for cross_blk, self_blk in zip(self.cross_blocks, self.self_blocks):
@@ -703,8 +805,12 @@ class EvidenceSparseBridge(_QueryBridgeBase):
         selected = torch.gather(visual_tokens, dim=1, index=gather_idx)
         return selected * torch.sigmoid(top_vals).unsqueeze(-1)
 
-    def forward(self, visual_features: torch.Tensor) -> torch.Tensor:
-        visual_tokens = self._prepare_visual_tokens(visual_features)
+    def forward(
+        self,
+        visual_features: torch.Tensor,
+        question_context: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        visual_tokens = self._prepare_visual_tokens(visual_features, question_context=question_context)
         summary = self.summary_proj(visual_tokens.mean(dim=1, keepdim=True))
         if int(self.evidence_queries.shape[1]) == 0:
             return summary
@@ -777,8 +883,12 @@ class QFormerLiteBridge(_QueryBridgeBase):
             ]
         )
 
-    def forward(self, visual_features: torch.Tensor) -> torch.Tensor:
-        visual_tokens = self._prepare_visual_tokens(visual_features)
+    def forward(
+        self,
+        visual_features: torch.Tensor,
+        question_context: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        visual_tokens = self._prepare_visual_tokens(visual_features, question_context=question_context)
         q = self.query_tokens.expand(int(visual_tokens.shape[0]), -1, -1)
         for blk in self.blocks:
             q = blk(q, visual_tokens)

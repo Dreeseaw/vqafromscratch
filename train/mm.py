@@ -193,12 +193,21 @@ def _apply_runtime_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "bridge_hybrid_image_bridge_type": "learned_query",
         "bridge_question_conditioning": False,
         "bridge_qcond_scale": 0.5,
+        "bridge_query_bank_mode": "learned",
+        "bridge_qquery_basis_count": 4,
+        "bridge_qquery_scale": 1.0,
         "bridge_question_context_mode": "all_text",
         "eval_use_kv_cache": False,
         "bridge_token_selector_type": "none",
         "bridge_token_select_k": 0,
+        "bridge_token_select_k_min": 0,
         "bridge_num_roles": 4,
         "bridge_evidence_topk": 0,
+        "lm_visual_adapter_type": "none",
+        "lm_visual_adapter_layers": 0,
+        "lm_visual_adapter_num_heads": 8,
+        "lm_visual_adapter_dropout": 0.0,
+        "lm_visual_adapter_gate_init": 0.5,
         "prefix_calibration": False,
         "prefix_calib_layernorm": True,
         "prefix_calib_bias": True,
@@ -499,6 +508,72 @@ class PrefixCalibrator(nn.Module):
         return y
 
 
+def _resolve_mha_heads(dim: int, requested: int) -> int:
+    d = max(1, int(dim))
+    h = max(1, min(int(requested), d))
+    while h > 1 and (d % h) != 0:
+        h -= 1
+    return h
+
+
+class ResidualVisualAdapter(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        *,
+        num_heads: int,
+        dropout: float,
+        gate_init: float,
+    ) -> None:
+        super().__init__()
+        d = int(dim)
+        p = max(0.0, float(dropout))
+        gate = min(1.0 - 1e-4, max(1e-4, float(gate_init)))
+        logit = math.log(gate / (1.0 - gate))
+        self.ln_q = nn.LayerNorm(d)
+        self.ln_kv = nn.LayerNorm(d)
+        self.cross_attn = nn.MultiheadAttention(
+            d,
+            num_heads=_resolve_mha_heads(d, int(num_heads)),
+            dropout=p,
+            batch_first=True,
+        )
+        self.cross_drop = nn.Dropout(p)
+        self.cross_gate_logit = nn.Parameter(torch.full((1, 1, d), logit))
+        h = max(4, 2 * d)
+        self.ff_ln = nn.LayerNorm(d)
+        self.ffn = nn.Sequential(
+            nn.Linear(d, h),
+            nn.GELU(),
+            nn.Dropout(p),
+            nn.Linear(h, d),
+        )
+        self.ff_drop = nn.Dropout(p)
+        self.ff_gate_logit = nn.Parameter(torch.full((1, 1, d), logit))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        visual_tokens: torch.Tensor,
+        query_keep_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        q = self.ln_q(x)
+        kv = self.ln_kv(visual_tokens)
+        attn_out, _ = self.cross_attn(q, kv, kv, need_weights=False)
+        if query_keep_mask is not None:
+            keep = query_keep_mask.unsqueeze(-1).to(dtype=attn_out.dtype)
+            attn_out = attn_out * keep
+        x = x + torch.sigmoid(self.cross_gate_logit) * self.cross_drop(attn_out)
+
+        ff_out = self.ffn(self.ff_ln(x))
+        if query_keep_mask is not None:
+            keep = query_keep_mask.unsqueeze(-1).to(dtype=ff_out.dtype)
+            ff_out = ff_out * keep
+        x = x + torch.sigmoid(self.ff_gate_logit) * self.ff_drop(ff_out)
+        return x
+
+
 class MultimodalPrefixLM(nn.Module):
     def __init__(
         self,
@@ -519,6 +594,11 @@ class MultimodalPrefixLM(nn.Module):
         prefix_dropout: float = 0.0,
         question_context_mode: str = "all_text",
         eval_use_kv_cache: bool = False,
+        lm_visual_adapter_type: str = "none",
+        lm_visual_adapter_layers: int = 0,
+        lm_visual_adapter_num_heads: int = 8,
+        lm_visual_adapter_dropout: float = 0.0,
+        lm_visual_adapter_gate_init: float = 0.5,
     ):
         super().__init__()
         self.vision_adapter = vision_adapter
@@ -542,6 +622,26 @@ class MultimodalPrefixLM(nn.Module):
         self.prefix_dropout = max(0.0, float(prefix_dropout))
         self.question_context_mode = str(question_context_mode)
         self.eval_use_kv_cache = bool(eval_use_kv_cache)
+        self.lm_visual_adapter_type = str(lm_visual_adapter_type)
+        self.lm_visual_adapter_layers = max(0, int(lm_visual_adapter_layers))
+        self.visual_adapters = nn.ModuleDict()
+        self.visual_adapter_layer_ids: List[int] = []
+        if self.lm_visual_adapter_type not in ("none", "cross_attn"):
+            raise ValueError(
+                f"Unsupported lm_visual_adapter_type={self.lm_visual_adapter_type}. Supported: none, cross_attn"
+            )
+        if self.lm_visual_adapter_type != "none" and self.lm_visual_adapter_layers > 0:
+            total_layers = len(self.lm._dec_blocks)
+            top_n = max(0, min(self.lm_visual_adapter_layers, total_layers))
+            self.visual_adapter_layer_ids = list(range(total_layers - top_n, total_layers))
+            for layer_idx in self.visual_adapter_layer_ids:
+                self.visual_adapters[str(layer_idx)] = ResidualVisualAdapter(
+                    d_model,
+                    num_heads=int(lm_visual_adapter_num_heads),
+                    dropout=float(lm_visual_adapter_dropout),
+                    gate_init=float(lm_visual_adapter_gate_init),
+                )
+        self.uses_visual_adapters = len(self.visual_adapter_layer_ids) > 0
 
     def _lm_autocast_dtype(self) -> Optional[torch.dtype]:
         if not self.lm_autocast:
@@ -584,6 +684,16 @@ class MultimodalPrefixLM(nn.Module):
             context_mask = ~text_pad_mask
         return self._question_context_from_text(text_emb, context_mask)
 
+    def _adapter_query_keep_mask(
+        self,
+        *,
+        text_pad_mask: torch.Tensor,
+        prefix_k: int,
+    ) -> torch.Tensor:
+        b = int(text_pad_mask.shape[0])
+        prefix_keep = torch.zeros((b, int(prefix_k)), dtype=torch.bool, device=text_pad_mask.device)
+        return torch.cat([prefix_keep, ~text_pad_mask], dim=1)
+
     def _compute_visual_prefix(
         self,
         *,
@@ -616,6 +726,45 @@ class MultimodalPrefixLM(nn.Module):
             visual_prefix = F.dropout(visual_prefix, p=self.prefix_dropout, training=True)
         return visual_prefix, used_visual_features
 
+    def _decode_hidden_with_visual_prefix(
+        self,
+        *,
+        text_emb: torch.Tensor,
+        text_pad_mask: torch.Tensor,
+        visual_prefix: torch.Tensor,
+    ) -> Tuple[torch.Tensor, int]:
+        x = torch.cat([visual_prefix, text_emb], dim=1)
+        b = int(text_emb.shape[0])
+        k = int(visual_prefix.shape[1])
+        prefix_pad = torch.zeros((b, k), dtype=torch.bool, device=text_emb.device)
+        full_pad = torch.cat([prefix_pad, text_pad_mask], dim=1)
+        if not self.uses_visual_adapters:
+            hidden = self.lm._decode_only(
+                x,
+                pad_mask=full_pad,
+                is_causal=bool(getattr(self.lm._config, "causal_lm", True)),
+            )
+            return hidden, k
+
+        query_keep_mask = self._adapter_query_keep_mask(text_pad_mask=text_pad_mask, prefix_k=k)
+        hidden = x
+        is_causal = bool(getattr(self.lm._config, "causal_lm", True))
+        for layer_idx, block in enumerate(self.lm._dec_blocks):
+            hidden = block(
+                hidden,
+                pad_mask=full_pad,
+                rope=self.lm._rope,
+                is_causal=is_causal,
+            )
+            adapter_key = str(layer_idx)
+            if adapter_key in self.visual_adapters:
+                hidden = self.visual_adapters[adapter_key](
+                    hidden,
+                    visual_tokens=visual_prefix,
+                    query_keep_mask=query_keep_mask,
+                )
+        return hidden, k
+
     def _decode_with_visual_prefix(
         self,
         *,
@@ -627,31 +776,25 @@ class MultimodalPrefixLM(nn.Module):
         visual_features: Optional[torch.Tensor] = None,
         images: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, int]:
-        x = torch.cat([visual_prefix, text_emb], dim=1)
-
-        b = int(input_ids.shape[0])
-        k = int(visual_prefix.shape[1])
-        prefix_pad = torch.zeros((b, k), dtype=torch.bool, device=input_ids.device)
-        full_pad = torch.cat([prefix_pad, text_pad_mask], dim=1)
         use_lm_amp = (
-            x.device.type == "cuda"
+            text_emb.device.type == "cuda"
             and str(getattr(self.lm._config, "attn_impl", "sdpa")) == "sdpa"
             and self._lm_autocast_dtype() is not None
         )
         if use_lm_amp:
             with torch.autocast(device_type="cuda", dtype=self._lm_autocast_dtype(), enabled=True):
-                hidden = self.lm._decode_only(
-                    x,
-                    pad_mask=full_pad,
-                    is_causal=bool(getattr(self.lm._config, "causal_lm", True)),
+                hidden, k = self._decode_hidden_with_visual_prefix(
+                    text_emb=text_emb,
+                    text_pad_mask=text_pad_mask,
+                    visual_prefix=visual_prefix,
                 )
                 logits = self.lm._lm_head(hidden)
             logits = logits.float()
         else:
-            hidden = self.lm._decode_only(
-                x,
-                pad_mask=full_pad,
-                is_causal=bool(getattr(self.lm._config, "causal_lm", True)),
+            hidden, k = self._decode_hidden_with_visual_prefix(
+                text_emb=text_emb,
+                text_pad_mask=text_pad_mask,
+                visual_prefix=visual_prefix,
             )
             logits = self.lm._lm_head(hidden)
         if debug_shapes:
@@ -663,7 +806,7 @@ class MultimodalPrefixLM(nn.Module):
                 print(f"[mm:shape] visual_features={tuple(visual_features.shape)}")
             print(f"[mm:shape] visual_prefix={tuple(visual_prefix.shape)}")
             print(f"[mm:shape] text_ids={tuple(input_ids.shape)} text_emb={tuple(text_emb.shape)}")
-            print(f"[mm:shape] combined={tuple(x.shape)} logits={tuple(logits.shape)}")
+            print(f"[mm:shape] combined={(int(hidden.shape[0]), int(hidden.shape[1]), int(hidden.shape[2]))} logits={tuple(logits.shape)}")
         return logits, k
 
     def _lm_head_with_amp(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -685,6 +828,8 @@ class MultimodalPrefixLM(nn.Module):
         text_pad_mask: torch.Tensor,
         visual_prefix: torch.Tensor,
     ) -> Tuple[torch.Tensor, int, Any]:
+        if self.uses_visual_adapters:
+            raise RuntimeError("KV-cache prefill is unsupported when lm_visual_adapter_type is enabled.")
         x = torch.cat([visual_prefix, text_emb], dim=1)
         b = int(text_emb.shape[0])
         k = int(visual_prefix.shape[1])
@@ -836,7 +981,7 @@ class MultimodalPrefixLM(nn.Module):
             cached_visual_features = self.vision_adapter(images)
 
         cached_visual_prefix: Optional[torch.Tensor] = None
-        if not supports_qcond:
+        if (not supports_qcond) or prompt_conditioned:
             prompt_input_ids, prompt_text_pad_mask, prompt_mask = _pack_text_batch(prompt_ids)
             prompt_text_emb = self.lm._embed_dropout(self.lm._embed(prompt_input_ids))
             cached_visual_prefix, cached_visual_features = self._compute_visual_prefix(
@@ -849,8 +994,8 @@ class MultimodalPrefixLM(nn.Module):
 
         can_use_kv_cache = (
             bool(self.eval_use_kv_cache)
-            and
-            cached_visual_prefix is not None
+            and cached_visual_prefix is not None
+            and not self.uses_visual_adapters
             and hasattr(self.lm, "_prefill_decode_only")
             and hasattr(self.lm, "_decode_only_incremental")
             and int(max_new_tokens) > 0
@@ -1106,6 +1251,8 @@ def configure_freezing(model: MultimodalPrefixLM, args: argparse.Namespace) -> N
         p.requires_grad_(True)
     for p in model.prefix_calibrator.parameters():
         p.requires_grad_(True)
+    for p in model.visual_adapters.parameters():
+        p.requires_grad_(True)
 
     mode = str(args.freeze_mode)
     if mode == "bridge_only":
@@ -1266,9 +1413,13 @@ def build_runtime_from_args(
         "bridge_hybrid_image_bridge_type": str(args.bridge_hybrid_image_bridge_type),
         "bridge_question_conditioning": bool(args.bridge_question_conditioning),
         "bridge_qcond_scale": float(args.bridge_qcond_scale),
+        "bridge_query_bank_mode": str(args.bridge_query_bank_mode),
+        "bridge_qquery_basis_count": int(args.bridge_qquery_basis_count),
+        "bridge_qquery_scale": float(args.bridge_qquery_scale),
         "bridge_question_context_mode": str(args.bridge_question_context_mode),
         "bridge_token_selector_type": str(args.bridge_token_selector_type),
         "bridge_token_select_k": int(args.bridge_token_select_k),
+        "bridge_token_select_k_min": int(args.bridge_token_select_k_min),
         "bridge_num_roles": int(args.bridge_num_roles),
         "bridge_evidence_topk": int(args.bridge_evidence_topk),
     }
@@ -1294,6 +1445,11 @@ def build_runtime_from_args(
         prefix_dropout=float(args.prefix_dropout),
         question_context_mode=str(args.bridge_question_context_mode),
         eval_use_kv_cache=bool(getattr(args, "eval_use_kv_cache", False)),
+        lm_visual_adapter_type=str(getattr(args, "lm_visual_adapter_type", "none")),
+        lm_visual_adapter_layers=int(getattr(args, "lm_visual_adapter_layers", 0)),
+        lm_visual_adapter_num_heads=int(getattr(args, "lm_visual_adapter_num_heads", 8)),
+        lm_visual_adapter_dropout=float(getattr(args, "lm_visual_adapter_dropout", 0.0)),
+        lm_visual_adapter_gate_init=float(getattr(args, "lm_visual_adapter_gate_init", 0.5)),
     ).to(device)
     if str(vision_device) != str(device):
         model.vision_adapter.vision_model.to(vision_device)
@@ -1368,10 +1524,11 @@ def run_generation_predictions(
                 }
             )
         if int(log_every) > 0 and ((bidx + 1) % int(log_every) == 0 or (bidx == 0)):
+            elapsed = max(1e-6, float(time.time() - t0))
             msg = (
                 f"[eval:{split_name}] batch={bidx + 1}"
                 + (f"/{max_batches}" if int(max_batches) > 0 else "")
-                + f" samples={len(records)} elapsed_s={time.time() - t0:.1f}"
+                + f" samples={len(records)} elapsed_s={elapsed:.1f} steps_per_s={(float(bidx + 1) / elapsed):.2f}"
             )
             if logger is not None:
                 logger.log(msg)
@@ -1693,9 +1850,19 @@ def log_startup_config(
         f"refine={bridge_cfg.bridge_refine_layers} pre_mixer={bridge_cfg.bridge_pre_mixer_type} "
         f"hybrid_alpha_mode={bridge_cfg.bridge_hybrid_alpha_mode} "
         f"qcond={int(bool(bridge_cfg.bridge_question_conditioning))} qcond_scale={bridge_cfg.bridge_qcond_scale:.6g} "
+        f"query_bank_mode={bridge_cfg.bridge_query_bank_mode} "
+        f"qquery_basis={bridge_cfg.bridge_qquery_basis_count} qquery_scale={bridge_cfg.bridge_qquery_scale:.6g} "
         f"qctx_mode={bridge_cfg.bridge_question_context_mode} "
         f"token_selector={bridge_cfg.bridge_token_selector_type} token_select_k={bridge_cfg.bridge_token_select_k} "
+        f"token_select_k_min={bridge_cfg.bridge_token_select_k_min} "
         f"num_roles={bridge_cfg.bridge_num_roles} evidence_topk={bridge_cfg.bridge_evidence_topk}"
+    )
+    logger.log(
+        f"[mm] lm_visual_adapter_type={getattr(args, 'lm_visual_adapter_type', 'none')} "
+        f"lm_visual_adapter_layers={int(getattr(args, 'lm_visual_adapter_layers', 0))} "
+        f"lm_visual_adapter_heads={int(getattr(args, 'lm_visual_adapter_num_heads', 8))} "
+        f"lm_visual_adapter_dropout={float(getattr(args, 'lm_visual_adapter_dropout', 0.0)):.6g} "
+        f"lm_visual_adapter_gate_init={float(getattr(args, 'lm_visual_adapter_gate_init', 0.5)):.6g}"
     )
     logger.log(
         f"[mm] prefix_calibration={int(bool(args.prefix_calibration))} "
@@ -1878,6 +2045,25 @@ def parse_args() -> argparse.Namespace:
         help="Scale factor for question-conditioned FiLM modulation in perceiver latents.",
     )
     ap.add_argument(
+        "--bridge_query_bank_mode",
+        type=str,
+        default="learned",
+        choices=["learned", "question_mix"],
+        help="Use the standard learned perceiver latent bank or question-mixed query latents.",
+    )
+    ap.add_argument(
+        "--bridge_qquery_basis_count",
+        type=int,
+        default=4,
+        help="Number of learned question-query basis tensors mixed by the pooled question context.",
+    )
+    ap.add_argument(
+        "--bridge_qquery_scale",
+        type=float,
+        default=1.0,
+        help="Residual scale applied to question-mixed perceiver queries.",
+    )
+    ap.add_argument(
         "--bridge_question_context_mode",
         type=str,
         default="all_text",
@@ -1888,14 +2074,20 @@ def parse_args() -> argparse.Namespace:
         "--bridge_token_selector_type",
         type=str,
         default="none",
-        choices=["none", "topk"],
+        choices=["none", "topk", "qtopk", "qadaptive"],
         help="Optional token selector before query/cross-attention bridges.",
     )
     ap.add_argument(
         "--bridge_token_select_k",
         type=int,
         default=0,
-        help="Selected token count when --bridge_token_selector_type=topk (<=0 disables).",
+        help="Selected token count (or max token budget for qadaptive) before the bridge extractor.",
+    )
+    ap.add_argument(
+        "--bridge_token_select_k_min",
+        type=int,
+        default=0,
+        help="Minimum kept token budget for --bridge_token_selector_type=qadaptive (<=0 uses max_k/2).",
     )
     ap.add_argument("--bridge_num_roles", type=int, default=4)
     ap.add_argument("--bridge_evidence_topk", type=int, default=0)
@@ -1967,6 +2159,22 @@ def parse_args() -> argparse.Namespace:
         choices=["bridge_only", "bridge_plus_top_lm", "full_finetune"],
     )
     ap.add_argument("--train_top_lm_layers", type=int, default=1)
+    ap.add_argument(
+        "--lm_visual_adapter_type",
+        type=str,
+        default="none",
+        choices=["none", "cross_attn"],
+        help="Optional residual visual adapters inserted into the top LM blocks.",
+    )
+    ap.add_argument(
+        "--lm_visual_adapter_layers",
+        type=int,
+        default=0,
+        help="Number of top LM layers that receive residual visual adapters.",
+    )
+    ap.add_argument("--lm_visual_adapter_num_heads", type=int, default=8)
+    ap.add_argument("--lm_visual_adapter_dropout", type=float, default=0.0)
+    ap.add_argument("--lm_visual_adapter_gate_init", type=float, default=0.5)
 
     ap.add_argument("--images_root", type=str, default="images")
     ap.add_argument("--annotations_root", type=str, default="annotations")
