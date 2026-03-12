@@ -343,12 +343,61 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("cos", cos)
         self.register_buffer("sin", sin)
 
-    def _get_cos_sin(self, seq_len: int, dtype: torch.dtype, device: torch.device):
-        if seq_len > self.cos.size(1):
-            raise ValueError(f"RoPE max_len={self.cos.size(1)} is smaller than seq_len={seq_len}.")
-        cos = self.cos[:, :seq_len].to(device=device, dtype=dtype)
-        sin = self.sin[:, :seq_len].to(device=device, dtype=dtype)
+    def _get_cos_sin(self, seq_len: int, dtype: torch.dtype, device: torch.device, start_pos: int = 0):
+        start = int(start_pos)
+        end = start + int(seq_len)
+        if end > self.cos.size(1):
+            raise ValueError(f"RoPE max_len={self.cos.size(1)} is smaller than end_pos={end}.")
+        cos = self.cos[:, start:end].to(device=device, dtype=dtype)
+        sin = self.sin[:, start:end].to(device=device, dtype=dtype)
         return cos, sin
+
+    def _get_cos_sin_positions(
+        self,
+        positions: torch.Tensor,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        pos = positions.to(device=device, dtype=torch.long)
+        if pos.numel() <= 0:
+            shape = tuple(pos.shape) + (self.cos.size(-1),)
+            empty = torch.empty(shape, device=device, dtype=dtype)
+            return empty, empty
+        max_pos = int(pos.max().item())
+        if max_pos >= self.cos.size(1):
+            raise ValueError(f"RoPE max_len={self.cos.size(1)} is smaller than max_pos={max_pos}.")
+        base_cos = self.cos[0].to(device=device, dtype=dtype)
+        base_sin = self.sin[0].to(device=device, dtype=dtype)
+        flat = pos.reshape(-1)
+        cos = base_cos.index_select(0, flat).view(*pos.shape, -1)
+        sin = base_sin.index_select(0, flat).view(*pos.shape, -1)
+        return cos, sin
+
+    @staticmethod
+    def _resolve_positions(
+        batch_size: int,
+        seq_len: int,
+        *,
+        start_pos,
+        device: torch.device,
+    ) -> torch.Tensor:
+        ar = torch.arange(seq_len, device=device, dtype=torch.long)
+        if isinstance(start_pos, int):
+            return ar.unsqueeze(0).expand(batch_size, -1) + int(start_pos)
+        if not torch.is_tensor(start_pos):
+            raise TypeError(f"Unsupported start_pos type: {type(start_pos)}")
+        pos = start_pos.to(device=device, dtype=torch.long)
+        if pos.ndim == 0:
+            return ar.unsqueeze(0).expand(batch_size, -1) + int(pos.item())
+        if pos.ndim == 1:
+            if pos.numel() != int(batch_size):
+                raise ValueError(f"Expected start_pos shape [{batch_size}], got {tuple(pos.shape)}")
+            return pos.unsqueeze(1) + ar.unsqueeze(0)
+        if pos.ndim == 2:
+            if tuple(pos.shape) != (int(batch_size), int(seq_len)):
+                raise ValueError(f"Expected start_pos shape [{batch_size},{seq_len}], got {tuple(pos.shape)}")
+            return pos
+        raise ValueError(f"Unsupported start_pos rank: {pos.ndim}")
 
     def _apply_rotary(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         # Broadcast cos/sin to match x shape for arbitrary leading dims.
@@ -366,6 +415,27 @@ class RotaryEmbedding(nn.Module):
         q = self._apply_rotary(q, cos_q, sin_q)
         k = self._apply_rotary(k, cos_k, sin_k)
         return q, k
+
+    def apply_with_offset(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        *,
+        q_start_pos: int = 0,
+        k_start_pos: int = 0,
+    ):
+        q_pos = self._resolve_positions(q.size(0), q.size(1), start_pos=q_start_pos, device=q.device)
+        k_pos = self._resolve_positions(k.size(0), k.size(1), start_pos=k_start_pos, device=k.device)
+        cos_q, sin_q = self._get_cos_sin_positions(q_pos, q.dtype, q.device)
+        cos_k, sin_k = self._get_cos_sin_positions(k_pos, k.dtype, k.device)
+        q = self._apply_rotary(q, cos_q, sin_q)
+        k = self._apply_rotary(k, cos_k, sin_k)
+        return q, k
+
+    def apply_to_k(self, k: torch.Tensor, *, start_pos: int = 0) -> torch.Tensor:
+        k_pos = self._resolve_positions(k.size(0), k.size(1), start_pos=start_pos, device=k.device)
+        cos_k, sin_k = self._get_cos_sin_positions(k_pos, k.dtype, k.device)
+        return self._apply_rotary(k, cos_k, sin_k)
 
 
 class TransformerEncoderBlock(nn.Module):
@@ -620,6 +690,84 @@ class TransformerEncoderBlock(nn.Module):
         if self._resid_max_norm > 0.0:
             x = clamp_residual(x, self._resid_max_norm)
         return x
+
+    def build_kv_cache(
+        self,
+        x: torch.Tensor,
+        *,
+        rope=None,
+        start_pos: int = 0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, S, _ = x.shape
+        x = _rms_norm_last_dim(x, eps=self._rmsnorm_eps)
+        qkv = self._in_proj(x)
+        _wq, wk, wv = qkv.chunk(3, dim=-1)
+        wk = wk.view(B, S, self._num_heads, self._head_dim)
+        wv = wv.view(B, S, self._num_heads, self._head_dim)
+        if rope is not None:
+            wk = rope.apply_to_k(wk, start_pos=start_pos)
+        wk = wk.transpose(1, 2).contiguous()
+        wv = wv.transpose(1, 2).contiguous()
+        return wk, wv
+
+    def forward_incremental(
+        self,
+        x: torch.Tensor,
+        *,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        pad_mask=None,
+        q_pad_mask=None,
+        rope=None,
+        start_pos: int = 0,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        B, S, E = x.shape
+        if S != 1:
+            raise ValueError(f"forward_incremental expects S=1, got shape={tuple(x.shape)}")
+        x_residual = x
+        x = _rms_norm_last_dim(x, eps=self._rmsnorm_eps)
+        qkv = self._in_proj(x)
+        wq, wk_new, wv_new = qkv.chunk(3, dim=-1)
+        wq = wq.view(B, S, self._num_heads, self._head_dim)
+        wk_new = wk_new.view(B, S, self._num_heads, self._head_dim)
+        wv_new = wv_new.view(B, S, self._num_heads, self._head_dim)
+        if rope is not None:
+            wq, wk_new = rope.apply_with_offset(
+                wq,
+                wk_new,
+                q_start_pos=start_pos,
+                k_start_pos=start_pos,
+            )
+        wq = wq.transpose(1, 2).contiguous()
+        wk_new = wk_new.transpose(1, 2).contiguous()
+        wv_new = wv_new.transpose(1, 2).contiguous()
+        if kv_cache is not None:
+            wk_prev, wv_prev = kv_cache
+            wk = torch.cat([wk_prev, wk_new], dim=-2)
+            wv = torch.cat([wv_prev, wv_new], dim=-2)
+        else:
+            wk = wk_new
+            wv = wv_new
+        h = self._attn(
+            wq,
+            wk,
+            wv,
+            pad_mask=pad_mask,
+            q_pad_mask=q_pad_mask,
+            is_causal=False,
+        )
+        h = h.transpose(1, 2).contiguous().view(B, S, E)
+        attn_out = _apply_layerscale(self._out_proj(h), self._ls_attn)
+        x = x_residual + self._resid_dropout(attn_out)
+        if self._resid_max_norm > 0.0:
+            x = clamp_residual(x, self._resid_max_norm)
+
+        x_residual = x
+        x = _rms_norm_last_dim(x, eps=self._rmsnorm_eps)
+        mlp_out = _apply_layerscale(self._mlp(x), self._ls_mlp)
+        x = x_residual + self._mlp_dropout(mlp_out)
+        if self._resid_max_norm > 0.0:
+            x = clamp_residual(x, self._resid_max_norm)
+        return x, (wk, wv)
 
 
 class TransformerDecoderBlock(nn.Module):
@@ -1123,6 +1271,48 @@ class TransformerDecoderOnlyV1(nn.Module):
         if len(out_parts) > 1:
             return tuple(out_parts)
         return logits
+
+    def _prefill_decode_only(
+        self,
+        x: torch.Tensor,
+        pad_mask=None,
+        is_causal: bool = True,
+    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
+        layer_inputs: List[torch.Tensor] = []
+        if pad_mask is not None:
+            pad_mask = pad_mask.to(device=x.device, dtype=torch.bool)
+        for block in self._dec_blocks:
+            layer_inputs.append(x)
+            x = block(x, pad_mask=pad_mask, rope=self._rope, is_causal=is_causal)
+        kv_cache = [block.build_kv_cache(inp, rope=self._rope, start_pos=0) for block, inp in zip(self._dec_blocks, layer_inputs)]
+        return x, kv_cache
+
+    def _decode_only_incremental(
+        self,
+        x: torch.Tensor,
+        *,
+        kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
+        pad_mask=None,
+        q_pad_mask=None,
+        start_pos: int,
+    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
+        if pad_mask is not None:
+            pad_mask = pad_mask.to(device=x.device, dtype=torch.bool)
+        if q_pad_mask is not None:
+            q_pad_mask = q_pad_mask.to(device=x.device, dtype=torch.bool)
+        next_cache: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        for i, block in enumerate(self._dec_blocks):
+            layer_cache = kv_cache[i] if kv_cache is not None else None
+            x, layer_cache = block.forward_incremental(
+                x,
+                kv_cache=layer_cache,
+                pad_mask=pad_mask,
+                q_pad_mask=q_pad_mask,
+                rope=self._rope,
+                start_pos=start_pos,
+            )
+            next_cache.append(layer_cache)
+        return x, next_cache
 
 
 class TransformerV1(nn.Module):

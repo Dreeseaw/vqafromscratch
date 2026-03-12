@@ -194,6 +194,7 @@ def _apply_runtime_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "bridge_question_conditioning": False,
         "bridge_qcond_scale": 0.5,
         "bridge_question_context_mode": "all_text",
+        "eval_use_kv_cache": False,
         "bridge_token_selector_type": "none",
         "bridge_token_select_k": 0,
         "bridge_num_roles": 4,
@@ -517,6 +518,7 @@ class MultimodalPrefixLM(nn.Module):
         prefix_batchvar_reg_weight: float = 0.0,
         prefix_dropout: float = 0.0,
         question_context_mode: str = "all_text",
+        eval_use_kv_cache: bool = False,
     ):
         super().__init__()
         self.vision_adapter = vision_adapter
@@ -539,6 +541,7 @@ class MultimodalPrefixLM(nn.Module):
         self.prefix_batchvar_reg_weight = float(prefix_batchvar_reg_weight)
         self.prefix_dropout = max(0.0, float(prefix_dropout))
         self.question_context_mode = str(question_context_mode)
+        self.eval_use_kv_cache = bool(eval_use_kv_cache)
 
     def _lm_autocast_dtype(self) -> Optional[torch.dtype]:
         if not self.lm_autocast:
@@ -567,36 +570,63 @@ class MultimodalPrefixLM(nn.Module):
             return self.bridge(bridge_input, question_context=question_context)
         return self.bridge(bridge_input)
 
-    def forward_logits(
+    def _compute_question_context(
         self,
-        input_ids: torch.Tensor,
-        images: torch.Tensor,
+        text_emb: torch.Tensor,
         text_pad_mask: torch.Tensor,
         prompt_mask: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        if not bool(getattr(self.bridge, "supports_question_context", False)):
+            return None
+        if self.question_context_mode == "prompt_only" and prompt_mask is not None:
+            context_mask = prompt_mask & (~text_pad_mask)
+        else:
+            context_mask = ~text_pad_mask
+        return self._question_context_from_text(text_emb, context_mask)
+
+    def _compute_visual_prefix(
+        self,
         *,
-        debug_shapes: bool = False,
-        return_aux: bool = False,
-    ) -> Tuple[torch.Tensor, int] | Tuple[torch.Tensor, int, Dict[str, torch.Tensor]]:
-        text_emb = self.lm._embed_dropout(self.lm._embed(input_ids))
+        images: torch.Tensor,
+        text_emb: Optional[torch.Tensor] = None,
+        text_pad_mask: Optional[torch.Tensor] = None,
+        prompt_mask: Optional[torch.Tensor] = None,
+        visual_features: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         question_context: Optional[torch.Tensor] = None
-        if bool(getattr(self.bridge, "supports_question_context", False)):
-            if self.question_context_mode == "prompt_only" and prompt_mask is not None:
-                context_mask = prompt_mask & (~text_pad_mask)
-            else:
-                context_mask = ~text_pad_mask
-            question_context = self._question_context_from_text(text_emb, context_mask)
+        if text_emb is not None and text_pad_mask is not None:
+            question_context = self._compute_question_context(
+                text_emb=text_emb,
+                text_pad_mask=text_pad_mask,
+                prompt_mask=prompt_mask,
+            )
 
         needs_visual = bool(getattr(self.bridge, "requires_visual_features", True))
-        visual_features: Optional[torch.Tensor] = None
+        used_visual_features = visual_features
         if needs_visual:
-            visual_features = self.vision_adapter(images)
-            visual_prefix = self._bridge_forward(visual_features, question_context)
+            if used_visual_features is None:
+                used_visual_features = self.vision_adapter(images)
+            visual_prefix = self._bridge_forward(used_visual_features, question_context)
         else:
             # Image-agnostic bridge baselines only need batch size/device from images.
             visual_prefix = self._bridge_forward(images, question_context)
+
         visual_prefix = self.prefix_calibrator(visual_prefix)
         if self.prefix_dropout > 0.0 and self.training:
             visual_prefix = F.dropout(visual_prefix, p=self.prefix_dropout, training=True)
+        return visual_prefix, used_visual_features
+
+    def _decode_with_visual_prefix(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        text_emb: torch.Tensor,
+        text_pad_mask: torch.Tensor,
+        visual_prefix: torch.Tensor,
+        debug_shapes: bool = False,
+        visual_features: Optional[torch.Tensor] = None,
+        images: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, int]:
         x = torch.cat([visual_prefix, text_emb], dim=1)
 
         b = int(input_ids.shape[0])
@@ -625,7 +655,8 @@ class MultimodalPrefixLM(nn.Module):
             )
             logits = self.lm._lm_head(hidden)
         if debug_shapes:
-            print(f"[mm:shape] images={tuple(images.shape)}")
+            if images is not None:
+                print(f"[mm:shape] images={tuple(images.shape)}")
             if visual_features is None:
                 print("[mm:shape] visual_features=<skipped by bridge>")
             else:
@@ -633,6 +664,66 @@ class MultimodalPrefixLM(nn.Module):
             print(f"[mm:shape] visual_prefix={tuple(visual_prefix.shape)}")
             print(f"[mm:shape] text_ids={tuple(input_ids.shape)} text_emb={tuple(text_emb.shape)}")
             print(f"[mm:shape] combined={tuple(x.shape)} logits={tuple(logits.shape)}")
+        return logits, k
+
+    def _lm_head_with_amp(self, hidden: torch.Tensor) -> torch.Tensor:
+        use_lm_amp = (
+            hidden.device.type == "cuda"
+            and str(getattr(self.lm._config, "attn_impl", "sdpa")) == "sdpa"
+            and self._lm_autocast_dtype() is not None
+        )
+        if use_lm_amp:
+            with torch.autocast(device_type="cuda", dtype=self._lm_autocast_dtype(), enabled=True):
+                logits = self.lm._lm_head(hidden)
+            return logits.float()
+        return self.lm._lm_head(hidden)
+
+    def _prefill_decode_with_visual_prefix(
+        self,
+        *,
+        text_emb: torch.Tensor,
+        text_pad_mask: torch.Tensor,
+        visual_prefix: torch.Tensor,
+    ) -> Tuple[torch.Tensor, int, Any]:
+        x = torch.cat([visual_prefix, text_emb], dim=1)
+        b = int(text_emb.shape[0])
+        k = int(visual_prefix.shape[1])
+        prefix_pad = torch.zeros((b, k), dtype=torch.bool, device=text_emb.device)
+        full_pad = torch.cat([prefix_pad, text_pad_mask], dim=1)
+        hidden, kv_cache = self.lm._prefill_decode_only(
+            x,
+            pad_mask=full_pad,
+            is_causal=bool(getattr(self.lm._config, "causal_lm", True)),
+        )
+        logits = self._lm_head_with_amp(hidden)
+        return logits, k, kv_cache
+
+    def forward_logits(
+        self,
+        input_ids: torch.Tensor,
+        images: torch.Tensor,
+        text_pad_mask: torch.Tensor,
+        prompt_mask: Optional[torch.Tensor] = None,
+        *,
+        debug_shapes: bool = False,
+        return_aux: bool = False,
+    ) -> Tuple[torch.Tensor, int] | Tuple[torch.Tensor, int, Dict[str, torch.Tensor]]:
+        text_emb = self.lm._embed_dropout(self.lm._embed(input_ids))
+        visual_prefix, visual_features = self._compute_visual_prefix(
+            images=images,
+            text_emb=text_emb,
+            text_pad_mask=text_pad_mask,
+            prompt_mask=prompt_mask,
+        )
+        logits, k = self._decode_with_visual_prefix(
+            input_ids=input_ids,
+            text_emb=text_emb,
+            text_pad_mask=text_pad_mask,
+            visual_prefix=visual_prefix,
+            debug_shapes=debug_shapes,
+            visual_features=visual_features,
+            images=images,
+        )
         if not return_aux:
             return logits, k
         aux = {
@@ -709,24 +800,155 @@ class MultimodalPrefixLM(nn.Module):
         if not seqs:
             return []
 
-        for _ in range(int(max_new_tokens)):
-            max_len = max(len(s) for s in seqs)
-            input_ids = torch.full((len(seqs), max_len), int(pad_id), dtype=torch.long, device=images.device)
-            text_pad_mask = torch.ones((len(seqs), max_len), dtype=torch.bool, device=images.device)
-            prompt_mask = torch.zeros((len(seqs), max_len), dtype=torch.bool, device=images.device)
-            for i, s in enumerate(seqs):
+        device = images.device
+        legacy_prompt_conditioned = bool(
+            getattr(self.bridge, "supports_question_context", False)
+            and self.question_context_mode == "prompt_only"
+        )
+
+        def _pack_text_batch(
+            ids: Sequence[Sequence[int]],
+            *,
+            legacy_prompt_mask: bool = False,
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            max_len = max(len(s) for s in ids)
+            input_ids = torch.full((len(ids), max_len), int(pad_id), dtype=torch.long, device=device)
+            text_pad_mask = torch.ones((len(ids), max_len), dtype=torch.bool, device=device)
+            prompt_mask = torch.zeros((len(ids), max_len), dtype=torch.bool, device=device)
+            for i, s in enumerate(ids):
                 if not s:
                     continue
-                t = torch.tensor(s, dtype=torch.long, device=images.device)
-                input_ids[i, : len(s)] = t
-                text_pad_mask[i, : len(s)] = False
-                prompt_mask[i, : len(s)] = True
+                t = torch.tensor(s, dtype=torch.long, device=device)
+                seq_len = int(len(s))
+                input_ids[i, :seq_len] = t
+                text_pad_mask[i, :seq_len] = False
+                prompt_len = seq_len if legacy_prompt_mask else min(int(len(prompt_ids[i])), seq_len)
+                if prompt_len > 0:
+                    prompt_mask[i, :prompt_len] = True
+            return input_ids, text_pad_mask, prompt_mask
 
-            logits, prefix_k = self.forward_logits(
-                input_ids=input_ids,
+        needs_visual = bool(getattr(self.bridge, "requires_visual_features", True))
+        supports_qcond = bool(getattr(self.bridge, "supports_question_context", False))
+        prompt_conditioned = supports_qcond and self.question_context_mode == "prompt_only"
+
+        cached_visual_features: Optional[torch.Tensor] = None
+        if needs_visual:
+            cached_visual_features = self.vision_adapter(images)
+
+        cached_visual_prefix: Optional[torch.Tensor] = None
+        if not supports_qcond:
+            prompt_input_ids, prompt_text_pad_mask, prompt_mask = _pack_text_batch(prompt_ids)
+            prompt_text_emb = self.lm._embed_dropout(self.lm._embed(prompt_input_ids))
+            cached_visual_prefix, cached_visual_features = self._compute_visual_prefix(
                 images=images,
-                text_pad_mask=text_pad_mask,
+                text_emb=prompt_text_emb,
+                text_pad_mask=prompt_text_pad_mask,
                 prompt_mask=prompt_mask,
+                visual_features=cached_visual_features,
+            )
+
+        can_use_kv_cache = (
+            bool(self.eval_use_kv_cache)
+            and
+            cached_visual_prefix is not None
+            and hasattr(self.lm, "_prefill_decode_only")
+            and hasattr(self.lm, "_decode_only_incremental")
+            and int(max_new_tokens) > 0
+        )
+        if can_use_kv_cache:
+            assert cached_visual_prefix is not None
+            prompt_input_ids, prompt_text_pad_mask, _prompt_mask = _pack_text_batch(prompt_ids)
+            prompt_text_emb = self.lm._embed_dropout(self.lm._embed(prompt_input_ids))
+            logits, prefix_k, kv_cache = self._prefill_decode_with_visual_prefix(
+                text_emb=prompt_text_emb,
+                text_pad_mask=prompt_text_pad_mask,
+                visual_prefix=cached_visual_prefix,
+            )
+            text_logits = logits[:, prefix_k:, :]
+            generated_ids: List[List[int]] = [[] for _ in seqs]
+            done = [False for _ in seqs]
+            for i in range(len(seqs)):
+                last_pos = max(0, len(prompt_ids[i]) - 1)
+                next_id = int(torch.argmax(text_logits[i, last_pos]).item())
+                if next_id == int(eos_id):
+                    done[i] = True
+                else:
+                    seqs[i].append(next_id)
+                    generated_ids[i].append(next_id)
+
+            cache_lens = torch.tensor(
+                [int(prefix_k + len(x)) for x in prompt_ids],
+                dtype=torch.long,
+                device=device,
+            )
+            full_pad = torch.cat(
+                [
+                    torch.zeros((len(seqs), prefix_k), dtype=torch.bool, device=device),
+                    prompt_text_pad_mask,
+                ],
+                dim=1,
+            )
+            steps_done = 1
+            while steps_done < int(max_new_tokens) and not all(done):
+                step_ids: List[int] = []
+                new_key_pad: List[bool] = []
+                for i in range(len(seqs)):
+                    if done[i] or not generated_ids[i]:
+                        step_ids.append(int(pad_id))
+                        new_key_pad.append(True)
+                    else:
+                        step_ids.append(int(generated_ids[i][-1]))
+                        new_key_pad.append(False)
+                step_input_ids = torch.tensor(step_ids, dtype=torch.long, device=device).unsqueeze(1)
+                step_text_emb = self.lm._embed_dropout(self.lm._embed(step_input_ids))
+                step_q_pad = torch.tensor(new_key_pad, dtype=torch.bool, device=device).unsqueeze(1)
+                full_pad = torch.cat(
+                    [full_pad, torch.tensor(new_key_pad, dtype=torch.bool, device=device).unsqueeze(1)],
+                    dim=1,
+                )
+                hidden, kv_cache = self.lm._decode_only_incremental(
+                    step_text_emb,
+                    kv_cache=kv_cache,
+                    pad_mask=full_pad,
+                    q_pad_mask=step_q_pad,
+                    start_pos=cache_lens,
+                )
+                cache_lens = cache_lens + (~step_q_pad.squeeze(1)).long()
+                step_logits = self._lm_head_with_amp(hidden)[:, 0, :]
+                for i in range(len(seqs)):
+                    if done[i]:
+                        continue
+                    next_id = int(torch.argmax(step_logits[i]).item())
+                    if next_id == int(eos_id):
+                        done[i] = True
+                        continue
+                    seqs[i].append(next_id)
+                    generated_ids[i].append(next_id)
+                steps_done += 1
+            return generated_ids
+
+        for _ in range(int(max_new_tokens)):
+            input_ids, text_pad_mask, prompt_mask = _pack_text_batch(
+                seqs,
+                legacy_prompt_mask=legacy_prompt_conditioned,
+            )
+            text_emb = self.lm._embed_dropout(self.lm._embed(input_ids))
+
+            visual_prefix = cached_visual_prefix
+            if visual_prefix is None:
+                visual_prefix, cached_visual_features = self._compute_visual_prefix(
+                    images=images,
+                    text_emb=text_emb,
+                    text_pad_mask=text_pad_mask,
+                    prompt_mask=prompt_mask,
+                    visual_features=cached_visual_features,
+                )
+
+            logits, prefix_k = self._decode_with_visual_prefix(
+                input_ids=input_ids,
+                text_emb=text_emb,
+                text_pad_mask=text_pad_mask,
+                visual_prefix=visual_prefix,
             )
             text_logits = logits[:, prefix_k:, :]
 
@@ -1073,6 +1295,7 @@ def build_runtime_from_args(
         prefix_batchvar_reg_weight=float(args.prefix_batchvar_reg_weight),
         prefix_dropout=float(args.prefix_dropout),
         question_context_mode=str(args.bridge_question_context_mode),
+        eval_use_kv_cache=bool(getattr(args, "eval_use_kv_cache", False)),
     ).to(device)
     if str(vision_device) != str(device):
         model.vision_adapter.vision_model.to(vision_device)
@@ -1484,8 +1707,10 @@ def log_startup_config(
         f"[mm] loop epochs={args.epochs} max_steps={args.max_steps} overfit_small_batch={int(bool(args.overfit_small_batch))} "
         f"lr_schedule={args.lr_schedule} lr_warmup_steps={args.lr_warmup_steps} lr_min_ratio={args.lr_min_ratio} "
         f"train_sample_budget={int(args.train_sample_budget)} manual_max_steps={int(bool(args.manual_max_steps))} "
+        f"eval_use_kv_cache={int(bool(getattr(args, 'eval_use_kv_cache', False)))} "
         f"cuda_empty_cache_after_eval={int(bool(args.cuda_empty_cache_after_eval))} "
         f"log_every={args.log_every} eval_every={args.eval_every} eval_batches={args.eval_batches} "
+        f"final_eval_batches={args.final_eval_batches} "
         f"eval_log_every={args.eval_log_every} eval_scorer={args.eval_scorer} "
         f"fixed_eval_count={args.fixed_eval_count} ckpt_every={args.ckpt_every} "
         f"final_sanity_count={args.final_sanity_count}"
@@ -1763,7 +1988,19 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--log_every", type=int, default=20)
     ap.add_argument("--eval_every", type=int, default=500)
     ap.add_argument("--eval_batches", type=int, default=20)
+    ap.add_argument(
+        "--final_eval_batches",
+        type=int,
+        default=0,
+        help="Maximum eval batches for the end-of-training eval; <=0 means full eval split.",
+    )
     ap.add_argument("--eval_log_every", type=int, default=10)
+    ap.add_argument(
+        "--eval_use_kv_cache",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use incremental LM KV-cache during eval generation when the visual prefix is decode-invariant.",
+    )
     ap.add_argument(
         "--cuda_empty_cache_after_eval",
         action=argparse.BooleanOptionalAction,
@@ -2269,7 +2506,7 @@ def main() -> None:
         tokenizer=tokenizer,
         device=device,
         max_answer_length=int(args.max_answer_length),
-        max_batches=int(args.eval_batches),
+        max_batches=int(args.final_eval_batches),
         debug_shapes=False,
         logger=logger,
         split_name=args.eval_split,
