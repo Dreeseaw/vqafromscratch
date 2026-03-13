@@ -16,6 +16,7 @@ type RunSummary = {
   trainableParams: number | null;
   isActive: boolean;
   hasFinalCheckpoint: boolean;
+  isEvalOnly: boolean;
   logfile: string | null;
   logfileMtimeMs: number | null;
 };
@@ -547,6 +548,7 @@ function parseRunSummary(task: TaskContext, runId: string): RunSummary {
     trainableParams: null,
     isActive: false,
     hasFinalCheckpoint: false,
+    isEvalOnly: false,
     logfile: null,
     logfileMtimeMs: null,
   };
@@ -562,13 +564,14 @@ function parseRunSummary(task: TaskContext, runId: string): RunSummary {
   out.numParams = parsed.numParams;
   out.trainableParams = parsed.trainableParams;
   out.hasFinalCheckpoint = parsed.hasFinalCheckpoint;
+  out.isEvalOnly = parsed.isEvalOnly;
   return out;
 }
 
 function parseRunDetail(task: TaskContext, runId: string): RunDetail | null {
   const parsed = parseRunLog(path.join(task.logsRoot, runId));
   const run = parseRunSummary(task, runId);
-  if (run.lastStep === null) return null;
+  if (!run.logfile) return null;
 
   return {
     run,
@@ -615,9 +618,14 @@ function mergeRunState(base: RunSummary, other: RunSummary): RunSummary {
   return {
     ...preferred,
     isActive: base.isActive || other.isActive,
+    isEvalOnly: preferred.isEvalOnly || base.isEvalOnly || other.isEvalOnly,
     trainableParams: preferred.trainableParams ?? base.trainableParams ?? other.trainableParams,
     numParams: preferred.numParams ?? base.numParams ?? other.numParams,
   };
+}
+
+function shouldIncludeRun(run: RunSummary): boolean {
+  return run.lastStep !== null || run.finalAccuracy !== null || run.bestAccuracy !== null || run.isEvalOnly;
 }
 
 function parseSweep(task: TaskContext, sweepDirName: string, isSymlink: boolean, mtimeMs: number): ParsedSweepSummary | null {
@@ -659,7 +667,7 @@ function parseSweep(task: TaskContext, sweepDirName: string, isSymlink: boolean,
     return run;
   });
   const activeRuns = parsedRuns.filter((run) => run.isActive).length;
-  const runs = parsedRuns.filter((run) => run.lastStep !== null);
+  const runs = parsedRuns.filter(shouldIncludeRun);
   const allAcc = runs.map((run) => run.bestAccuracy).filter((value): value is number => Number.isFinite(value));
   const ceVals = runs.map((run) => run.lastTrainCe).filter((value): value is number => Number.isFinite(value));
   const startLine = lines.find((line) => /\bSTART\b/.test(line)) ?? lines[0] ?? "";
@@ -798,7 +806,7 @@ function getBootstrap(task: TaskContext) {
     for (const runId of doc.runRefs) {
       if (runMap.has(runId)) continue;
       const run = parseRunSummary(task, runId);
-      if (run.lastStep !== null) runMap.set(runId, run);
+      if (shouldIncludeRun(run)) runMap.set(runId, run);
     }
   }
   const allRuns = [...runMap.values()];
@@ -1384,7 +1392,7 @@ function resolveRunId(task: TaskContext, runId: string | null): string | null {
 }
 
 function formatRunForQa(run: RunSummary): string {
-  return `${run.runId}: final_acc=${fmtAcc(run.finalAccuracy)} best_acc=${fmtAcc(run.bestAccuracy)} last_train_ce=${fmtAcc(run.lastTrainCe)} last_step=${fmtNum(run.lastStep)} active=${run.isActive ? "yes" : "no"} params=${fmtNum(run.numParams)}`;
+  return `${run.runId}: final_acc=${fmtAcc(run.finalAccuracy)} best_acc=${fmtAcc(run.bestAccuracy)} last_train_ce=${fmtAcc(run.lastTrainCe)} last_step=${fmtNum(run.lastStep)} active=${run.isActive ? "yes" : "no"} eval_only=${run.isEvalOnly ? "yes" : "no"} params=${fmtNum(run.numParams)}`;
 }
 
 function formatSweepForQa(sweep: SweepSummary): string {

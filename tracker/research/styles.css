@@ -385,6 +385,19 @@ tr:hover td {
   background: var(--table-selected);
 }
 
+.run-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  margin-top: 6px;
+  padding: 0 8px;
+  border: 1px solid rgba(45, 108, 118, 0.24);
+  border-radius: 999px;
+  background: rgba(45, 108, 118, 0.12);
+  color: var(--accent-strong);
+  font-size: 11px;
+}
+
 select {
   min-height: 40px;
   padding: 0 38px 0 12px;
@@ -1180,6 +1193,13 @@ textarea {
   gap: 6px;
 }
 
+.doc-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
 #docTitle {
   font-size: clamp(1.35rem, 2vw, 1.85rem);
   letter-spacing: -0.03em;
@@ -1189,7 +1209,8 @@ textarea {
   margin-top: 0;
 }
 
-#docHome {
+#docHome,
+#docDownload {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1205,7 +1226,8 @@ textarea {
   font-weight: 700;
 }
 
-#docHome:hover {
+#docHome:hover,
+#docDownload:hover {
   transform: translateY(-1px);
   background: var(--accent-strong);
   border-color: var(--accent-strong);

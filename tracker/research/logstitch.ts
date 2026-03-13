@@ -27,6 +27,7 @@ export type ParsedRunLogData = {
   numParams: number | null;
   trainableParams: number | null;
   hasFinalCheckpoint: boolean;
+  isEvalOnly: boolean;
   trainCeSeries: SeriesPoint[];
   valAccuracySeries: SeriesPoint[];
   valStepsPerSecSeries: SeriesPoint[];
@@ -198,6 +199,7 @@ export function parseRunLog(runDir: string, options: { introLineCount?: number; 
     numParams: null,
     trainableParams: null,
     hasFinalCheckpoint: false,
+    isEvalOnly: false,
     trainCeSeries: [],
     valAccuracySeries: [],
     valStepsPerSecSeries: [],
@@ -220,6 +222,9 @@ export function parseRunLog(runDir: string, options: { introLineCount?: number; 
   let numParams: number | null = null;
   let trainableParams: number | null = null;
   let hasFinalCheckpoint = false;
+  let isEvalOnly = false;
+  let lastEvalStepSeen: number | null = null;
+  let lastEvalRateSeen: number | null = null;
   let evalOrder = 0;
 
   for (const segment of segments) {
@@ -231,6 +236,7 @@ export function parseRunLog(runDir: string, options: { introLineCount?: number; 
     const totalParamsMatch = text.match(/\btotal_params=([\d,]+)/i) ?? text.match(/\bTotal params:\s*([\d,]+)/i);
     if (totalParamsMatch) numParams = Number(totalParamsMatch[1].replaceAll(",", ""));
     if (/\[mm\]\s+final checkpoint:\s+/m.test(text)) hasFinalCheckpoint = true;
+    if (/\beval_only=1\b/i.test(text) || /\btag=eval_only(?:_|$)/i.test(text)) isEvalOnly = true;
 
     let lastStepSeen: number | null = segment.resumeStep > 0 ? segment.resumeStep : null;
     let pendingEval: EvalBlock | null = null;
@@ -292,6 +298,8 @@ export function parseRunLog(runDir: string, options: { introLineCount?: number; 
         pendingEval.maxBatch = Math.max(pendingEval.maxBatch ?? 0, currentBatch);
         if (Number.isFinite(totalBatches) && totalBatches > 0) pendingEval.totalBatches = totalBatches;
         if (Number.isFinite(elapsed) && elapsed > 0) pendingEval.batchesPerSec = currentBatch / elapsed;
+        lastEvalStepSeen = pendingEval.step ?? lastEvalStepSeen;
+        if (Number.isFinite(pendingEval.batchesPerSec ?? NaN)) lastEvalRateSeen = pendingEval.batchesPerSec;
         continue;
       }
 
@@ -346,6 +354,8 @@ export function parseRunLog(runDir: string, options: { introLineCount?: number; 
     .sort((a, b) => a[0] - b[0])
     .map(([step, value]) => ({ step, value }));
   const lastTrainPoint = trainEntries.at(-1) ?? null;
+  const lastEvalAccPoint = valAccuracySeries.at(-1) ?? null;
+  const lastEvalRatePoint = valStepsPerSecSeries.at(-1) ?? null;
 
   return {
     logfile: latestSegment?.file ?? null,
@@ -355,11 +365,12 @@ export function parseRunLog(runDir: string, options: { introLineCount?: number; 
     finalAccuracy: finalEval?.accuracy ?? null,
     bestAccuracy,
     lastTrainCe: lastTrainPoint?.[1].ce ?? null,
-    lastStep: lastTrainPoint?.[0] ?? null,
-    lastStepsPerSec: lastTrainPoint?.[1].stepsPerSec ?? null,
+    lastStep: lastTrainPoint?.[0] ?? lastEvalAccPoint?.step ?? lastEvalRatePoint?.step ?? lastEvalStepSeen ?? null,
+    lastStepsPerSec: lastTrainPoint?.[1].stepsPerSec ?? lastEvalRateSeen,
     numParams,
     trainableParams,
     hasFinalCheckpoint,
+    isEvalOnly,
     trainCeSeries,
     valAccuracySeries,
     valStepsPerSecSeries,

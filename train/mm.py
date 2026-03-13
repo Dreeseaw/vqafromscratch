@@ -196,6 +196,7 @@ def _apply_runtime_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "bridge_query_bank_mode": "learned",
         "bridge_qquery_basis_count": 4,
         "bridge_qquery_scale": 1.0,
+        "bridge_query_role_specialization": False,
         "bridge_question_context_mode": "all_text",
         "eval_use_kv_cache": False,
         "eval_kv_cache_mode": "batched",
@@ -230,6 +231,8 @@ def _apply_runtime_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "max_text_tokens": 256,
         "batch_size": 16,
         "eval_batch_size": 0,
+        "eval_image_corruption": "none",
+        "eval_image_corruption_seed": 123,
         "num_workers": 2,
         "prefetch_factor": 2,
         "pin_memory": True,
@@ -671,24 +674,40 @@ class MultimodalPrefixLM(nn.Module):
         self,
         bridge_input: torch.Tensor,
         question_context: Optional[torch.Tensor],
+        question_tokens: Optional[torch.Tensor] = None,
+        question_token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if bool(getattr(self.bridge, "supports_question_context", False)):
-            return self.bridge(bridge_input, question_context=question_context)
+        if bool(getattr(self.bridge, "supports_question_context", False)) or bool(
+            getattr(self.bridge, "supports_question_tokens", False)
+        ):
+            return self.bridge(
+                bridge_input,
+                question_context=question_context,
+                question_tokens=question_tokens,
+                question_token_mask=question_token_mask,
+            )
         return self.bridge(bridge_input)
 
-    def _compute_question_context(
+    def _compute_question_views(
         self,
         text_emb: torch.Tensor,
         text_pad_mask: torch.Tensor,
         prompt_mask: Optional[torch.Tensor] = None,
-    ) -> Optional[torch.Tensor]:
-        if not bool(getattr(self.bridge, "supports_question_context", False)):
-            return None
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        supports_qctx = bool(getattr(self.bridge, "supports_question_context", False))
+        supports_qtokens = bool(getattr(self.bridge, "supports_question_tokens", False))
+        if not supports_qctx and not supports_qtokens:
+            return None, None, None
         if self.question_context_mode == "prompt_only" and prompt_mask is not None:
             context_mask = prompt_mask & (~text_pad_mask)
         else:
             context_mask = ~text_pad_mask
-        return self._question_context_from_text(text_emb, context_mask)
+        question_context = None
+        if supports_qctx:
+            question_context = self._question_context_from_text(text_emb, context_mask)
+        question_tokens = text_emb if supports_qtokens else None
+        question_token_mask = context_mask if supports_qtokens else None
+        return question_context, question_tokens, question_token_mask
 
     def _adapter_query_keep_mask(
         self,
@@ -710,8 +729,10 @@ class MultimodalPrefixLM(nn.Module):
         visual_features: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         question_context: Optional[torch.Tensor] = None
+        question_tokens: Optional[torch.Tensor] = None
+        question_token_mask: Optional[torch.Tensor] = None
         if text_emb is not None and text_pad_mask is not None:
-            question_context = self._compute_question_context(
+            question_context, question_tokens, question_token_mask = self._compute_question_views(
                 text_emb=text_emb,
                 text_pad_mask=text_pad_mask,
                 prompt_mask=prompt_mask,
@@ -722,10 +743,20 @@ class MultimodalPrefixLM(nn.Module):
         if needs_visual:
             if used_visual_features is None:
                 used_visual_features = self.vision_adapter(images)
-            visual_prefix = self._bridge_forward(used_visual_features, question_context)
+            visual_prefix = self._bridge_forward(
+                used_visual_features,
+                question_context,
+                question_tokens=question_tokens,
+                question_token_mask=question_token_mask,
+            )
         else:
             # Image-agnostic bridge baselines only need batch size/device from images.
-            visual_prefix = self._bridge_forward(images, question_context)
+            visual_prefix = self._bridge_forward(
+                images,
+                question_context,
+                question_tokens=question_tokens,
+                question_token_mask=question_token_mask,
+            )
 
         visual_prefix = self.prefix_calibrator(visual_prefix)
         if self.prefix_dropout > 0.0 and self.training:
@@ -1415,6 +1446,11 @@ def build_loader(
         if 0.0 < eval_fraction < 1.0:
             keep = max(1, int(math.ceil(float(len(ds)) * eval_fraction)))
             ds.items = ds.items[:keep]
+    if not train_mode:
+        ds.set_image_corruption(
+            str(getattr(args, "eval_image_corruption", "none")),
+            seed=int(getattr(args, "eval_image_corruption_seed", 123)),
+        )
     collator = QACollator(
         tokenizer=tokenizer,
         max_q=args.max_question_length,
@@ -1623,6 +1659,7 @@ def build_runtime_from_args(
         "bridge_query_bank_mode": str(args.bridge_query_bank_mode),
         "bridge_qquery_basis_count": int(args.bridge_qquery_basis_count),
         "bridge_qquery_scale": float(args.bridge_qquery_scale),
+        "bridge_query_role_specialization": bool(args.bridge_query_role_specialization),
         "bridge_question_context_mode": str(args.bridge_question_context_mode),
         "bridge_token_selector_type": str(args.bridge_token_selector_type),
         "bridge_token_select_k": int(args.bridge_token_select_k),
@@ -2060,6 +2097,7 @@ def log_startup_config(
         f"qcond={int(bool(bridge_cfg.bridge_question_conditioning))} qcond_scale={bridge_cfg.bridge_qcond_scale:.6g} "
         f"query_bank_mode={bridge_cfg.bridge_query_bank_mode} "
         f"qquery_basis={bridge_cfg.bridge_qquery_basis_count} qquery_scale={bridge_cfg.bridge_qquery_scale:.6g} "
+        f"qquery_role_specialization={int(bool(getattr(bridge_cfg, 'bridge_query_role_specialization', False)))} "
         f"qctx_mode={bridge_cfg.bridge_question_context_mode} "
         f"token_selector={bridge_cfg.bridge_token_selector_type} token_select_k={bridge_cfg.bridge_token_select_k} "
         f"token_select_k_min={bridge_cfg.bridge_token_select_k_min} "
@@ -2071,6 +2109,10 @@ def log_startup_config(
         f"lm_visual_adapter_heads={int(getattr(args, 'lm_visual_adapter_num_heads', 8))} "
         f"lm_visual_adapter_dropout={float(getattr(args, 'lm_visual_adapter_dropout', 0.0)):.6g} "
         f"lm_visual_adapter_gate_init={float(getattr(args, 'lm_visual_adapter_gate_init', 0.5)):.6g}"
+    )
+    logger.log(
+        f"[mm] eval_image_corruption={str(getattr(args, 'eval_image_corruption', 'none'))} "
+        f"eval_image_corruption_seed={int(getattr(args, 'eval_image_corruption_seed', 123))}"
     )
     logger.log(
         f"[mm] prefix_calibration={int(bool(args.prefix_calibration))} "
@@ -2259,8 +2301,11 @@ def parse_args() -> argparse.Namespace:
         "--bridge_query_bank_mode",
         type=str,
         default="learned",
-        choices=["learned", "question_mix"],
-        help="Use the standard learned perceiver latent bank or question-mixed query latents.",
+        choices=["learned", "question_mix", "question_hidden_mean", "question_hidden_attn"],
+        help=(
+            "Use the standard learned perceiver latent bank, question-mixed query latents, "
+            "mean-projected question-token latents, or attention-derived question-token latents."
+        ),
     )
     ap.add_argument(
         "--bridge_qquery_basis_count",
@@ -2273,6 +2318,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Residual scale applied to question-mixed perceiver queries.",
+    )
+    ap.add_argument(
+        "--bridge_query_role_specialization",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Add learned role-specialization embeddings to perceiver query slots.",
     )
     ap.add_argument(
         "--bridge_question_context_mode",
@@ -2404,6 +2455,19 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Eval dataloader batch size. <=0 reuses --batch_size.",
+    )
+    ap.add_argument(
+        "--eval_image_corruption",
+        type=str,
+        default="none",
+        choices=["none", "zero", "shuffle", "random_swap"],
+        help="Optional eval-only image corruption mode for grounding diagnostics.",
+    )
+    ap.add_argument(
+        "--eval_image_corruption_seed",
+        type=int,
+        default=123,
+        help="Seed for eval image corruption modes that require a randomized image remap.",
     )
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--max_steps", type=int, default=0)

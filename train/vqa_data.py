@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import zipfile
 from collections import Counter
@@ -301,6 +302,8 @@ class VQAv2Dataset(Dataset):
         self.annotations_root = annotations_root
         self.split = split
         self.transform = transform or build_image_transform(train_mode=(split == "train"))
+        self.image_corruption_mode = "none"
+        self._corruption_indices: Optional[List[int]] = None
 
         q_path = resolve_question_file(annotations_root, split)
         with open(q_path, "r", encoding="utf-8") as f:
@@ -375,13 +378,47 @@ class VQAv2Dataset(Dataset):
             items = items[: int(limit)]
         self.items = items
 
+    def set_image_corruption(self, mode: str = "none", *, seed: int = 0) -> None:
+        mode = str(mode or "none")
+        if mode not in ("none", "zero", "shuffle", "random_swap"):
+            raise ValueError(
+                f"Unsupported image_corruption_mode={mode}. Supported: none, zero, shuffle, random_swap"
+            )
+        self.image_corruption_mode = mode
+        self._corruption_indices = None
+        n = len(self.items)
+        if n <= 0 or mode in ("none", "zero"):
+            return
+        if mode == "shuffle":
+            if n == 1:
+                self._corruption_indices = [0]
+            else:
+                self._corruption_indices = [((i + 1) % n) for i in range(n)]
+            return
+        idxs = list(range(n))
+        if n == 1:
+            self._corruption_indices = idxs
+            return
+        rng = random.Random(int(seed))
+        rng.shuffle(idxs)
+        for i in range(n):
+            if idxs[i] == i:
+                j = (i + 1) % n
+                idxs[i], idxs[j] = idxs[j], idxs[i]
+        self._corruption_indices = idxs
+
     def __len__(self) -> int:
         return len(self.items)
 
     def __getitem__(self, idx: int) -> dict:
         item = self.items[idx]
-        img = Image.open(item["image_path"]).convert("RGB")
+        source_item = item
+        if self._corruption_indices is not None:
+            source_item = self.items[self._corruption_indices[idx]]
+        img = Image.open(source_item["image_path"]).convert("RGB")
         img_t = self.transform(img)
+        if self.image_corruption_mode == "zero":
+            img_t = torch.zeros_like(img_t)
         return {
             "image": img_t,
             "question": item["question"],

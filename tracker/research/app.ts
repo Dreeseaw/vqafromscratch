@@ -12,6 +12,7 @@ type RunSummary = {
   trainableParams: number | null;
   isActive: boolean;
   hasFinalCheckpoint: boolean;
+  isEvalOnly: boolean;
   logfile: string | null;
 };
 
@@ -1305,7 +1306,7 @@ function renderRuns(data: Bootstrap) {
     const tr = document.createElement("tr");
     tr.className = run.runId === selectedRunId ? "is-selected clickable-row" : "clickable-row";
     tr.innerHTML = `
-      <td><code>${run.runId}</code></td>
+      <td><code>${run.runId}</code>${run.isEvalOnly ? '<div><span class="run-badge mono">Eval-only</span></div>' : ""}</td>
       <td>${fmtAcc(run.finalAccuracy)}</td>
       <td>${fmtAcc(run.lastTrainCe)}</td>
       <td>${fmtNum(run.lastStep)}</td>
@@ -1554,7 +1555,7 @@ function renderRunDetail(detail: RunDetail) {
   const summary = document.createElement("div");
   summary.className = "detail-grid";
   const cards = [
-    ["Status", detail.run.isActive ? "active" : detail.run.hasFinalCheckpoint ? "finished" : "idle"],
+    ["Status", detail.run.isActive ? "active" : detail.run.isEvalOnly ? "eval-only" : detail.run.hasFinalCheckpoint ? "finished" : "idle"],
     ["Updated", fmtDateTime(detail.updatedAt, "full")],
     ["Final Acc", fmtAcc(detail.run.finalAccuracy)],
     ["Best Acc", fmtAcc(detail.run.bestAccuracy)],
