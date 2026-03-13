@@ -216,6 +216,17 @@ type IdeaTreeResponse = {
   debug: IdeaGraphDebug;
 };
 
+type IdeaTreeProgressStage = "harvest" | "attachment" | "synthesis";
+
+type IdeaTreeProgressStatus = {
+  taskId: string;
+  state: "idle" | "running" | "completed" | "error";
+  activeStage: IdeaTreeProgressStage | null;
+  message: string;
+  startedAt: string | null;
+  updatedAt: string;
+};
+
 type QaMessage = {
   role: "user" | "assistant";
   content: string;
@@ -244,12 +255,35 @@ const fmtAcc = (v: number | null) => (Number.isFinite(v ?? NaN) ? (v as number).
 const fmtNum = (v: number | null) => (Number.isFinite(v ?? NaN) ? String(v) : "-");
 const fmtRate = (v: number | null) => (Number.isFinite(v ?? NaN) ? (v as number).toFixed(4) : "-");
 const fmtPct = (v: number | null) => (Number.isFinite(v ?? NaN) ? `${(v as number).toFixed(1)}%` : "-");
+const SHORT_DATE_TIME = new Intl.DateTimeFormat(undefined, {
+  month: "short",
+  day: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+});
+const FULL_DATE_TIME = new Intl.DateTimeFormat(undefined, {
+  month: "short",
+  day: "numeric",
+  year: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+});
 const fmtParams = (total: number | null, trainable: number | null) => {
   if (!Number.isFinite(total ?? NaN)) return "-";
   const totalStr = Intl.NumberFormat("en-US").format(total as number);
   if (!Number.isFinite(trainable ?? NaN) || !total || total <= 0) return totalStr;
   return `${totalStr} (${fmtPct(((trainable as number) / (total as number)) * 100)})`;
 };
+
+function fmtDateTime(value: string | null, style: "short" | "full" = "short"): string {
+  if (!value) return "-";
+  const ms = Date.parse(value);
+  if (!Number.isFinite(ms)) return value;
+  const date = new Date(ms);
+  const now = new Date();
+  const formatter = style === "full" || date.getFullYear() !== now.getFullYear() ? FULL_DATE_TIME : SHORT_DATE_TIME;
+  return formatter.format(date);
+}
 
 function escapeHtml(value: string): string {
   return value
@@ -265,6 +299,7 @@ const RUNS_PAGE_SIZE = 10;
 const DOCS_PAGE_SIZE = 5;
 const BOOTSTRAP_REFRESH_MS = 10000;
 const RUN_DETAIL_REFRESH_MS = 10000;
+const IDEA_TREE_STATUS_POLL_MS = 1000;
 const COLLAPSE_STORAGE_KEY = "researchTrackerCollapsedSections";
 
 let state: Bootstrap | null = null;
@@ -287,7 +322,11 @@ let runsSort: SortState<RunSortKey> = { key: "finalAccuracy", direction: "desc" 
 let docsSort: SortState<DocSortKey> = { key: null, direction: "asc" };
 let ideaTree: IdeaTreeResponse | null = null;
 let ideaTreeError: string | null = null;
+let ideaTreeProgress: IdeaTreeProgressStatus | null = null;
 let ideaTreeEdgeRenderFrame: number | null = null;
+let ideaTreeStatusPollTimer: number | null = null;
+let showRunLogHead = true;
+let showRunLogTail = true;
 const qaThreads = new Map<string, QaMessage[]>();
 let collapsedSections = new Set<string>();
 
@@ -305,6 +344,34 @@ function setTaskInUrl(taskId: string) {
 
 function getActiveTaskId(): string {
   return selectedTaskId || state?.selectedTask.id || "";
+}
+
+function stopIdeaTreeStatusPolling() {
+  if (ideaTreeStatusPollTimer !== null) {
+    window.clearInterval(ideaTreeStatusPollTimer);
+    ideaTreeStatusPollTimer = null;
+  }
+}
+
+async function pollIdeaTreeStatus(taskId: string) {
+  try {
+    const res = await fetch(apiUrl("/api/ideas/tree/status", { task: taskId }), { cache: "no-store" });
+    if (!res.ok) throw new Error(`idea tree status failed: ${res.status}`);
+    const status = (await res.json()) as IdeaTreeProgressStatus;
+    if (taskId !== getActiveTaskId()) return;
+    ideaTreeProgress = status;
+    if (state) renderIdeaTree(state);
+  } catch {
+    // keep existing loading UI if status polling fails
+  }
+}
+
+function startIdeaTreeStatusPolling(taskId: string) {
+  stopIdeaTreeStatusPolling();
+  void pollIdeaTreeStatus(taskId);
+  ideaTreeStatusPollTimer = window.setInterval(() => {
+    void pollIdeaTreeStatus(taskId);
+  }, IDEA_TREE_STATUS_POLL_MS);
 }
 
 function apiUrl(path: string, extra: Record<string, string> = {}): string {
@@ -373,6 +440,7 @@ function setupCollapsibles() {
 }
 
 function resetTaskScopedUi() {
+  stopIdeaTreeStatusPolling();
   selectedSweep = "__all__";
   activeOnly = false;
   sweepsPage = 0;
@@ -384,6 +452,7 @@ function resetTaskScopedUi() {
   selectedDocUpdatedAt = null;
   ideaTree = null;
   ideaTreeError = null;
+  ideaTreeProgress = null;
   $("runDetailPanel").hidden = true;
   $("docDetailPanel").hidden = true;
   $("docDetailOpen").hidden = true;
@@ -554,7 +623,7 @@ function renderHeader(data: Bootstrap) {
   document.title = `${task.title} Research Tracker`;
   $("taskTitle").textContent = task.title;
   $("taskMeta").textContent = task.description ? `${task.description} Docs: ${task.docsRoot}` : `Docs: ${task.docsRoot}`;
-  $("updatedAt").textContent = `updated: ${data.generatedAt}`;
+  $("updatedAt").textContent = `Updated ${fmtDateTime(data.generatedAt, "full")}`;
   $("docsHint").textContent = task.docsRoot;
   $("taskQaHint").textContent = `Answers use ${task.docsRoot}, ${task.scriptsRoot}, and ${task.logsRoot}.`;
 
@@ -595,80 +664,6 @@ function renderKpis(data: Bootstrap) {
       ${item.subvalue ? `<div class="kpi-subvalue mono muted">${item.subvalue}</div>` : ""}
     `;
     kpis.appendChild(div);
-  }
-}
-
-function renderHighlights(data: Bootstrap) {
-  const wrap = $("highlights");
-  wrap.innerHTML = "";
-  const bestRun = data.summary.bestRun ? data.runs.find((run) => run.runId === data.summary.bestRun?.runId) ?? null : null;
-  const latestSweep = data.sweeps[0] ?? null;
-  const latestDoc = data.docs[0] ?? null;
-  const bestAcc = data.summary.bestRun?.finalAccuracy ?? null;
-  const suspiciousRun =
-    bestAcc === null
-      ? null
-      : data.runs
-          .filter(
-            (run) =>
-              Number.isFinite(run.finalAccuracy ?? NaN) &&
-              Number.isFinite(run.lastTrainCe ?? NaN) &&
-              (run.finalAccuracy as number) < bestAcc * 0.92
-          )
-          .slice()
-          .sort((a, b) => (a.lastTrainCe ?? Number.POSITIVE_INFINITY) - (b.lastTrainCe ?? Number.POSITIVE_INFINITY))[0] ?? null;
-
-  const cards = [
-    bestRun
-      ? {
-          eyebrow: "Best Run",
-          title: bestRun.runId,
-          body: `Final acc ${fmtAcc(bestRun.finalAccuracy)} with train CE ${fmtAcc(bestRun.lastTrainCe)}.`,
-          action: "Open run",
-          onClick: () => selectRun(bestRun.runId, true),
-        }
-      : null,
-    latestSweep
-      ? {
-          eyebrow: "Freshest Sweep",
-          title: latestSweep.sweepId,
-          body: `${latestSweep.status} • ${latestSweep.runs.length} runs • best acc ${fmtAcc(latestSweep.bestAccuracy)}.`,
-          action: "Filter runs",
-          onClick: () => selectSweep(latestSweep.sweepId),
-        }
-      : null,
-    suspiciousRun
-      ? {
-          eyebrow: "Oddball",
-          title: suspiciousRun.runId,
-          body: `Low train CE ${fmtAcc(suspiciousRun.lastTrainCe)} but final acc only ${fmtAcc(suspiciousRun.finalAccuracy)}.`,
-          action: "Inspect run",
-          onClick: () => selectRun(suspiciousRun.runId, true),
-        }
-      : null,
-    latestDoc
-      ? {
-          eyebrow: "Latest Doc",
-          title: latestDoc.title,
-          body: `${latestDoc.file} • ${latestDoc.runRefs.length} run refs.`,
-          action: "Open doc",
-          onClick: () => selectDoc(latestDoc.file, true),
-        }
-      : null,
-  ].filter((card): card is { eyebrow: string; title: string; body: string; action: string; onClick: () => void } => Boolean(card));
-
-  for (const card of cards) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "highlight-card";
-    button.innerHTML = `
-      <div class="highlight-eyebrow">${card.eyebrow}</div>
-      <div class="highlight-title">${card.title}</div>
-      <div class="highlight-body">${card.body}</div>
-      <div class="highlight-action mono">${card.action}</div>
-    `;
-    button.addEventListener("click", card.onClick);
-    wrap.appendChild(button);
   }
 }
 
@@ -1057,18 +1052,62 @@ function buildIdeaTreeDebug(payload: IdeaTreeResponse): HTMLElement {
   return debug;
 }
 
+function makeIdeaTreeLoadingHtml(status: IdeaTreeProgressStatus | null): string {
+  const steps: Array<{ key: IdeaTreeProgressStage; label: string }> = [
+    { key: "harvest", label: "Harvest" },
+    { key: "attachment", label: "Attach" },
+    { key: "synthesis", label: "Synthesize" },
+  ];
+  const activeStage = status?.activeStage ?? "harvest";
+  const activeIndex = steps.findIndex((step) => step.key === activeStage);
+  const title =
+    status?.state === "error"
+      ? "Graph generation failed"
+      : status?.state === "completed"
+        ? "Graph generation complete"
+        : "Generating graph";
+  const copy =
+    status?.message ??
+    "Harvesting candidates, attaching evidence, and assembling the final structure.";
+
+  return `
+    <div class="idea-tree-empty idea-tree-loading" aria-live="polite">
+      <div class="idea-tree-loading-head">
+        <div class="idea-tree-loading-spinner" aria-hidden="true"></div>
+        <div>
+          <div class="idea-tree-loading-title">${escapeHtml(title)}</div>
+          <div class="idea-tree-loading-copy muted">${escapeHtml(copy)}</div>
+        </div>
+      </div>
+      <div class="idea-tree-loading-steps mono">
+        ${steps
+          .map((step, index) => {
+            const classNames = ["idea-tree-loading-step"];
+            if (status?.state === "completed" || index < activeIndex) classNames.push("is-complete");
+            if (status?.state === "running" && index === activeIndex) classNames.push("is-active");
+            if (status?.state === "error" && index === activeIndex) classNames.push("is-error");
+            return `<span class="${classNames.join(" ")}">${step.label}</span>`;
+          })
+          .join("")}
+      </div>
+    </div>
+  `;
+}
+
 function renderIdeaTree(data: Bootstrap) {
   if (ideaTree && ideaTree.taskId !== data.selectedTask.id) {
     ideaTree = null;
     ideaTreeError = null;
   }
+  if (ideaTreeProgress && ideaTreeProgress.taskId !== data.selectedTask.id) ideaTreeProgress = null;
   const meta = $("ideaTreeMeta");
   const body = $("ideaTreeBody");
   const generateBtn = $("ideaTreeGenerate") as HTMLButtonElement;
   generateBtn.disabled = ideaTreeLoadInFlight;
+  generateBtn.textContent = ideaTreeLoadInFlight ? "Generating..." : "Generate Graph";
 
   if (ideaTreeLoadInFlight) {
-    meta.textContent = "generating graph...";
+    meta.textContent = ideaTreeProgress ? ideaTreeProgress.message : "generating graph...";
     meta.title = "";
   } else if (ideaTreeError) {
     meta.textContent = `error: ${ideaTreeError}`;
@@ -1082,7 +1121,7 @@ function renderIdeaTree(data: Bootstrap) {
   }
 
   if (ideaTreeLoadInFlight && !ideaTree) {
-    body.innerHTML = `<div class="idea-tree-empty muted">Generating a multi-stage semantic graph from the full task corpus...</div>`;
+    body.innerHTML = makeIdeaTreeLoadingHtml(ideaTreeProgress);
     return;
   }
   if (ideaTreeError && !ideaTree) {
@@ -1128,20 +1167,27 @@ function renderIdeaTreeEdges() {
     const fromNode = nodesById.get(edge.fromId);
     const toNode = nodesById.get(edge.toId);
     if (!fromEl || !toEl || !fromNode || !toNode) continue;
+    const fromAssignment = layout.assignments.get(edge.fromId);
+    const toAssignment = layout.assignments.get(edge.toId);
     const fromRect = fromEl.getBoundingClientRect();
     const toRect = toEl.getBoundingClientRect();
-    const startX = fromRect.left - shellRect.left + fromRect.width / 2;
-    const startY = fromRect.top - shellRect.top + fromRect.height;
-    const endX = toRect.left - shellRect.left + toRect.width / 2;
-    const endY = toRect.top - shellRect.top;
-    const controlY = startY + Math.max(30, (endY - startY) / 2);
-    const d = `M ${startX} ${startY} C ${startX} ${controlY} ${endX} ${Math.max(startY + 24, endY - 24)} ${endX} ${endY}`;
+    const shouldFlip =
+      (fromAssignment?.depth ?? Number.POSITIVE_INFINITY) > (toAssignment?.depth ?? Number.POSITIVE_INFINITY) ||
+      ((fromAssignment?.depth ?? 0) === (toAssignment?.depth ?? 0) && fromRect.top > toRect.top);
+    const sourceRect = shouldFlip ? toRect : fromRect;
+    const targetRect = shouldFlip ? fromRect : toRect;
+    const startX = sourceRect.left - shellRect.left + sourceRect.width / 2;
+    const startY = sourceRect.bottom - shellRect.top;
+    const endX = targetRect.left - shellRect.left + targetRect.width / 2;
+    const endY = targetRect.top - shellRect.top;
+    const curveY = Math.max(28, Math.abs(endY - startY) / 2);
+    const startControlY = startY + curveY;
+    const endControlY = endY - curveY;
+    const d = `M ${startX} ${startY} C ${startX} ${startControlY} ${endX} ${endControlY} ${endX} ${endY}`;
 
     const visiblePath = document.createElementNS("http://www.w3.org/2000/svg", "path");
     visiblePath.setAttribute("class", "idea-edge-visible");
     visiblePath.setAttribute("d", d);
-    const fromAssignment = layout.assignments.get(edge.fromId);
-    const toAssignment = layout.assignments.get(edge.toId);
     const isCrossLink =
       (fromAssignment?.anchorId ?? edge.fromId) !== (toAssignment?.anchorId ?? edge.toId) ||
       (toAssignment?.depth ?? 0) <= (fromAssignment?.depth ?? -1);
@@ -1196,8 +1242,8 @@ function renderSweeps(data: Bootstrap) {
       <td>${sweep.runs.length}</td>
       <td>${fmtAcc(sweep.bestAccuracy)}</td>
       <td>${fmtAcc(sweep.lastTrainCe)}</td>
-      <td>${sweep.startedAt ?? "-"}</td>
-      <td>${sweep.endedAt ?? "-"}</td>
+      <td>${fmtDateTime(sweep.startedAt)}</td>
+      <td>${fmtDateTime(sweep.endedAt)}</td>
     `;
     tr.addEventListener("click", () => {
       selectSweep(sweep.sweepId);
@@ -1300,7 +1346,7 @@ function renderDocs(data: Bootstrap) {
         <strong>${doc.title}</strong><br />
         <span class="mono muted">${doc.file}</span>
       </td>
-      <td class="mono">${doc.updatedAt}</td>
+      <td class="mono">${fmtDateTime(doc.updatedAt)}</td>
       <td>${doc.runRefs.length}</td>
       <td>${topAcc}</td>
     `;
@@ -1354,7 +1400,12 @@ function renderTaskQa(data: Bootstrap) {
       bubble.className = `qa-message qa-${message.role}${message.pending ? " is-pending" : ""}${message.error ? " is-error" : ""}`;
       const meta = document.createElement("div");
       meta.className = "qa-meta mono muted";
-      meta.textContent = message.role === "user" ? "You" : message.pending ? "Agent thinking..." : `Agent${message.generatedAt ? ` • ${message.generatedAt}` : ""}`;
+      meta.textContent =
+        message.role === "user"
+          ? `You${message.generatedAt ? ` • ${fmtDateTime(message.generatedAt)}` : ""}`
+          : message.pending
+            ? "Agent thinking..."
+            : `Agent${message.generatedAt ? ` • ${fmtDateTime(message.generatedAt)}` : ""}`;
       const body = document.createElement("div");
       body.className = "qa-content";
       body.textContent = message.content;
@@ -1378,7 +1429,6 @@ function renderAll(data: Bootstrap) {
   renderHeader(data);
   renderSortButtons();
   renderKpis(data);
-  renderHighlights(data);
   renderIdeaTree(data);
   renderTaskQa(data);
   renderSweeps(data);
@@ -1393,7 +1443,16 @@ async function loadIdeaTree(scrollIntoView: boolean) {
   if (!taskId || ideaTreeLoadInFlight) return;
   ideaTreeLoadInFlight = true;
   ideaTreeError = null;
+  ideaTreeProgress = {
+    taskId,
+    state: "running",
+    activeStage: "harvest",
+    message: "Starting graph generation...",
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
   openSection("ideaTreeSection");
+  startIdeaTreeStatusPolling(taskId);
   if (state) renderIdeaTree(state);
   try {
     const res = await fetch("/api/ideas/tree", {
@@ -1408,14 +1467,24 @@ async function loadIdeaTree(scrollIntoView: boolean) {
     if (taskId !== getActiveTaskId()) return;
     ideaTree = body as IdeaTreeResponse;
     ideaTreeError = null;
+    ideaTreeProgress = null;
     if (state) renderIdeaTree(state);
     if (scrollIntoView) $("ideaTreeSection").scrollIntoView({ behavior: "smooth", block: "start" });
   } catch (error) {
     if (taskId !== getActiveTaskId()) return;
     ideaTree = null;
     ideaTreeError = String(error);
+    ideaTreeProgress = {
+      taskId,
+      state: "error",
+      activeStage: ideaTreeProgress?.activeStage ?? null,
+      message: String(error),
+      startedAt: ideaTreeProgress?.startedAt ?? new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
     if (state) renderIdeaTree(state);
   } finally {
+    stopIdeaTreeStatusPolling();
     ideaTreeLoadInFlight = false;
     if (state && state.selectedTask.id === taskId) renderIdeaTree(state);
   }
@@ -1486,7 +1555,7 @@ function renderRunDetail(detail: RunDetail) {
   summary.className = "detail-grid";
   const cards = [
     ["Status", detail.run.isActive ? "active" : detail.run.hasFinalCheckpoint ? "finished" : "idle"],
-    ["Updated", detail.updatedAt ?? "-"],
+    ["Updated", fmtDateTime(detail.updatedAt, "full")],
     ["Final Acc", fmtAcc(detail.run.finalAccuracy)],
     ["Best Acc", fmtAcc(detail.run.bestAccuracy)],
     ["Last Train CE", fmtAcc(detail.run.lastTrainCe)],
@@ -1510,7 +1579,21 @@ function renderRunDetail(detail: RunDetail) {
   if (detail.valAccuracySeries.length > 0) charts.appendChild(makeChartCard("Val Acc", detail.valAccuracySeries, "acc"));
   body.appendChild(charts);
 
-  if (detail.introLines.length > 0) {
+  if (detail.introLines.length > 0 || detail.tailLines.length > 0) {
+    const toggles = document.createElement("div");
+    toggles.className = "detail-toggle-row";
+    if (detail.introLines.length > 0) toggles.appendChild(makeRunLogToggle("Show log head", showRunLogHead, (checked) => {
+      showRunLogHead = checked;
+      if (runDetail) renderRunDetail(runDetail);
+    }));
+    if (detail.tailLines.length > 0) toggles.appendChild(makeRunLogToggle("Show log tail", showRunLogTail, (checked) => {
+      showRunLogTail = checked;
+      if (runDetail) renderRunDetail(runDetail);
+    }));
+    body.appendChild(toggles);
+  }
+
+  if (detail.introLines.length > 0 && showRunLogHead) {
     const introWrap = document.createElement("div");
     introWrap.className = "detail-tail";
     introWrap.innerHTML = `<div class="detail-section-title">Log Start</div>`;
@@ -1521,7 +1604,7 @@ function renderRunDetail(detail: RunDetail) {
     body.appendChild(introWrap);
   }
 
-  if (detail.tailLines.length > 0) {
+  if (detail.tailLines.length > 0 && showRunLogTail) {
     const tailWrap = document.createElement("div");
     tailWrap.className = "detail-tail";
     tailWrap.innerHTML = `<div class="detail-section-title">Log Tail</div>`;
@@ -1531,6 +1614,20 @@ function renderRunDetail(detail: RunDetail) {
     tailWrap.appendChild(pre);
     body.appendChild(tailWrap);
   }
+}
+
+function makeRunLogToggle(label: string, checked: boolean, onChange: (checked: boolean) => void): HTMLElement {
+  const wrap = document.createElement("label");
+  wrap.className = "detail-toggle";
+  const input = document.createElement("input");
+  input.type = "checkbox";
+  input.checked = checked;
+  input.addEventListener("change", () => onChange(input.checked));
+  const text = document.createElement("span");
+  text.textContent = label;
+  wrap.appendChild(input);
+  wrap.appendChild(text);
+  return wrap;
 }
 
 function makeChartCard(title: string, points: SeriesPoint[], kind: "acc" | "ce" | "rate") {

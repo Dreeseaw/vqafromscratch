@@ -4,35 +4,16 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Markdown Viewer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&display=swap" />
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.8.1/github-markdown-light.min.css" />
   <link rel="stylesheet" href="/styles.css" />
-  <style>
-    .doc-wrap {
-      width: min(1000px, 95vw);
-      margin: 16px auto 30px;
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 12px;
-    }
-    .doc-head {
-      display: flex;
-      justify-content: space-between;
-      align-items: baseline;
-      margin-bottom: 10px;
-    }
-    #docMeta {
-      margin-top: 4px;
-    }
-    #docBody {
-      min-height: 120px;
-    }
-  </style>
 </head>
-<body>
-  <main class="doc-wrap">
+<body class="doc-page">
+  <main class="doc-wrap doc-shell">
     <div class="doc-head">
-      <div>
+      <div class="doc-copy">
         <strong id="docTitle">Markdown</strong>
         <div id="docMeta" class="muted mono"></div>
       </div>

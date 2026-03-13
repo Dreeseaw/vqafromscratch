@@ -4,18 +4,21 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Research Progress Tracker</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&display=swap" />
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.8.1/github-markdown-light.min.css" />
   <link rel="stylesheet" href="/styles.css" />
 </head>
-<body>
-  <main class="wrap">
-    <header class="top">
-      <div>
+<body class="dashboard-page">
+  <main class="wrap dashboard-shell">
+    <header class="top hero-panel">
+      <div class="top-copy">
         <h1>Auto-Research Progress</h1>
         <div id="taskTitle" class="task-title">Task</div>
         <div id="taskMeta" class="muted">Loading task...</div>
       </div>
-      <div class="top-actions">
+      <div class="top-actions top-meta">
         <label class="muted mono">Task
           <select id="taskSelect"></select>
         </label>
@@ -30,16 +33,6 @@
       </div>
       <div id="overviewContent" class="section-content">
         <section class="kpis" id="kpis"></section>
-      </div>
-    </section>
-
-    <section id="highlightsSection" class="panel collapsible-section">
-      <div class="panel-head">
-        <h2>Highlights</h2>
-        <button id="toggleHighlightsSection" class="collapse-button" type="button" data-target="highlightsContent" data-label="Highlights">Collapse</button>
-      </div>
-      <div id="highlightsContent" class="section-content">
-        <section class="highlights" id="highlights"></section>
       </div>
     </section>
 

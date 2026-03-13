@@ -134,6 +134,17 @@ type IdeaTreeResponse = {
   debug: IdeaGraphDebug;
 };
 
+type IdeaTreeProgressStage = "harvest" | "attachment" | "synthesis";
+
+type IdeaTreeProgressStatus = {
+  taskId: string;
+  state: "idle" | "running" | "completed" | "error";
+  activeStage: IdeaTreeProgressStage | null;
+  message: string;
+  startedAt: string | null;
+  updatedAt: string;
+};
+
 type IdeaTreeRequest = {
   taskId?: string;
 };
@@ -246,6 +257,7 @@ const preferredUserHome =
   (userName && fs.existsSync(path.join("/home", userName)) && path.join("/home", userName)) ||
   process.env.HOME ||
   os.homedir();
+const ideaTreeProgressByTask = new Map<string, IdeaTreeProgressStatus>();
 
 const IDEA_GRAPH_HARVEST_OUTPUT_SCHEMA = {
   type: "object",
@@ -827,6 +839,23 @@ function sanitizeIdeaId(value: string, max = 48): string {
     .replace(/[^A-Za-z0-9_-]+/g, "_")
     .replace(/^_+|_+$/g, "");
   return cleaned.slice(0, max) || "item";
+}
+
+function setIdeaTreeProgress(
+  taskId: string,
+  patch: Partial<IdeaTreeProgressStatus> & Pick<IdeaTreeProgressStatus, "state" | "message">
+): IdeaTreeProgressStatus {
+  const prev = ideaTreeProgressByTask.get(taskId);
+  const next: IdeaTreeProgressStatus = {
+    taskId,
+    state: patch.state,
+    activeStage: patch.activeStage ?? prev?.activeStage ?? null,
+    message: patch.message,
+    startedAt: patch.startedAt ?? prev?.startedAt ?? null,
+    updatedAt: new Date().toISOString(),
+  };
+  ideaTreeProgressByTask.set(taskId, next);
+  return next;
 }
 
 function normalizeIdeaSearchText(value: string): string {
@@ -1904,6 +1933,12 @@ async function handleIdeaTree(req: Request, fallbackTask: TaskContext | null): P
   }
 
   try {
+    setIdeaTreeProgress(task.id, {
+      state: "running",
+      activeStage: "harvest",
+      message: "Harvesting candidates from the task corpus.",
+      startedAt: new Date().toISOString(),
+    });
     const totalStart = Date.now();
     const bootstrap = getBootstrap(task);
 
@@ -1912,6 +1947,11 @@ async function handleIdeaTree(req: Request, fallbackTask: TaskContext | null): P
     const evidenceMs = Date.now() - evidenceStart;
 
     const harvestStart = Date.now();
+    setIdeaTreeProgress(task.id, {
+      state: "running",
+      activeStage: "harvest",
+      message: "Harvesting candidate ideas and variants.",
+    });
     const harvestPrompt = formatIdeaGraphEvidencePackForHarvestPrompt(task, bootstrap, evidence);
     const harvestRaw = await runCodexIdeaGraphStage(harvestPrompt, {
       stage: "harvest",
@@ -1927,6 +1967,11 @@ async function handleIdeaTree(req: Request, fallbackTask: TaskContext | null): P
     );
 
     const attachmentStart = Date.now();
+    setIdeaTreeProgress(task.id, {
+      state: "running",
+      activeStage: "attachment",
+      message: "Attaching evidence to harvested candidates.",
+    });
     const attachmentPrompt = buildIdeaGraphAttachmentPrompt(task, harvested, evidenceRefsByCandidate, lookup);
     const attachmentRaw = await runCodexIdeaGraphStage(attachmentPrompt, {
       stage: "attachment",
@@ -1937,6 +1982,11 @@ async function handleIdeaTree(req: Request, fallbackTask: TaskContext | null): P
     const attachmentMs = Date.now() - attachmentStart;
 
     const graphStart = Date.now();
+    setIdeaTreeProgress(task.id, {
+      state: "running",
+      activeStage: "synthesis",
+      message: "Synthesizing the final graph structure.",
+    });
     const synthesisPrompt = buildIdeaGraphSynthesisPrompt(task, attached.kept, lookup);
     const graphRaw = await runCodexIdeaGraphStage(synthesisPrompt, {
       stage: "synthesis",
@@ -1953,10 +2003,19 @@ async function handleIdeaTree(req: Request, fallbackTask: TaskContext | null): P
       graphMs,
       totalMs: Date.now() - totalStart,
     });
+    setIdeaTreeProgress(task.id, {
+      state: "completed",
+      activeStage: "synthesis",
+      message: "Graph generation complete.",
+    });
     return new Response(JSON.stringify(response), {
       headers: { "Content-Type": "application/json; charset=utf-8" },
     });
   } catch (error) {
+    setIdeaTreeProgress(task.id, {
+      state: "error",
+      message: error instanceof Error ? error.message : String(error),
+    });
     return new Response(
       JSON.stringify({
         error: error instanceof Error ? error.message : String(error),
@@ -2031,6 +2090,22 @@ serve({
     if (url.pathname === "/api/ideas/tree") {
       if (req.method !== "POST") return new Response("Method not allowed", { status: 405 });
       return handleIdeaTree(req, task);
+    }
+    if (url.pathname === "/api/ideas/tree/status") {
+      if (!task) return new Response("Unknown task", { status: 404 });
+      const status =
+        ideaTreeProgressByTask.get(task.id) ??
+        ({
+          taskId: task.id,
+          state: "idle",
+          activeStage: null,
+          message: "Not started.",
+          startedAt: null,
+          updatedAt: new Date().toISOString(),
+        } satisfies IdeaTreeProgressStatus);
+      return new Response(JSON.stringify(status), {
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+      });
     }
     return new Response("Not found", { status: 404 });
   },
