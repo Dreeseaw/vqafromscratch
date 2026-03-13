@@ -43,6 +43,23 @@
       </div>
     </section>
 
+    <section id="ideaTreeSection" class="panel collapsible-section">
+      <div class="panel-head">
+        <div>
+          <h2>Idea Graph</h2>
+          <div class="muted">Generate a multi-stage semantic graph from the full task corpus, with intermediate debugging info.</div>
+        </div>
+        <div class="section-actions">
+          <button id="ideaTreeGenerate" type="button">Generate Graph</button>
+          <button id="toggleIdeaTreeSection" class="collapse-button" type="button" data-target="ideaTreeContent" data-label="Idea Graph">Collapse</button>
+        </div>
+      </div>
+      <div id="ideaTreeContent" class="section-content">
+        <div id="ideaTreeMeta" class="muted mono">Not generated yet.</div>
+        <div id="ideaTreeBody" class="idea-tree-body"></div>
+      </div>
+    </section>
+
     <section id="taskQaSection" class="panel collapsible-section">
       <div class="panel-head">
         <div>

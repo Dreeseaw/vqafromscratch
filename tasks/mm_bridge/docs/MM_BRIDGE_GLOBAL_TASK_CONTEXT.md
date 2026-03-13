@@ -157,6 +157,27 @@ Interpretation rule:
 - if the user asks for the largest batch size that fits, maximize raw `batch_size` first
 - only fall back to a smaller raw `batch_size` when the larger one fails memory/stability or the user explicitly asks for a different optimization target
 
+## KV-Cache Eval Note
+
+For the bridge-only eval KV-cache path:
+
+- the first generated token should still use the original mixed-length full-batch decode path
+- continuation may use the newer batched cache mode instead of per-sample serial continuation
+- the important correctness condition is that padded prefill slots stay masked on every incremental decode step
+
+Operational note:
+
+- `train/mm.py` now supports `--eval_kv_cache_mode batched|serial`
+- `batched` is the default future-run mode for `--eval_use_kv_cache`
+- `serial` remains the direct fallback/reference path if a checkpoint ever disagrees
+- after the Hammer batched-KV retune, the bridge-only Hammer families no longer need the old `64x3` / reduced-eval-batch special-casing by default
+- current Hammer-family default should be `192 x 1` unless a future probe shows a real regression
+
+Validation rule:
+
+- before trusting a new batched KV-cache setup on a real checkpoint family, compare `batched` vs `serial` generation on a small mixed-length prompt batch
+- if they disagree, treat the batched path as nonstandard until the mismatch is explained
+
 ## Run Control Policy
 
 For standard bridge sweeps and long comparable runs:

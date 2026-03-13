@@ -198,6 +198,7 @@ def _apply_runtime_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "bridge_qquery_scale": 1.0,
         "bridge_question_context_mode": "all_text",
         "eval_use_kv_cache": False,
+        "eval_kv_cache_mode": "batched",
         "bridge_token_selector_type": "none",
         "bridge_token_select_k": 0,
         "bridge_token_select_k_min": 0,
@@ -595,6 +596,7 @@ class MultimodalPrefixLM(nn.Module):
         prefix_dropout: float = 0.0,
         question_context_mode: str = "all_text",
         eval_use_kv_cache: bool = False,
+        eval_kv_cache_mode: str = "batched",
         lm_visual_adapter_type: str = "none",
         lm_visual_adapter_layers: int = 0,
         lm_visual_adapter_num_heads: int = 8,
@@ -623,6 +625,9 @@ class MultimodalPrefixLM(nn.Module):
         self.prefix_dropout = max(0.0, float(prefix_dropout))
         self.question_context_mode = str(question_context_mode)
         self.eval_use_kv_cache = bool(eval_use_kv_cache)
+        self.eval_kv_cache_mode = str(eval_kv_cache_mode)
+        if self.eval_kv_cache_mode not in ("serial", "batched"):
+            raise ValueError("eval_kv_cache_mode must be 'serial' or 'batched'.")
         self.lm_visual_adapter_type = str(lm_visual_adapter_type)
         self.lm_visual_adapter_layers = max(0, int(lm_visual_adapter_layers))
         self.visual_adapters = nn.ModuleDict()
@@ -844,6 +849,271 @@ class MultimodalPrefixLM(nn.Module):
         logits = self._lm_head_with_amp(hidden)
         return logits, k, kv_cache
 
+    @staticmethod
+    def _pack_generation_text_batch(
+        ids: Sequence[Sequence[int]],
+        *,
+        prompt_lengths: Sequence[int],
+        pad_id: int,
+        device: torch.device,
+        legacy_prompt_mask: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if len(ids) != len(prompt_lengths):
+            raise ValueError(f"Expected prompt_lengths len={len(ids)}, got {len(prompt_lengths)}")
+        if not ids:
+            empty_ids = torch.empty((0, 0), dtype=torch.long, device=device)
+            empty_mask = torch.empty((0, 0), dtype=torch.bool, device=device)
+            return empty_ids, empty_mask, empty_mask
+        max_len = max(len(s) for s in ids)
+        input_ids = torch.full((len(ids), max_len), int(pad_id), dtype=torch.long, device=device)
+        text_pad_mask = torch.ones((len(ids), max_len), dtype=torch.bool, device=device)
+        prompt_mask = torch.zeros((len(ids), max_len), dtype=torch.bool, device=device)
+        for i, s in enumerate(ids):
+            if not s:
+                continue
+            t = torch.tensor(s, dtype=torch.long, device=device)
+            seq_len = int(len(s))
+            input_ids[i, :seq_len] = t
+            text_pad_mask[i, :seq_len] = False
+            prompt_len = seq_len if legacy_prompt_mask else min(int(prompt_lengths[i]), seq_len)
+            if prompt_len > 0:
+                prompt_mask[i, :prompt_len] = True
+        return input_ids, text_pad_mask, prompt_mask
+
+    @staticmethod
+    def _select_kv_cache_rows(
+        kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
+        row_indices: torch.Tensor,
+    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        row_idx = row_indices.to(dtype=torch.long)
+        return [
+            (
+                wk.index_select(0, row_idx),
+                wv.index_select(0, row_idx),
+            )
+            for wk, wv in kv_cache
+        ]
+
+    def _generate_answers_with_kv_cache_serial(
+        self,
+        *,
+        seqs: List[List[int]],
+        generated_ids: List[List[int]],
+        done: List[bool],
+        cached_visual_prefix: torch.Tensor,
+        eos_id: int,
+        max_new_tokens: int,
+    ) -> List[List[int]]:
+        device = cached_visual_prefix.device
+        for i in range(len(seqs)):
+            if done[i]:
+                continue
+            cur_ids = list(seqs[i])
+            cur_len = int(len(cur_ids))
+            single_input_ids = torch.tensor(cur_ids, dtype=torch.long, device=device).unsqueeze(0)
+            single_text_pad_mask = torch.zeros((1, cur_len), dtype=torch.bool, device=device)
+            single_text_emb = self.lm._embed_dropout(self.lm._embed(single_input_ids))
+            single_visual_prefix = cached_visual_prefix[i : i + 1]
+            logits_i, prefix_k_i, kv_cache = self._prefill_decode_with_visual_prefix(
+                text_emb=single_text_emb,
+                text_pad_mask=single_text_pad_mask,
+                visual_prefix=single_visual_prefix,
+            )
+            next_id = int(torch.argmax(logits_i[0, prefix_k_i + cur_len - 1]).item())
+            if next_id == int(eos_id):
+                done[i] = True
+                continue
+            seqs[i].append(next_id)
+            generated_ids[i].append(next_id)
+            step_pos = int(prefix_k_i + cur_len)
+            tokens_generated = 2
+
+            while tokens_generated < int(max_new_tokens):
+                step_input_ids = torch.tensor([[next_id]], dtype=torch.long, device=device)
+                step_text_emb = self.lm._embed_dropout(self.lm._embed(step_input_ids))
+                hidden, kv_cache = self.lm._decode_only_incremental(
+                    step_text_emb,
+                    kv_cache=kv_cache,
+                    pad_mask=None,
+                    q_pad_mask=None,
+                    start_pos=step_pos,
+                )
+                step_pos += 1
+                next_id = int(torch.argmax(self._lm_head_with_amp(hidden)[0, 0]).item())
+                if next_id == int(eos_id):
+                    done[i] = True
+                    break
+                seqs[i].append(next_id)
+                generated_ids[i].append(next_id)
+                tokens_generated += 1
+        return generated_ids
+
+    def _generate_answers_with_kv_cache_batched(
+        self,
+        *,
+        seqs: List[List[int]],
+        prompt_lengths: Sequence[int],
+        generated_ids: List[List[int]],
+        done: List[bool],
+        cached_visual_prefix: torch.Tensor,
+        pad_id: int,
+        eos_id: int,
+        max_new_tokens: int,
+    ) -> List[List[int]]:
+        device = cached_visual_prefix.device
+        active_indices = [i for i, finished in enumerate(done) if not finished]
+        if not active_indices:
+            return generated_ids
+
+        select_idx = torch.tensor(active_indices, dtype=torch.long, device=device)
+        active_visual_prefix = cached_visual_prefix.index_select(0, select_idx)
+        active_seqs = [list(seqs[i]) for i in active_indices]
+        active_prompt_lengths = [int(prompt_lengths[i]) for i in active_indices]
+        input_ids, text_pad_mask, _ = self._pack_generation_text_batch(
+            active_seqs,
+            prompt_lengths=active_prompt_lengths,
+            pad_id=pad_id,
+            device=device,
+            legacy_prompt_mask=False,
+        )
+        text_emb = self.lm._embed_dropout(self.lm._embed(input_ids))
+        logits, prefix_k, kv_cache = self._prefill_decode_with_visual_prefix(
+            text_emb=text_emb,
+            text_pad_mask=text_pad_mask,
+            visual_prefix=active_visual_prefix,
+        )
+        prefix_pad = torch.zeros((len(active_indices), prefix_k), dtype=torch.bool, device=device)
+        cache_pad_mask = torch.cat([prefix_pad, text_pad_mask], dim=1)
+        cur_lens = [int(len(s)) for s in active_seqs]
+
+        continue_rows: List[int] = []
+        continue_indices: List[int] = []
+        continue_token_ids: List[int] = []
+        continue_step_pos: List[int] = []
+        for row_idx, global_idx in enumerate(active_indices):
+            next_id = int(torch.argmax(logits[row_idx, prefix_k + cur_lens[row_idx] - 1]).item())
+            if next_id == int(eos_id):
+                done[global_idx] = True
+                continue
+            seqs[global_idx].append(next_id)
+            generated_ids[global_idx].append(next_id)
+            continue_rows.append(row_idx)
+            continue_indices.append(global_idx)
+            continue_token_ids.append(next_id)
+            continue_step_pos.append(prefix_k + cur_lens[row_idx])
+
+        if int(max_new_tokens) <= 2 or not continue_rows:
+            return generated_ids
+
+        keep_rows = torch.tensor(continue_rows, dtype=torch.long, device=device)
+        kv_cache = self._select_kv_cache_rows(kv_cache, keep_rows)
+        cache_pad_mask = cache_pad_mask.index_select(0, keep_rows)
+        step_pos = torch.tensor(continue_step_pos, dtype=torch.long, device=device)
+        active_indices = continue_indices
+        step_input_ids = torch.tensor(continue_token_ids, dtype=torch.long, device=device).unsqueeze(1)
+        tokens_generated = 2
+
+        while tokens_generated < int(max_new_tokens) and active_indices:
+            step_text_emb = self.lm._embed_dropout(self.lm._embed(step_input_ids))
+            # Batched prefill keeps padded prompt slots in-cache; keep them masked
+            # while letting newly appended generated tokens participate normally.
+            step_pad_mask = torch.cat(
+                [cache_pad_mask, torch.zeros((len(active_indices), 1), dtype=torch.bool, device=device)],
+                dim=1,
+            )
+            hidden, kv_cache = self.lm._decode_only_incremental(
+                step_text_emb,
+                kv_cache=kv_cache,
+                pad_mask=step_pad_mask,
+                q_pad_mask=None,
+                start_pos=step_pos,
+            )
+            step_pos = step_pos + 1
+            next_ids = torch.argmax(self._lm_head_with_amp(hidden)[:, 0], dim=-1)
+
+            keep_rows_list: List[int] = []
+            keep_indices: List[int] = []
+            keep_token_ids: List[int] = []
+            for row_idx, global_idx in enumerate(active_indices):
+                next_id = int(next_ids[row_idx].item())
+                if next_id == int(eos_id):
+                    done[global_idx] = True
+                    continue
+                seqs[global_idx].append(next_id)
+                generated_ids[global_idx].append(next_id)
+                keep_rows_list.append(row_idx)
+                keep_indices.append(global_idx)
+                keep_token_ids.append(next_id)
+
+            tokens_generated += 1
+            if tokens_generated >= int(max_new_tokens) or not keep_rows_list:
+                break
+
+            keep_rows = torch.tensor(keep_rows_list, dtype=torch.long, device=device)
+            kv_cache = self._select_kv_cache_rows(kv_cache, keep_rows)
+            cache_pad_mask = step_pad_mask.index_select(0, keep_rows)
+            step_pos = step_pos.index_select(0, keep_rows)
+            active_indices = keep_indices
+            step_input_ids = torch.tensor(keep_token_ids, dtype=torch.long, device=device).unsqueeze(1)
+        return generated_ids
+
+    def _generate_answers_with_kv_cache(
+        self,
+        *,
+        seqs: List[List[int]],
+        prompt_lengths: Sequence[int],
+        cached_visual_prefix: torch.Tensor,
+        pad_id: int,
+        eos_id: int,
+        max_new_tokens: int,
+    ) -> List[List[int]]:
+        generated_ids: List[List[int]] = [[] for _ in seqs]
+        input_ids, text_pad_mask, _ = self._pack_generation_text_batch(
+            seqs,
+            prompt_lengths=prompt_lengths,
+            pad_id=pad_id,
+            device=cached_visual_prefix.device,
+            legacy_prompt_mask=False,
+        )
+        text_emb = self.lm._embed_dropout(self.lm._embed(input_ids))
+        logits, prefix_k = self._decode_with_visual_prefix(
+            input_ids=input_ids,
+            text_emb=text_emb,
+            text_pad_mask=text_pad_mask,
+            visual_prefix=cached_visual_prefix,
+        )
+        text_logits = logits[:, prefix_k:, :]
+        done = [False for _ in seqs]
+        for i in range(len(seqs)):
+            next_id = int(torch.argmax(text_logits[i, len(seqs[i]) - 1]).item())
+            if next_id == int(eos_id):
+                done[i] = True
+                continue
+            seqs[i].append(next_id)
+            generated_ids[i].append(next_id)
+
+        if int(max_new_tokens) <= 1 or all(done):
+            return generated_ids
+        if str(getattr(self, "eval_kv_cache_mode", "batched")) == "serial":
+            return self._generate_answers_with_kv_cache_serial(
+                seqs=seqs,
+                generated_ids=generated_ids,
+                done=done,
+                cached_visual_prefix=cached_visual_prefix,
+                eos_id=eos_id,
+                max_new_tokens=max_new_tokens,
+            )
+        return self._generate_answers_with_kv_cache_batched(
+            seqs=seqs,
+            prompt_lengths=prompt_lengths,
+            generated_ids=generated_ids,
+            done=done,
+            cached_visual_prefix=cached_visual_prefix,
+            pad_id=pad_id,
+            eos_id=eos_id,
+            max_new_tokens=max_new_tokens,
+        )
+
     def forward_logits(
         self,
         input_ids: torch.Tensor,
@@ -947,31 +1217,11 @@ class MultimodalPrefixLM(nn.Module):
             return []
 
         device = images.device
+        prompt_lengths = [int(len(x)) for x in prompt_ids]
         legacy_prompt_conditioned = bool(
             getattr(self.bridge, "supports_question_context", False)
             and self.question_context_mode == "prompt_only"
         )
-
-        def _pack_text_batch(
-            ids: Sequence[Sequence[int]],
-            *,
-            legacy_prompt_mask: bool = False,
-        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            max_len = max(len(s) for s in ids)
-            input_ids = torch.full((len(ids), max_len), int(pad_id), dtype=torch.long, device=device)
-            text_pad_mask = torch.ones((len(ids), max_len), dtype=torch.bool, device=device)
-            prompt_mask = torch.zeros((len(ids), max_len), dtype=torch.bool, device=device)
-            for i, s in enumerate(ids):
-                if not s:
-                    continue
-                t = torch.tensor(s, dtype=torch.long, device=device)
-                seq_len = int(len(s))
-                input_ids[i, :seq_len] = t
-                text_pad_mask[i, :seq_len] = False
-                prompt_len = seq_len if legacy_prompt_mask else min(int(len(prompt_ids[i])), seq_len)
-                if prompt_len > 0:
-                    prompt_mask[i, :prompt_len] = True
-            return input_ids, text_pad_mask, prompt_mask
 
         needs_visual = bool(getattr(self.bridge, "requires_visual_features", True))
         supports_qcond = bool(getattr(self.bridge, "supports_question_context", False))
@@ -983,7 +1233,13 @@ class MultimodalPrefixLM(nn.Module):
 
         cached_visual_prefix: Optional[torch.Tensor] = None
         if (not supports_qcond) or prompt_conditioned:
-            prompt_input_ids, prompt_text_pad_mask, prompt_mask = _pack_text_batch(prompt_ids)
+            prompt_input_ids, prompt_text_pad_mask, prompt_mask = self._pack_generation_text_batch(
+                prompt_ids,
+                prompt_lengths=prompt_lengths,
+                pad_id=pad_id,
+                device=device,
+                legacy_prompt_mask=False,
+            )
             prompt_text_emb = self.lm._embed_dropout(self.lm._embed(prompt_input_ids))
             cached_visual_prefix, cached_visual_features = self._compute_visual_prefix(
                 images=images,
@@ -1003,77 +1259,23 @@ class MultimodalPrefixLM(nn.Module):
         )
         if can_use_kv_cache:
             assert cached_visual_prefix is not None
-            generated_ids: List[List[int]] = [[] for _ in seqs]
             # Preserve exact historical first-token behavior by using the original
             # mixed-length full-batch decode once before switching to cached continuation.
-            input_ids, text_pad_mask, prompt_mask = _pack_text_batch(
-                seqs,
-                legacy_prompt_mask=False,
+            return self._generate_answers_with_kv_cache(
+                seqs=seqs,
+                prompt_lengths=prompt_lengths,
+                cached_visual_prefix=cached_visual_prefix,
+                pad_id=pad_id,
+                eos_id=eos_id,
+                max_new_tokens=max_new_tokens,
             )
-            text_emb = self.lm._embed_dropout(self.lm._embed(input_ids))
-            logits, prefix_k = self._decode_with_visual_prefix(
-                input_ids=input_ids,
-                text_emb=text_emb,
-                text_pad_mask=text_pad_mask,
-                visual_prefix=cached_visual_prefix,
-            )
-            text_logits = logits[:, prefix_k:, :]
-            done = [False for _ in seqs]
-            for i in range(len(seqs)):
-                next_id = int(torch.argmax(text_logits[i, len(seqs[i]) - 1]).item())
-                if next_id == int(eos_id):
-                    done[i] = True
-                    continue
-                seqs[i].append(next_id)
-                generated_ids[i].append(next_id)
-
-            if int(max_new_tokens) <= 1:
-                return generated_ids
-
-            for i in range(len(seqs)):
-                if done[i]:
-                    continue
-                cur_ids = list(seqs[i])
-                cur_len = int(len(cur_ids))
-                single_input_ids = torch.tensor(cur_ids, dtype=torch.long, device=device).unsqueeze(0)
-                single_text_pad_mask = torch.zeros((1, cur_len), dtype=torch.bool, device=device)
-                single_text_emb = self.lm._embed_dropout(self.lm._embed(single_input_ids))
-                single_visual_prefix = cached_visual_prefix[i : i + 1]
-                logits_i, prefix_k_i, kv_cache = self._prefill_decode_with_visual_prefix(
-                    text_emb=single_text_emb,
-                    text_pad_mask=single_text_pad_mask,
-                    visual_prefix=single_visual_prefix,
-                )
-                steps_done = 1
-                next_id = int(torch.argmax(logits_i[0, prefix_k_i + cur_len - 1]).item())
-                if next_id == int(eos_id):
-                    continue
-                seqs[i].append(next_id)
-                generated_ids[i].append(next_id)
-                step_pos = int(prefix_k_i + cur_len)
-
-                while (steps_done + 1) < int(max_new_tokens):
-                    step_input_ids = torch.tensor([[next_id]], dtype=torch.long, device=device)
-                    step_text_emb = self.lm._embed_dropout(self.lm._embed(step_input_ids))
-                    hidden, kv_cache = self.lm._decode_only_incremental(
-                        step_text_emb,
-                        kv_cache=kv_cache,
-                        pad_mask=None,
-                        q_pad_mask=None,
-                        start_pos=step_pos,
-                    )
-                    step_pos += 1
-                    next_id = int(torch.argmax(self._lm_head_with_amp(hidden)[0, 0]).item())
-                    if next_id == int(eos_id):
-                        break
-                    seqs[i].append(next_id)
-                    generated_ids[i].append(next_id)
-                    steps_done += 1
-            return generated_ids
 
         for _ in range(int(max_new_tokens)):
-            input_ids, text_pad_mask, prompt_mask = _pack_text_batch(
+            input_ids, text_pad_mask, prompt_mask = self._pack_generation_text_batch(
                 seqs,
+                prompt_lengths=prompt_lengths,
+                pad_id=pad_id,
+                device=device,
                 legacy_prompt_mask=legacy_prompt_conditioned,
             )
             text_emb = self.lm._embed_dropout(self.lm._embed(input_ids))
@@ -1450,6 +1652,7 @@ def build_runtime_from_args(
         prefix_dropout=float(args.prefix_dropout),
         question_context_mode=str(args.bridge_question_context_mode),
         eval_use_kv_cache=bool(getattr(args, "eval_use_kv_cache", False)),
+        eval_kv_cache_mode=str(getattr(args, "eval_kv_cache_mode", "batched")),
         lm_visual_adapter_type=str(getattr(args, "lm_visual_adapter_type", "none")),
         lm_visual_adapter_layers=int(getattr(args, "lm_visual_adapter_layers", 0)),
         lm_visual_adapter_num_heads=int(getattr(args, "lm_visual_adapter_num_heads", 8)),
@@ -1905,6 +2108,7 @@ def log_startup_config(
         f"lr_schedule={args.lr_schedule} lr_warmup_steps={args.lr_warmup_steps} lr_min_ratio={args.lr_min_ratio} "
         f"train_sample_budget={int(args.train_sample_budget)} manual_max_steps={int(bool(args.manual_max_steps))} "
         f"eval_use_kv_cache={int(bool(getattr(args, 'eval_use_kv_cache', False)))} "
+        f"eval_kv_cache_mode={str(getattr(args, 'eval_kv_cache_mode', 'batched'))} "
         f"cuda_empty_cache_after_eval={int(bool(args.cuda_empty_cache_after_eval))} "
         f"log_every={args.log_every} eval_every={args.eval_every} eval_batches={args.eval_batches} "
         f"final_eval_batches={args.final_eval_batches} "
@@ -2244,6 +2448,13 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Use incremental LM KV-cache during eval generation when the visual prefix is decode-invariant.",
+    )
+    ap.add_argument(
+        "--eval_kv_cache_mode",
+        type=str,
+        default="batched",
+        choices=["serial", "batched"],
+        help="KV-cache eval continuation mode after the first generated token.",
     )
     ap.add_argument(
         "--cuda_empty_cache_after_eval",

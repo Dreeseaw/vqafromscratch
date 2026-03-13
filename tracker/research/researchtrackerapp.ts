@@ -95,14 +95,276 @@ type TaskQaResponse = {
   generatedAt: string;
 };
 
+type IdeaTreeNodeKind = "idea" | "property" | "variant";
+
+type IdeaTreeNode = {
+  id: string;
+  label: string;
+  kind: IdeaTreeNodeKind;
+  summary: string;
+  detail: string;
+  aliases: string[];
+  evidenceRefs: string[];
+};
+
+type IdeaTreeEdge = {
+  id: string;
+  fromId: string;
+  toId: string;
+  relationPhrase: string;
+  reasoning: string;
+  evidenceRefs: string[];
+};
+
+type IdeaTreeResponse = {
+  taskId: string;
+  generatedAt: string;
+  anchors: string[];
+  inputs: {
+    snapshotGeneratedAt: string;
+    docs: string[];
+    snippetCount: number;
+    runFamilyCount: number;
+    pipelineVersion: string;
+  };
+  graph: {
+    nodes: IdeaTreeNode[];
+    edges: IdeaTreeEdge[];
+  };
+  debug: IdeaGraphDebug;
+};
+
+type IdeaTreeRequest = {
+  taskId?: string;
+};
+
+type IdeaGraphEvidenceDoc = {
+  file: string;
+  title: string;
+  updatedAt: string;
+  runRefs: string[];
+  snippetIds: string[];
+};
+
+type IdeaGraphEvidenceSnippet = {
+  id: string;
+  docFile: string;
+  heading: string;
+  updatedAt: string;
+  excerpt: string;
+  runRefs: string[];
+  mentionedAccuracies: number[];
+  score: number;
+};
+
+type IdeaGraphRunFamily = {
+  id: string;
+  familyKey: string;
+  label: string;
+  runCount: number;
+  activeRuns: number;
+  bestAccuracy: number | null;
+  lastTrainCe: number | null;
+  docRefs: string[];
+  sampleRuns: string[];
+};
+
+type IdeaGraphHarvestCandidate = {
+  id: string;
+  label: string;
+  kind: IdeaTreeNodeKind;
+  aliases: string[];
+  candidateRefs: string[];
+  notes: string;
+};
+
+type IdeaGraphAttachedCandidate = {
+  id: string;
+  label: string;
+  kind: IdeaTreeNodeKind;
+  aliases: string[];
+  summary: string;
+  detail: string;
+  coverageNote: string;
+  evidenceRefs: string[];
+  contradictionRefs: string[];
+};
+
+type IdeaGraphDroppedCandidate = {
+  id: string;
+  label: string;
+  reason: string;
+  candidateRefs: string[];
+};
+
+type IdeaGraphEdgeModel = {
+  fromId: string;
+  toId: string;
+  relationPhrase: string;
+  reasoning: string;
+  evidenceRefs: string[];
+};
+
+type IdeaGraphDebug = {
+  timings: {
+    evidenceMs: number;
+    harvestMs: number;
+    attachmentMs: number;
+    graphMs: number;
+    totalMs: number;
+  };
+  evidence: {
+    docs: IdeaGraphEvidenceDoc[];
+    snippets: IdeaGraphEvidenceSnippet[];
+    runFamilies: IdeaGraphRunFamily[];
+  };
+  harvest: {
+    candidates: IdeaGraphHarvestCandidate[];
+  };
+  attachment: {
+    kept: IdeaGraphAttachedCandidate[];
+    dropped: IdeaGraphDroppedCandidate[];
+  };
+};
+
 const ACTIVE_WINDOW_MS = 45 * 60 * 1000;
 const QA_TIMEOUT_MS = 2 * 60 * 1000;
 const QA_MAX_TURNS = 8;
+const IDEA_TREE_TIMEOUT_MS = 90 * 1000;
+const IDEA_TREE_MAX_ANCHORS = 5;
+const IDEA_GRAPH_MAX_SNIPPETS = 96;
+const IDEA_GRAPH_MAX_SNIPPETS_PER_DOC = 4;
+const IDEA_GRAPH_SNIPPET_CHARS = 340;
+const IDEA_GRAPH_HARVEST_MAX_CANDIDATES = 16;
+const IDEA_GRAPH_ATTACH_MAX_REFS = 10;
+const IDEA_GRAPH_HARVEST_TIMEOUT_MS = 90 * 1000;
+const IDEA_GRAPH_ATTACHMENT_TIMEOUT_MS = 90 * 1000;
+const IDEA_GRAPH_SYNTHESIS_TIMEOUT_MS = 90 * 1000;
+const IDEA_TREE_REASONING_EFFORT = "low";
 const userName = process.env.USER || process.env.LOGNAME || "";
 const preferredUserHome =
   (userName && fs.existsSync(path.join("/home", userName)) && path.join("/home", userName)) ||
   process.env.HOME ||
   os.homedir();
+
+const IDEA_GRAPH_HARVEST_OUTPUT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["candidates"],
+  properties: {
+    candidates: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["id", "label", "kind", "aliases", "candidateRefs", "notes"],
+        properties: {
+          id: { type: "string", minLength: 1, maxLength: 48 },
+          label: { type: "string", minLength: 1, maxLength: 80 },
+          kind: { type: "string", enum: ["idea", "property", "variant"] },
+          aliases: {
+            type: "array",
+            items: { type: "string", minLength: 1, maxLength: 80 },
+          },
+          candidateRefs: {
+            type: "array",
+            minItems: 1,
+            items: { type: "string", minLength: 1, maxLength: 80 },
+          },
+          notes: { type: "string", minLength: 1, maxLength: 220 },
+        },
+      },
+    },
+  },
+} as const;
+
+const IDEA_GRAPH_ATTACHMENT_OUTPUT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["kept", "dropped"],
+  properties: {
+    kept: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["id", "label", "kind", "aliases", "summary", "detail", "coverageNote", "evidenceRefs", "contradictionRefs"],
+        properties: {
+          id: { type: "string", minLength: 1, maxLength: 48 },
+          label: { type: "string", minLength: 1, maxLength: 80 },
+          kind: { type: "string", enum: ["idea", "property", "variant"] },
+          aliases: {
+            type: "array",
+            items: { type: "string", minLength: 1, maxLength: 80 },
+          },
+          summary: { type: "string", minLength: 1, maxLength: 160 },
+          detail: { type: "string", minLength: 1, maxLength: 420 },
+          coverageNote: { type: "string", minLength: 1, maxLength: 200 },
+          evidenceRefs: {
+            type: "array",
+            minItems: 1,
+            items: { type: "string", minLength: 1, maxLength: 80 },
+          },
+          contradictionRefs: {
+            type: "array",
+            items: { type: "string", minLength: 1, maxLength: 80 },
+          },
+        },
+      },
+    },
+    dropped: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["id", "label", "reason", "candidateRefs"],
+        properties: {
+          id: { type: "string", minLength: 1, maxLength: 48 },
+          label: { type: "string", minLength: 1, maxLength: 80 },
+          reason: { type: "string", minLength: 1, maxLength: 220 },
+          candidateRefs: {
+            type: "array",
+            items: { type: "string", minLength: 1, maxLength: 80 },
+          },
+        },
+      },
+    },
+  },
+} as const;
+
+const IDEA_GRAPH_SYNTHESIS_OUTPUT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["anchors", "edges"],
+  properties: {
+    anchors: {
+      type: "array",
+      minItems: 3,
+      maxItems: IDEA_TREE_MAX_ANCHORS,
+      items: { type: "string", minLength: 1, maxLength: 48 },
+    },
+    edges: {
+      type: "array",
+      minItems: 3,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["fromId", "toId", "relationPhrase", "reasoning", "evidenceRefs"],
+        properties: {
+          fromId: { type: "string", minLength: 1, maxLength: 48 },
+          toId: { type: "string", minLength: 1, maxLength: 48 },
+          relationPhrase: { type: "string", minLength: 1, maxLength: 48 },
+          reasoning: { type: "string", minLength: 1, maxLength: 260 },
+          evidenceRefs: {
+            type: "array",
+            minItems: 1,
+            items: { type: "string", minLength: 1, maxLength: 80 },
+          },
+        },
+      },
+    },
+  },
+} as const;
 
 function usageAndExit(): never {
   console.error("Usage: bun run tracker/research/researchtrackerapp.ts [-p <port>] [--task <task_id>] [--tasks-root <dir>]");
@@ -559,6 +821,510 @@ function getBootstrap(task: TaskContext) {
   };
 }
 
+function sanitizeIdeaId(value: string, max = 48): string {
+  const cleaned = String(value ?? "")
+    .trim()
+    .replace(/[^A-Za-z0-9_-]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return cleaned.slice(0, max) || "item";
+}
+
+function normalizeIdeaSearchText(value: string): string {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenizeIdeaSearchText(value: string): string[] {
+  const stopwords = new Set([
+    "the",
+    "and",
+    "for",
+    "with",
+    "from",
+    "into",
+    "that",
+    "this",
+    "task",
+    "report",
+    "plan",
+    "note",
+    "default",
+    "main",
+    "frontier",
+    "family",
+    "run",
+    "runs",
+    "bridge",
+    "idea",
+    "variant",
+    "property",
+  ]);
+  return uniq(
+    normalizeIdeaSearchText(value)
+      .split(" ")
+      .filter((token) => token.length >= 3 && !stopwords.has(token))
+  );
+}
+
+function extractRunRefsFromText(task: TaskContext, text: string): string[] {
+  const logsRefs = [...text.matchAll(/logs\/([A-Za-z0-9._-]+)/g)].map((match) => match[1]);
+  const inlineRefs = [...text.matchAll(/`([A-Za-z0-9._-]{6,})`/g)]
+    .map((match) => match[1])
+    .filter((runId) => fs.existsSync(path.join(task.logsRoot, runId)));
+  return uniq([...logsRefs, ...inlineRefs]);
+}
+
+function extractMentionedAccuracies(text: string): number[] {
+  return uniq(
+    [...text.matchAll(/\b0\.\d{3,4}\b/g)]
+      .map((match) => Number(match[0]))
+      .filter((value) => Number.isFinite(value) && value >= 0.1)
+  ).sort((a, b) => b - a);
+}
+
+function compressIdeaSnippetText(text: string): string {
+  return text
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/\|/g, " | ")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function scoreIdeaGraphSnippet(doc: DocSummary, heading: string, excerpt: string, order: number): number {
+  const headingScore = /(overview|scope|results|ranking|failure|conclusion|combination|patterns|purpose|baseline|novelty|answer|launch|decision|queue)/i.test(heading) ? 8 : 0;
+  const docScore = /(analysis|report|overview|state|context|brainstorm|ideas|diagnosis|final|future|plan)/i.test(`${doc.file} ${doc.title}`) ? 6 : 0;
+  const contentScore = /(best|delta|lift|regression|failure|throughput|constraint|anchor|baseline|stack|combine|question|qcond|earlylayer|geomcal|adapter|qquery|dynbudget|structuredroles|multiscale|perceiver)/i.test(excerpt)
+    ? 7
+    : 0;
+  const runScore = Math.min(4, doc.runRefs.length);
+  const accScore = Math.min(3, doc.mentionedAccuracies.length);
+  return headingScore + docScore + contentScore + runScore + accScore - Math.min(order, 5);
+}
+
+function splitDocIntoIdeaSnippets(task: TaskContext, doc: DocSummary): IdeaGraphEvidenceSnippet[] {
+  const raw = readText(path.join(task.docsRoot, doc.file));
+  const lines = raw.split(/\r?\n/);
+  const sections: Array<{ heading: string; lines: string[]; order: number }> = [];
+  let current = { heading: doc.title, lines: [] as string[], order: 0 };
+  for (const line of lines) {
+    const headingMatch = line.match(/^#{1,3}\s+(.+)$/);
+    if (headingMatch) {
+      sections.push(current);
+      current = {
+        heading: headingMatch[1].trim(),
+        lines: [],
+        order: sections.length,
+      };
+      continue;
+    }
+    current.lines.push(line);
+  }
+  sections.push(current);
+  const snippets: IdeaGraphEvidenceSnippet[] = [];
+  for (const section of sections) {
+    const rawSection = section.lines.join("\n").trim();
+    const excerpt = trimTo(compressIdeaSnippetText(rawSection), IDEA_GRAPH_SNIPPET_CHARS);
+    if (!excerpt) continue;
+    const sectionRunRefs = uniq([...doc.runRefs, ...extractRunRefsFromText(task, rawSection)]).slice(0, 8);
+    const sectionAccuracies = extractMentionedAccuracies(rawSection).slice(0, 6);
+    snippets.push({
+      id: sanitizeIdeaId(`snippet_${doc.file.replace(/\.md$/i, "")}_${section.order + 1}_${section.heading}`, 80),
+      docFile: doc.file,
+      heading: section.heading || doc.title,
+      updatedAt: doc.updatedAt,
+      excerpt,
+      runRefs: sectionRunRefs,
+      mentionedAccuracies: sectionAccuracies,
+      score: scoreIdeaGraphSnippet(doc, section.heading, excerpt, section.order),
+    });
+  }
+  return snippets;
+}
+
+function selectIdeaGraphSnippets(docs: DocSummary[], allSnippets: IdeaGraphEvidenceSnippet[]): IdeaGraphEvidenceSnippet[] {
+  const byDoc = new Map<string, IdeaGraphEvidenceSnippet[]>();
+  for (const snippet of allSnippets) {
+    const group = byDoc.get(snippet.docFile);
+    if (group) group.push(snippet);
+    else byDoc.set(snippet.docFile, [snippet]);
+  }
+  const selected: IdeaGraphEvidenceSnippet[] = [];
+  const selectedIds = new Set<string>();
+  const perDocCount = new Map<string, number>();
+  for (const doc of docs) {
+    const lead = (byDoc.get(doc.file) ?? []).slice().sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || a.heading.localeCompare(b.heading))[0];
+    if (!lead || selectedIds.has(lead.id)) continue;
+    selected.push(lead);
+    selectedIds.add(lead.id);
+    perDocCount.set(doc.file, 1);
+  }
+  const extras = allSnippets
+    .filter((snippet) => !selectedIds.has(snippet.id))
+    .sort((a, b) => b.score - a.score || Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || a.docFile.localeCompare(b.docFile));
+  for (const snippet of extras) {
+    if (selected.length >= IDEA_GRAPH_MAX_SNIPPETS) break;
+    const count = perDocCount.get(snippet.docFile) ?? 0;
+    if (count >= IDEA_GRAPH_MAX_SNIPPETS_PER_DOC) continue;
+    selected.push(snippet);
+    selectedIds.add(snippet.id);
+    perDocCount.set(snippet.docFile, count + 1);
+  }
+  return selected.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || b.score - a.score || a.docFile.localeCompare(b.docFile));
+}
+
+function buildIdeaGraphRunFamilies(runs: RunSummary[], docs: DocSummary[]): IdeaGraphRunFamily[] {
+  const groups = new Map<string, RunSummary[]>();
+  for (const run of runs) {
+    const familyKey = normalizeRunId(run.runId);
+    const group = groups.get(familyKey);
+    if (group) group.push(run);
+    else groups.set(familyKey, [run]);
+  }
+  const docFamilyRefs = new Map<string, Set<string>>();
+  for (const doc of docs) {
+    for (const runId of doc.runRefs) {
+      const familyKey = normalizeRunId(runId);
+      const refs = docFamilyRefs.get(familyKey);
+      if (refs) refs.add(doc.file);
+      else docFamilyRefs.set(familyKey, new Set([doc.file]));
+    }
+  }
+  return [...groups.entries()]
+    .map(([familyKey, group]) => {
+      const accuracies = group.map((run) => run.finalAccuracy).filter((value): value is number => Number.isFinite(value));
+      const ces = group.map((run) => run.lastTrainCe).filter((value): value is number => Number.isFinite(value));
+      const sampleRuns = group
+        .slice()
+        .sort(
+          (a, b) =>
+            (b.finalAccuracy ?? -1) - (a.finalAccuracy ?? -1) ||
+            (b.bestAccuracy ?? -1) - (a.bestAccuracy ?? -1) ||
+            (b.lastStep ?? -1) - (a.lastStep ?? -1)
+        )
+        .slice(0, 4)
+        .map((run) => run.runId);
+      return {
+        id: sanitizeIdeaId(`runfam_${familyKey}`, 80),
+        familyKey,
+        label: familyKey.replace(/_/g, " "),
+        runCount: group.length,
+        activeRuns: group.filter((run) => run.isActive).length,
+        bestAccuracy: accuracies.length > 0 ? Math.max(...accuracies) : null,
+        lastTrainCe: ces.length > 0 ? Math.min(...ces) : null,
+        docRefs: [...(docFamilyRefs.get(familyKey) ?? new Set<string>())].sort().slice(0, 8),
+        sampleRuns,
+      };
+    })
+    .sort(
+      (a, b) =>
+        b.docRefs.length - a.docRefs.length ||
+        b.activeRuns - a.activeRuns ||
+        (b.bestAccuracy ?? -1) - (a.bestAccuracy ?? -1) ||
+        b.runCount - a.runCount ||
+        a.familyKey.localeCompare(b.familyKey)
+    );
+}
+
+function buildIdeaGraphEvidencePack(task: TaskContext, bootstrap: ReturnType<typeof getBootstrap>): {
+  docs: IdeaGraphEvidenceDoc[];
+  snippets: IdeaGraphEvidenceSnippet[];
+  runFamilies: IdeaGraphRunFamily[];
+} {
+  const allSnippets = bootstrap.docs.flatMap((doc) => splitDocIntoIdeaSnippets(task, doc));
+  const snippets = selectIdeaGraphSnippets(bootstrap.docs, allSnippets);
+  const snippetIdsByDoc = new Map<string, string[]>();
+  for (const snippet of snippets) {
+    const group = snippetIdsByDoc.get(snippet.docFile);
+    if (group) group.push(snippet.id);
+    else snippetIdsByDoc.set(snippet.docFile, [snippet.id]);
+  }
+  const docs = bootstrap.docs.map((doc) => ({
+    file: doc.file,
+    title: doc.title,
+    updatedAt: doc.updatedAt,
+    runRefs: doc.runRefs.slice(0, 8),
+    snippetIds: snippetIdsByDoc.get(doc.file) ?? [],
+  }));
+  const runFamilies = buildIdeaGraphRunFamilies(bootstrap.runs, bootstrap.docs);
+  return { docs, snippets, runFamilies };
+}
+
+type IdeaGraphEvidenceLookupEntry = {
+  id: string;
+  kind: "snippet" | "run_family";
+  text: string;
+  short: string;
+};
+
+function buildIdeaGraphEvidenceLookup(evidence: {
+  snippets: IdeaGraphEvidenceSnippet[];
+  runFamilies: IdeaGraphRunFamily[];
+}): Map<string, IdeaGraphEvidenceLookupEntry> {
+  const lookup = new Map<string, IdeaGraphEvidenceLookupEntry>();
+  for (const snippet of evidence.snippets) {
+    const short = `${snippet.docFile} • ${snippet.heading}`;
+    lookup.set(snippet.id, {
+      id: snippet.id,
+      kind: "snippet",
+      short,
+      text: `snippet ${snippet.id} | doc=${snippet.docFile} | heading=${snippet.heading} | runs=${snippet.runRefs.join(",") || "-"} | excerpt=${snippet.excerpt}`,
+    });
+  }
+  for (const family of evidence.runFamilies) {
+    const short = `${family.familyKey} • runs=${family.runCount}`;
+    lookup.set(family.id, {
+      id: family.id,
+      kind: "run_family",
+      short,
+      text: `run_family ${family.id} | family=${family.familyKey} | runs=${family.runCount} | active=${family.activeRuns} | best_acc=${fmtAcc(family.bestAccuracy)} | last_train_ce=${fmtAcc(family.lastTrainCe)} | docs=${family.docRefs.join(",") || "-"} | samples=${family.sampleRuns.join(",") || "-"}`,
+    });
+  }
+  return lookup;
+}
+
+function formatIdeaGraphEvidencePackForHarvestPrompt(
+  task: TaskContext,
+  bootstrap: ReturnType<typeof getBootstrap>,
+  evidence: { docs: IdeaGraphEvidenceDoc[]; snippets: IdeaGraphEvidenceSnippet[]; runFamilies: IdeaGraphRunFamily[] }
+): string {
+  return [
+    "You are stage 1 of 3 for a semantic idea-graph build.",
+    `Task: ${task.title} (${task.id})`,
+    task.description ? `Task description: ${task.description}` : null,
+    task.qaPromptHint ? `Task-specific hint: ${task.qaPromptHint}` : null,
+    "",
+    "Stage goal:",
+    "- Harvest stable candidate concepts, properties, and concrete variants across the full task corpus.",
+    "- Optimize for recall, not final pruning.",
+    "- Do not build edges yet.",
+    "",
+    "Return JSON only with this shape:",
+    "{",
+    '  "candidates": [',
+    "    {",
+    '      "id": "string",',
+    '      "label": "canonical concept label",',
+    '      "kind": "idea|property|variant",',
+    '      "aliases": ["optional alias"],',
+    '      "candidateRefs": ["snippet_or_run_family_ref"],',
+    '      "notes": "why this candidate matters"',
+    "    }",
+    "  ]",
+    "}",
+    "",
+    "Rules:",
+    `- Return between 10 and ${IDEA_GRAPH_HARVEST_MAX_CANDIDATES} candidates.`,
+    "- candidateRefs must use only snippet ids or run_family ids from the evidence pack below.",
+    "- Prefer stable project concepts over plan labels, queue labels, or filenames.",
+    "- Collapse aliases if two labels describe the same underlying mechanism.",
+    "- It is okay to keep partially supported candidates here; stage 2 will prune them.",
+    "- Do not create edges, priorities, or next actions.",
+    "",
+    "Tracker snapshot:",
+    `- generated_at=${bootstrap.generatedAt}`,
+    `- docs=${bootstrap.summary.docsCount}`,
+    `- runs=${bootstrap.summary.runsCount}`,
+    `- runs_with_accuracy=${bootstrap.summary.runsWithAccuracy}`,
+    "",
+    "Docs in corpus:",
+    ...(evidence.docs.length > 0
+      ? evidence.docs.map(
+          (doc) => `- ${doc.file} | title=${doc.title} | updated=${doc.updatedAt} | run_refs=${doc.runRefs.join(",") || "-"} | snippet_refs=${doc.snippetIds.join(",") || "-"}`
+        )
+      : ["- none"]),
+    "",
+    "Selected snippet evidence across the corpus:",
+    ...(evidence.snippets.length > 0
+      ? evidence.snippets.map(
+          (snippet) =>
+            `- ${snippet.id} | doc=${snippet.docFile} | heading=${snippet.heading} | runs=${snippet.runRefs.join(",") || "-"} | acc=${snippet.mentionedAccuracies.join(",") || "-"} | excerpt=${snippet.excerpt}`
+        )
+      : ["- none"]),
+    "",
+    "Run families:",
+    ...(evidence.runFamilies.length > 0
+      ? evidence.runFamilies.map(
+          (family) =>
+            `- ${family.id} | family=${family.familyKey} | runs=${family.runCount} | active=${family.activeRuns} | best_acc=${fmtAcc(family.bestAccuracy)} | last_train_ce=${fmtAcc(family.lastTrainCe)} | docs=${family.docRefs.join(",") || "-"} | samples=${family.sampleRuns.join(",") || "-"}`
+        )
+      : ["- none"]),
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join("\n");
+}
+
+function scoreIdeaEvidenceMatch(
+  candidateTerms: string[],
+  candidatePhrases: string[],
+  entry: IdeaGraphEvidenceLookupEntry,
+  candidateRefSet: Set<string>
+): number {
+  let score = candidateRefSet.has(entry.id) ? 8 : 0;
+  const haystack = normalizeIdeaSearchText(entry.text);
+  for (const phrase of candidatePhrases) {
+    if (phrase.length >= 4 && haystack.includes(phrase)) score += 5;
+  }
+  const tokenSet = new Set(haystack.split(" ").filter(Boolean));
+  for (const term of candidateTerms) {
+    if (tokenSet.has(term)) score += 2;
+  }
+  return score;
+}
+
+function collectCandidateEvidenceRefs(
+  candidate: IdeaGraphHarvestCandidate,
+  evidence: { docs: IdeaGraphEvidenceDoc[]; snippets: IdeaGraphEvidenceSnippet[]; runFamilies: IdeaGraphRunFamily[] },
+  lookup: Map<string, IdeaGraphEvidenceLookupEntry>
+): string[] {
+  const docSnippetMap = new Map(evidence.docs.map((doc) => [doc.file, doc.snippetIds] as const));
+  const familyByKey = new Map(evidence.runFamilies.map((family) => [family.familyKey, family.id] as const));
+  const familyByRun = new Map<string, string>();
+  for (const family of evidence.runFamilies) {
+    for (const runId of family.sampleRuns) familyByRun.set(runId, family.id);
+  }
+  const directRefs = new Set<string>();
+  for (const rawRef of candidate.candidateRefs) {
+    const ref = String(rawRef ?? "").trim();
+    if (!ref) continue;
+    if (lookup.has(ref)) {
+      directRefs.add(ref);
+      continue;
+    }
+    for (const snippetId of docSnippetMap.get(ref) ?? []) directRefs.add(snippetId);
+    const familyRef = familyByKey.get(normalizeRunId(ref)) ?? familyByRun.get(ref);
+    if (familyRef) directRefs.add(familyRef);
+  }
+  const candidatePhrases = uniq([candidate.label, ...candidate.aliases].map(normalizeIdeaSearchText).filter((value) => value.length >= 4));
+  const candidateTerms = tokenizeIdeaSearchText([candidate.label, ...candidate.aliases].join(" "));
+  const scored = [...lookup.values()]
+    .map((entry) => ({
+      id: entry.id,
+      score: scoreIdeaEvidenceMatch(candidateTerms, candidatePhrases, entry, directRefs),
+    }))
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
+  const refs = [...directRefs];
+  for (const entry of scored) {
+    if (refs.length >= IDEA_GRAPH_ATTACH_MAX_REFS) break;
+    if (refs.includes(entry.id)) continue;
+    refs.push(entry.id);
+  }
+  return refs.slice(0, IDEA_GRAPH_ATTACH_MAX_REFS);
+}
+
+function buildIdeaGraphAttachmentPrompt(
+  task: TaskContext,
+  candidates: IdeaGraphHarvestCandidate[],
+  evidenceRefsByCandidate: Map<string, string[]>,
+  lookup: Map<string, IdeaGraphEvidenceLookupEntry>
+): string {
+  return [
+    "You are stage 2 of 3 for a semantic idea-graph build.",
+    `Task: ${task.title} (${task.id})`,
+    "",
+    "Stage goal:",
+    "- Prune weak or duplicate candidates.",
+    "- Attach explicit supporting evidence to the survivors.",
+    "- Write compact summaries/details for the surviving candidates.",
+    "",
+    "Return JSON only with this shape:",
+    "{",
+    '  "kept": [',
+    "    {",
+    '      "id": "string",',
+    '      "label": "canonical concept label",',
+    '      "kind": "idea|property|variant",',
+    '      "aliases": ["optional alias"],',
+    '      "summary": "one compact sentence",',
+    '      "detail": "2-3 short sentences",',
+    '      "coverageNote": "what the evidence coverage looks like",',
+    '      "evidenceRefs": ["supporting_ref"],',
+    '      "contradictionRefs": ["optional_ref"]',
+    "    }",
+    "  ],",
+    '  "dropped": [',
+    "    {",
+    '      "id": "string",',
+    '      "label": "candidate label",',
+    '      "reason": "why it was dropped",',
+    '      "candidateRefs": ["original_ref"]',
+    "    }",
+    "  ]",
+    "}",
+    "",
+    "Rules:",
+    "- Keep only stable semantic concepts that are actually supported by the evidence.",
+    "- Drop thin, duplicate, purely organizational, or speculative candidates.",
+    "- Keep evidenceRefs focused and explicit. Prefer snippet ids and run_family ids that directly support the concept.",
+    "- contradictionRefs should be empty unless the evidence genuinely cuts against the candidate.",
+    "- coverageNote should state whether the support is broad, narrow, or mixed.",
+    "",
+    "Candidates and matched evidence:",
+    ...candidates.flatMap((candidate) => {
+      const refs = evidenceRefsByCandidate.get(candidate.id) ?? [];
+      return [
+        `- candidate ${candidate.id} | label=${candidate.label} | kind=${candidate.kind} | aliases=${candidate.aliases.join(",") || "-"} | seed_refs=${candidate.candidateRefs.join(",") || "-"} | notes=${candidate.notes}`,
+        ...refs.map((ref) => `  - ${lookup.get(ref)?.text ?? ref}`),
+      ];
+    }),
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join("\n");
+}
+
+function buildIdeaGraphSynthesisPrompt(
+  task: TaskContext,
+  candidates: IdeaGraphAttachedCandidate[],
+  lookup: Map<string, IdeaGraphEvidenceLookupEntry>
+): string {
+  return [
+    "You are stage 3 of 3 for a semantic idea-graph build.",
+    `Task: ${task.title} (${task.id})`,
+    "",
+    "Stage goal:",
+    "- Build a sparse semantic DAG from the validated candidates below.",
+    "- Choose the most central entry concepts as anchors.",
+    "- Create only evidence-backed concept-to-concept edges.",
+    "",
+    "Return JSON only with this shape:",
+    "{",
+    '  "anchors": ["candidate_id"],',
+    '  "edges": [',
+    "    {",
+    '      "fromId": "candidate_id",',
+    '      "toId": "candidate_id",',
+    '      "relationPhrase": "short semantic relation",',
+    '      "reasoning": "why the evidence supports the edge",',
+    '      "evidenceRefs": ["supporting_ref"]',
+    "    }",
+    "  ]",
+    "}",
+    "",
+    "Rules:",
+    `- Return between 3 and ${IDEA_TREE_MAX_ANCHORS} anchors.`,
+    "- Nodes are fixed. Do not invent new node ids.",
+    "- Prefer sparse, strong edges over dense speculative ones.",
+    "- Edge direction matters and should read naturally from source to target.",
+    "- Avoid organizational or process relations.",
+    "- If two candidates do not have a real supported relation, leave them disconnected.",
+    "",
+    "Validated candidates:",
+    ...candidates.flatMap((candidate) => [
+      `- ${candidate.id} | label=${candidate.label} | kind=${candidate.kind} | aliases=${candidate.aliases.join(",") || "-"} | summary=${candidate.summary} | coverage=${candidate.coverageNote} | evidence=${candidate.evidenceRefs.join(",") || "-"} | contradictions=${candidate.contradictionRefs.join(",") || "-"}`,
+      ...candidate.evidenceRefs.slice(0, 6).map((ref) => `  - ${lookup.get(ref)?.text ?? ref}`),
+    ]),
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join("\n");
+}
+
 function transpileAppTs(): string {
   const src = readText(appTsPath);
   const transpiler = new Bun.Transpiler({ loader: "ts", target: "browser" });
@@ -596,7 +1362,11 @@ function formatSweepForQa(sweep: SweepSummary): string {
   return `${sweep.sweepId}: status=${sweep.status} active_runs=${sweep.activeRuns} runs=${sweep.runs.length} best_acc=${fmtAcc(sweep.bestAccuracy)} last_train_ce=${fmtAcc(sweep.lastTrainCe)} started=${sweep.startedAt ?? "-"} ended=${sweep.endedAt ?? "-"}`;
 }
 
-function buildTaskQaPrompt(task: TaskContext, question: string, conversation: ChatTurn[]): string {
+function buildTaskQaPrompt(
+  task: TaskContext,
+  question: string,
+  conversation: ChatTurn[]
+): string {
   const bootstrap = getBootstrap(task);
   const activeSweeps = bootstrap.sweeps.filter((sweep) => sweep.activeRuns > 0).slice(0, 6);
   const recentSweeps = bootstrap.sweeps.slice(0, 8);
@@ -697,22 +1467,38 @@ function parseEvidenceFromAnswer(answer: string): string[] {
   return evidence;
 }
 
-async function runCodexTaskQa(prompt: string): Promise<string> {
+async function runCodexPrompt(
+  prompt: string,
+  opts: {
+    tempPrefix: string;
+    timeoutMs: number;
+    timeoutLabel: string;
+    reasoningEffort?: "low" | "medium" | "high" | "xhigh";
+    outputSchema?: Record<string, unknown>;
+  }
+): Promise<string> {
   if (!codexExecutable) throw new Error("codex executable not found on the server.");
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "research-task-qa-"));
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), opts.tempPrefix));
   const outputFile = path.join(tempDir, "last-message.txt");
+  const args = [
+    codexExecutable,
+    "exec",
+    "-C",
+    repoRoot,
+    "--ephemeral",
+    "-s",
+    "read-only",
+  ];
+  if (opts.reasoningEffort) args.push("-c", `model_reasoning_effort="${opts.reasoningEffort}"`);
+  if (opts.outputSchema) {
+    const schemaFile = path.join(tempDir, "output-schema.json");
+    fs.writeFileSync(schemaFile, JSON.stringify(opts.outputSchema, null, 2));
+    args.push("--output-schema", schemaFile);
+  }
+  args.push("--output-last-message", outputFile, "-");
   let timedOut = false;
   const proc = Bun.spawn(
-    [
-      codexExecutable,
-      "exec",
-      "-C",
-      repoRoot,
-      "--dangerously-bypass-approvals-and-sandbox",
-      "--output-last-message",
-      outputFile,
-      "-",
-    ],
+    args,
     {
       stdin: new Blob([prompt]),
       stdout: "pipe",
@@ -732,7 +1518,7 @@ async function runCodexTaskQa(prompt: string): Promise<string> {
     } catch {
       // no-op
     }
-  }, QA_TIMEOUT_MS);
+  }, opts.timeoutMs);
 
   try {
     const [exitCode, stdout, stderr] = await Promise.all([
@@ -740,7 +1526,7 @@ async function runCodexTaskQa(prompt: string): Promise<string> {
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
     ]);
-    if (timedOut) throw new Error(`Task QA timed out after ${QA_TIMEOUT_MS / 1000}s.`);
+    if (timedOut) throw new Error(`${opts.timeoutLabel} timed out after ${opts.timeoutMs / 1000}s.`);
     const output = (fs.existsSync(outputFile) ? readText(outputFile) : stdout).trim();
     if (output) return output;
     const detail = stderr.trim() || stdout.trim();
@@ -749,6 +1535,299 @@ async function runCodexTaskQa(prompt: string): Promise<string> {
     clearTimeout(timer);
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
+}
+
+async function runCodexTaskQa(prompt: string): Promise<string> {
+  return runCodexPrompt(prompt, {
+    tempPrefix: "research-task-qa-",
+    timeoutMs: QA_TIMEOUT_MS,
+    timeoutLabel: "Task QA",
+    reasoningEffort: "high",
+  });
+}
+
+async function runCodexIdeaGraphStage(
+  prompt: string,
+  opts: {
+    stage: string;
+    timeoutMs: number;
+    outputSchema: Record<string, unknown>;
+  }
+): Promise<string> {
+  return runCodexPrompt(prompt, {
+    tempPrefix: `research-idea-graph-${opts.stage}-`,
+    timeoutMs: opts.timeoutMs,
+    timeoutLabel: `Idea graph ${opts.stage}`,
+    reasoningEffort: IDEA_TREE_REASONING_EFFORT,
+    outputSchema: opts.outputSchema,
+  });
+}
+
+function extractJsonObject(raw: string): string {
+  const trimmed = raw.trim();
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced) return fenced[1].trim();
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+  if (start !== -1 && end !== -1 && end > start) return trimmed.slice(start, end + 1).trim();
+  return trimmed;
+}
+
+function normalizeIdeaNodeKind(value: unknown): IdeaTreeNodeKind {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (normalized === "idea" || normalized === "property" || normalized === "variant") return normalized;
+  return "idea";
+}
+
+function normalizeIdeaRefs(value: unknown, max = 6): string[] {
+  if (!Array.isArray(value)) return [];
+  return uniq(
+    value
+      .map((entry) => trimTo(String(entry ?? "").trim(), 80))
+      .filter(Boolean)
+      .slice(0, max)
+  );
+}
+
+function normalizeIdeaGraphHarvestCandidates(value: unknown, evidenceIds: Set<string>): IdeaGraphHarvestCandidate[] {
+  if (!Array.isArray(value)) throw new Error("Idea graph harvest response is missing candidates[].");
+  const seen = new Set<string>();
+  const candidates: IdeaGraphHarvestCandidate[] = [];
+  for (const rawCandidate of value) {
+    if (!rawCandidate || typeof rawCandidate !== "object") continue;
+    const candidate = rawCandidate as Record<string, unknown>;
+    const id = sanitizeIdeaId(String(candidate.id ?? ""), 48);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    candidates.push({
+      id,
+      label: trimTo(String(candidate.label ?? "").trim(), 80) || id,
+      kind: normalizeIdeaNodeKind(candidate.kind),
+      aliases: normalizeIdeaRefs(candidate.aliases, 6).slice(0, 6),
+      candidateRefs: normalizeIdeaRefs(candidate.candidateRefs, IDEA_GRAPH_ATTACH_MAX_REFS).filter((ref) => evidenceIds.has(ref)),
+      notes: trimTo(String(candidate.notes ?? "").trim(), 240),
+    });
+  }
+  return candidates;
+}
+
+function normalizeIdeaGraphAttachmentCandidates(
+  value: unknown,
+  allowedIds: Set<string>,
+  evidenceIds: Set<string>
+): IdeaGraphAttachedCandidate[] {
+  if (!Array.isArray(value)) throw new Error("Idea graph attachment response is missing kept[].");
+  const seen = new Set<string>();
+  const kept: IdeaGraphAttachedCandidate[] = [];
+  for (const rawCandidate of value) {
+    if (!rawCandidate || typeof rawCandidate !== "object") continue;
+    const candidate = rawCandidate as Record<string, unknown>;
+    const id = sanitizeIdeaId(String(candidate.id ?? ""), 48);
+    if (!id || seen.has(id) || !allowedIds.has(id)) continue;
+    seen.add(id);
+    kept.push({
+      id,
+      label: trimTo(String(candidate.label ?? "").trim(), 80) || id,
+      kind: normalizeIdeaNodeKind(candidate.kind),
+      aliases: normalizeIdeaRefs(candidate.aliases, 6).slice(0, 6),
+      summary: trimTo(String(candidate.summary ?? "").trim(), 160),
+      detail: trimTo(String(candidate.detail ?? "").trim(), 420),
+      coverageNote: trimTo(String(candidate.coverageNote ?? "").trim(), 220),
+      evidenceRefs: normalizeIdeaRefs(candidate.evidenceRefs, IDEA_GRAPH_ATTACH_MAX_REFS).filter((ref) => evidenceIds.has(ref)),
+      contradictionRefs: normalizeIdeaRefs(candidate.contradictionRefs, 6).filter((ref) => evidenceIds.has(ref)),
+    });
+  }
+  return kept;
+}
+
+function normalizeIdeaGraphDroppedCandidates(
+  value: unknown,
+  allowedIds: Set<string>,
+  evidenceIds: Set<string>
+): IdeaGraphDroppedCandidate[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const dropped: IdeaGraphDroppedCandidate[] = [];
+  for (const rawCandidate of value) {
+    if (!rawCandidate || typeof rawCandidate !== "object") continue;
+    const candidate = rawCandidate as Record<string, unknown>;
+    const id = sanitizeIdeaId(String(candidate.id ?? ""), 48);
+    if (!id || seen.has(id) || !allowedIds.has(id)) continue;
+    seen.add(id);
+    dropped.push({
+      id,
+      label: trimTo(String(candidate.label ?? "").trim(), 80) || id,
+      reason: trimTo(String(candidate.reason ?? "").trim(), 240),
+      candidateRefs: normalizeIdeaRefs(candidate.candidateRefs, IDEA_GRAPH_ATTACH_MAX_REFS).filter((ref) => evidenceIds.has(ref)),
+    });
+  }
+  return dropped;
+}
+
+function normalizeIdeaGraphEdges(value: unknown): IdeaGraphEdgeModel[] {
+  if (!Array.isArray(value)) return [];
+  const edges: IdeaGraphEdgeModel[] = [];
+  for (const rawEdge of value) {
+    if (!rawEdge || typeof rawEdge !== "object") continue;
+    const edge = rawEdge as Record<string, unknown>;
+    const fromId = sanitizeIdeaId(String(edge.fromId ?? ""), 48);
+    const toId = sanitizeIdeaId(String(edge.toId ?? ""), 48);
+    if (!fromId || !toId || fromId === toId) continue;
+    edges.push({
+      fromId,
+      toId,
+      relationPhrase: trimTo(String(edge.relationPhrase ?? "").trim(), 48),
+      reasoning: trimTo(String(edge.reasoning ?? "").trim(), 260),
+      evidenceRefs: normalizeIdeaRefs(edge.evidenceRefs, IDEA_GRAPH_ATTACH_MAX_REFS),
+    });
+  }
+  return edges;
+}
+
+function validateIdeaGraphHarvestResponse(
+  raw: string,
+  evidence: { docs: IdeaGraphEvidenceDoc[]; snippets: IdeaGraphEvidenceSnippet[]; runFamilies: IdeaGraphRunFamily[] }
+): IdeaGraphHarvestCandidate[] {
+  const evidenceIds = new Set<string>([
+    ...evidence.snippets.map((snippet) => snippet.id),
+    ...evidence.runFamilies.map((family) => family.id),
+  ]);
+  let parsed: { candidates?: unknown };
+  try {
+    parsed = JSON.parse(extractJsonObject(raw)) as { candidates?: unknown };
+  } catch (error) {
+    throw new Error(`Idea graph harvest JSON parse failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const candidates = normalizeIdeaGraphHarvestCandidates(parsed.candidates, evidenceIds)
+    .filter((candidate) => candidate.label.length > 0 && candidate.candidateRefs.length > 0 && candidate.notes.length > 0)
+    .map((candidate) => ({
+      ...candidate,
+      aliases: uniq(candidate.aliases.filter((alias) => alias.toLowerCase() !== candidate.label.toLowerCase())).slice(0, 6),
+    }));
+  if (candidates.length === 0) throw new Error("Idea graph harvest returned no valid candidates.");
+  return candidates;
+}
+
+function validateIdeaGraphAttachmentResponse(
+  raw: string,
+  harvested: IdeaGraphHarvestCandidate[],
+  evidence: { snippets: IdeaGraphEvidenceSnippet[]; runFamilies: IdeaGraphRunFamily[] }
+): {
+  kept: IdeaGraphAttachedCandidate[];
+  dropped: IdeaGraphDroppedCandidate[];
+} {
+  const allowedIds = new Set(harvested.map((candidate) => candidate.id));
+  const evidenceIds = new Set<string>([
+    ...evidence.snippets.map((snippet) => snippet.id),
+    ...evidence.runFamilies.map((family) => family.id),
+  ]);
+  let parsed: { kept?: unknown; dropped?: unknown };
+  try {
+    parsed = JSON.parse(extractJsonObject(raw)) as { kept?: unknown; dropped?: unknown };
+  } catch (error) {
+    throw new Error(`Idea graph attachment JSON parse failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const kept = normalizeIdeaGraphAttachmentCandidates(parsed.kept, allowedIds, evidenceIds)
+    .filter((candidate) => candidate.label.length > 0 && candidate.summary.length > 0 && candidate.detail.length > 0 && candidate.coverageNote.length > 0 && candidate.evidenceRefs.length > 0)
+    .map((candidate) => ({
+      ...candidate,
+      aliases: uniq(candidate.aliases.filter((alias) => alias.toLowerCase() !== candidate.label.toLowerCase())).slice(0, 6),
+    }));
+  if (kept.length < 4) throw new Error("Idea graph attachment kept too few evidence-backed candidates.");
+  const dropped = normalizeIdeaGraphDroppedCandidates(parsed.dropped, allowedIds, evidenceIds).filter((candidate) => candidate.reason.length > 0);
+  return { kept, dropped };
+}
+
+function validateIdeaGraphSynthesisResponse(
+  raw: string,
+  attached: IdeaGraphAttachedCandidate[],
+  evidence: { snippets: IdeaGraphEvidenceSnippet[]; runFamilies: IdeaGraphRunFamily[] }
+): { anchors: string[]; edges: IdeaTreeEdge[] } {
+  const nodesById = new Map(attached.map((candidate) => [candidate.id, candidate] as const));
+  const evidenceIds = new Set<string>([
+    ...evidence.snippets.map((snippet) => snippet.id),
+    ...evidence.runFamilies.map((family) => family.id),
+  ]);
+  let parsed: { anchors?: unknown; edges?: unknown };
+  try {
+    parsed = JSON.parse(extractJsonObject(raw)) as { anchors?: unknown; edges?: unknown };
+  } catch (error) {
+    throw new Error(`Idea graph synthesis JSON parse failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const anchors = Array.isArray(parsed.anchors)
+    ? uniq(
+        parsed.anchors
+          .map((anchor) => sanitizeIdeaId(String(anchor ?? ""), 48))
+          .filter((anchor) => Boolean(anchor) && nodesById.has(anchor))
+      )
+    : [];
+  if (anchors.length === 0) throw new Error("Idea graph synthesis returned no valid anchors.");
+  if (anchors.length > IDEA_TREE_MAX_ANCHORS) throw new Error(`Idea graph returned too many anchors (max ${IDEA_TREE_MAX_ANCHORS}).`);
+  const edges = normalizeIdeaGraphEdges(parsed.edges);
+  const dedupedEdges: IdeaTreeEdge[] = [];
+  const seenEdges = new Set<string>();
+  for (const edge of edges) {
+    if (!nodesById.has(edge.fromId) || !nodesById.has(edge.toId)) continue;
+    const evidenceRefs = edge.evidenceRefs.filter((ref) => evidenceIds.has(ref));
+    if (!edge.relationPhrase || !edge.reasoning || evidenceRefs.length === 0) continue;
+    const key = `${edge.fromId}|${edge.relationPhrase}|${edge.toId}`;
+    if (seenEdges.has(key)) continue;
+    seenEdges.add(key);
+    dedupedEdges.push({
+      id: `${edge.fromId}__${edge.toId}__${edge.relationPhrase.replace(/[^A-Za-z0-9]+/g, "_").slice(0, 24)}`,
+      fromId: edge.fromId,
+      toId: edge.toId,
+      relationPhrase: edge.relationPhrase,
+      reasoning: edge.reasoning,
+      evidenceRefs,
+    });
+  }
+  if (dedupedEdges.length === 0) throw new Error("Idea graph synthesis returned no valid semantic edges.");
+  return { anchors, edges: dedupedEdges };
+}
+
+function buildIdeaTreeResponse(
+  task: TaskContext,
+  bootstrap: ReturnType<typeof getBootstrap>,
+  evidence: { docs: IdeaGraphEvidenceDoc[]; snippets: IdeaGraphEvidenceSnippet[]; runFamilies: IdeaGraphRunFamily[] },
+  harvested: IdeaGraphHarvestCandidate[],
+  attached: { kept: IdeaGraphAttachedCandidate[]; dropped: IdeaGraphDroppedCandidate[] },
+  graph: { anchors: string[]; edges: IdeaTreeEdge[] },
+  timings: IdeaGraphDebug["timings"]
+): IdeaTreeResponse {
+  const nodes = attached.kept.map((candidate) => ({
+    id: candidate.id,
+    label: candidate.label,
+    kind: candidate.kind,
+    summary: candidate.summary,
+    detail: candidate.detail,
+    aliases: candidate.aliases,
+    evidenceRefs: candidate.evidenceRefs,
+  }));
+  return {
+    taskId: task.id,
+    generatedAt: new Date().toISOString(),
+    anchors: graph.anchors,
+    inputs: {
+      snapshotGeneratedAt: bootstrap.generatedAt,
+      docs: evidence.docs.map((doc) => doc.file),
+      snippetCount: evidence.snippets.length,
+      runFamilyCount: evidence.runFamilies.length,
+      pipelineVersion: "semantic_graph_v3",
+    },
+    graph: {
+      nodes,
+      edges: graph.edges,
+    },
+    debug: {
+      timings,
+      evidence,
+      harvest: {
+        candidates: harvested,
+      },
+      attachment: attached,
+    },
+  };
 }
 
 async function handleTaskQa(req: Request): Promise<Response> {
@@ -783,12 +1862,97 @@ async function handleTaskQa(req: Request): Promise<Response> {
 
   try {
     const answer = await runCodexTaskQa(buildTaskQaPrompt(task, question, conversation));
+    const evidence = parseEvidenceFromAnswer(answer);
     const response: TaskQaResponse = {
       taskId: task.id,
       answer,
-      evidence: parseEvidenceFromAnswer(answer),
+      evidence,
       generatedAt: new Date().toISOString(),
     };
+    return new Response(JSON.stringify(response), {
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+    });
+  } catch (error) {
+    return new Response(
+      JSON.stringify({
+        error: error instanceof Error ? error.message : String(error),
+      }),
+      {
+        status: 500,
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+      }
+    );
+  }
+}
+
+async function handleIdeaTree(req: Request, fallbackTask: TaskContext | null): Promise<Response> {
+  let payload: IdeaTreeRequest;
+  try {
+    payload = (await req.json()) as IdeaTreeRequest;
+  } catch {
+    return new Response(JSON.stringify({ error: "Invalid JSON body." }), {
+      status: 400,
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+    });
+  }
+  const task = resolveTaskContext(payload.taskId ?? fallbackTask?.id ?? null);
+  if (!task) {
+    return new Response(JSON.stringify({ error: "Unknown task." }), {
+      status: 404,
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+    });
+  }
+
+  try {
+    const totalStart = Date.now();
+    const bootstrap = getBootstrap(task);
+
+    const evidenceStart = Date.now();
+    const evidence = buildIdeaGraphEvidencePack(task, bootstrap);
+    const evidenceMs = Date.now() - evidenceStart;
+
+    const harvestStart = Date.now();
+    const harvestPrompt = formatIdeaGraphEvidencePackForHarvestPrompt(task, bootstrap, evidence);
+    const harvestRaw = await runCodexIdeaGraphStage(harvestPrompt, {
+      stage: "harvest",
+      timeoutMs: IDEA_GRAPH_HARVEST_TIMEOUT_MS,
+      outputSchema: IDEA_GRAPH_HARVEST_OUTPUT_SCHEMA as Record<string, unknown>,
+    });
+    const harvested = validateIdeaGraphHarvestResponse(harvestRaw, evidence);
+    const harvestMs = Date.now() - harvestStart;
+
+    const lookup = buildIdeaGraphEvidenceLookup(evidence);
+    const evidenceRefsByCandidate = new Map(
+      harvested.map((candidate) => [candidate.id, collectCandidateEvidenceRefs(candidate, evidence, lookup)] as const)
+    );
+
+    const attachmentStart = Date.now();
+    const attachmentPrompt = buildIdeaGraphAttachmentPrompt(task, harvested, evidenceRefsByCandidate, lookup);
+    const attachmentRaw = await runCodexIdeaGraphStage(attachmentPrompt, {
+      stage: "attachment",
+      timeoutMs: IDEA_GRAPH_ATTACHMENT_TIMEOUT_MS,
+      outputSchema: IDEA_GRAPH_ATTACHMENT_OUTPUT_SCHEMA as Record<string, unknown>,
+    });
+    const attached = validateIdeaGraphAttachmentResponse(attachmentRaw, harvested, evidence);
+    const attachmentMs = Date.now() - attachmentStart;
+
+    const graphStart = Date.now();
+    const synthesisPrompt = buildIdeaGraphSynthesisPrompt(task, attached.kept, lookup);
+    const graphRaw = await runCodexIdeaGraphStage(synthesisPrompt, {
+      stage: "synthesis",
+      timeoutMs: IDEA_GRAPH_SYNTHESIS_TIMEOUT_MS,
+      outputSchema: IDEA_GRAPH_SYNTHESIS_OUTPUT_SCHEMA as Record<string, unknown>,
+    });
+    const graph = validateIdeaGraphSynthesisResponse(graphRaw, attached.kept, evidence);
+    const graphMs = Date.now() - graphStart;
+
+    const response = buildIdeaTreeResponse(task, bootstrap, evidence, harvested, attached, graph, {
+      evidenceMs,
+      harvestMs,
+      attachmentMs,
+      graphMs,
+      totalMs: Date.now() - totalStart,
+    });
     return new Response(JSON.stringify(response), {
       headers: { "Content-Type": "application/json; charset=utf-8" },
     });
@@ -863,6 +2027,10 @@ serve({
     if (url.pathname === "/api/qa/task") {
       if (req.method !== "POST") return new Response("Method not allowed", { status: 405 });
       return handleTaskQa(req);
+    }
+    if (url.pathname === "/api/ideas/tree") {
+      if (req.method !== "POST") return new Response("Method not allowed", { status: 405 });
+      return handleIdeaTree(req, task);
     }
     return new Response("Not found", { status: 404 });
   },

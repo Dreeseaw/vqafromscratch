@@ -96,6 +96,126 @@ type TaskQaResponse = {
   generatedAt: string;
 };
 
+type IdeaTreeNodeKind = "idea" | "property" | "variant";
+
+type IdeaTreeNode = {
+  id: string;
+  label: string;
+  kind: IdeaTreeNodeKind;
+  summary: string;
+  detail: string;
+  aliases: string[];
+  evidenceRefs: string[];
+};
+
+type IdeaTreeEdge = {
+  id: string;
+  fromId: string;
+  toId: string;
+  relationPhrase: string;
+  reasoning: string;
+  evidenceRefs: string[];
+};
+
+type IdeaGraphEvidenceDoc = {
+  file: string;
+  title: string;
+  updatedAt: string;
+  runRefs: string[];
+  snippetIds: string[];
+};
+
+type IdeaGraphEvidenceSnippet = {
+  id: string;
+  docFile: string;
+  heading: string;
+  updatedAt: string;
+  excerpt: string;
+  runRefs: string[];
+  mentionedAccuracies: number[];
+  score: number;
+};
+
+type IdeaGraphRunFamily = {
+  id: string;
+  familyKey: string;
+  label: string;
+  runCount: number;
+  activeRuns: number;
+  bestAccuracy: number | null;
+  lastTrainCe: number | null;
+  docRefs: string[];
+  sampleRuns: string[];
+};
+
+type IdeaGraphHarvestCandidate = {
+  id: string;
+  label: string;
+  kind: IdeaTreeNodeKind;
+  aliases: string[];
+  candidateRefs: string[];
+  notes: string;
+};
+
+type IdeaGraphAttachedCandidate = {
+  id: string;
+  label: string;
+  kind: IdeaTreeNodeKind;
+  aliases: string[];
+  summary: string;
+  detail: string;
+  coverageNote: string;
+  evidenceRefs: string[];
+  contradictionRefs: string[];
+};
+
+type IdeaGraphDroppedCandidate = {
+  id: string;
+  label: string;
+  reason: string;
+  candidateRefs: string[];
+};
+
+type IdeaGraphDebug = {
+  timings: {
+    evidenceMs: number;
+    harvestMs: number;
+    attachmentMs: number;
+    graphMs: number;
+    totalMs: number;
+  };
+  evidence: {
+    docs: IdeaGraphEvidenceDoc[];
+    snippets: IdeaGraphEvidenceSnippet[];
+    runFamilies: IdeaGraphRunFamily[];
+  };
+  harvest: {
+    candidates: IdeaGraphHarvestCandidate[];
+  };
+  attachment: {
+    kept: IdeaGraphAttachedCandidate[];
+    dropped: IdeaGraphDroppedCandidate[];
+  };
+};
+
+type IdeaTreeResponse = {
+  taskId: string;
+  generatedAt: string;
+  anchors: string[];
+  inputs: {
+    snapshotGeneratedAt: string;
+    docs: string[];
+    snippetCount: number;
+    runFamilyCount: number;
+    pipelineVersion: string;
+  };
+  graph: {
+    nodes: IdeaTreeNode[];
+    edges: IdeaTreeEdge[];
+  };
+  debug: IdeaGraphDebug;
+};
+
 type QaMessage = {
   role: "user" | "assistant";
   content: string;
@@ -131,6 +251,15 @@ const fmtParams = (total: number | null, trainable: number | null) => {
   return `${totalStr} (${fmtPct(((trainable as number) / (total as number)) * 100)})`;
 };
 
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
 const SWEEPS_PAGE_SIZE = 5;
 const RUNS_PAGE_SIZE = 10;
 const DOCS_PAGE_SIZE = 5;
@@ -152,9 +281,13 @@ let selectedDocUpdatedAt: string | null = null;
 let bootstrapLoadInFlight = false;
 let runDetailLoadInFlight = false;
 let taskQaLoadInFlight = false;
+let ideaTreeLoadInFlight = false;
 let sweepsSort: SortState<SweepSortKey> = { key: null, direction: "asc" };
 let runsSort: SortState<RunSortKey> = { key: "finalAccuracy", direction: "desc" };
 let docsSort: SortState<DocSortKey> = { key: null, direction: "asc" };
+let ideaTree: IdeaTreeResponse | null = null;
+let ideaTreeError: string | null = null;
+let ideaTreeEdgeRenderFrame: number | null = null;
 const qaThreads = new Map<string, QaMessage[]>();
 let collapsedSections = new Set<string>();
 
@@ -215,6 +348,7 @@ function setSectionCollapsed(sectionId: string, collapsed: boolean) {
   button.setAttribute("aria-expanded", String(!collapsed));
   if (collapsed) collapsedSections.add(sectionId);
   else collapsedSections.delete(sectionId);
+  if (!collapsed && sectionId === "ideaTreeSection") scheduleIdeaTreeEdgeRender();
 }
 
 function openSection(sectionId: string) {
@@ -248,6 +382,8 @@ function resetTaskScopedUi() {
   runDetail = null;
   selectedDocFile = null;
   selectedDocUpdatedAt = null;
+  ideaTree = null;
+  ideaTreeError = null;
   $("runDetailPanel").hidden = true;
   $("docDetailPanel").hidden = true;
   $("docDetailOpen").hidden = true;
@@ -462,44 +598,6 @@ function renderKpis(data: Bootstrap) {
   }
 }
 
-function selectSweep(sweepId: string) {
-  openSection("sweepsSection");
-  openSection("runsSection");
-  selectedSweep = sweepId;
-  runsPage = 0;
-  const select = $("sweepFilter") as HTMLSelectElement;
-  select.value = sweepId;
-  if (state) {
-    renderSweeps(state);
-    renderRuns(state);
-  }
-}
-
-function selectRun(runId: string, scrollIntoView: boolean) {
-  selectedRunId = runId;
-  openSection("runsSection");
-  openSection("runDetailPanel");
-  if (state) {
-    const ownerSweep = state.sweeps.find((sweep) => sweep.runs.some((run) => run.runId === runId));
-    if (ownerSweep) {
-      selectedSweep = ownerSweep.sweepId;
-      const select = $("sweepFilter") as HTMLSelectElement;
-      select.value = ownerSweep.sweepId;
-    }
-    renderRuns(state);
-  }
-  void loadRunDetail(runId, scrollIntoView);
-}
-
-function selectDoc(file: string, scrollIntoView: boolean) {
-  openSection("docsSection");
-  openSection("docDetailPanel");
-  selectedDocFile = file;
-  selectedDocUpdatedAt = null;
-  if (state) renderDocs(state);
-  void loadDocDetail(file, scrollIntoView);
-}
-
 function renderHighlights(data: Bootstrap) {
   const wrap = $("highlights");
   wrap.innerHTML = "";
@@ -571,6 +669,513 @@ function renderHighlights(data: Bootstrap) {
     `;
     button.addEventListener("click", card.onClick);
     wrap.appendChild(button);
+  }
+}
+
+function selectSweep(sweepId: string) {
+  openSection("sweepsSection");
+  openSection("runsSection");
+  selectedSweep = sweepId;
+  runsPage = 0;
+  const select = $("sweepFilter") as HTMLSelectElement;
+  select.value = sweepId;
+  if (state) {
+    renderSweeps(state);
+    renderRuns(state);
+  }
+}
+
+function selectRun(runId: string, scrollIntoView: boolean) {
+  selectedRunId = runId;
+  openSection("runsSection");
+  openSection("runDetailPanel");
+  if (state) {
+    const ownerSweep = state.sweeps.find((sweep) => sweep.runs.some((run) => run.runId === runId));
+    if (ownerSweep) {
+      selectedSweep = ownerSweep.sweepId;
+      const select = $("sweepFilter") as HTMLSelectElement;
+      select.value = ownerSweep.sweepId;
+    }
+    renderRuns(state);
+  }
+  void loadRunDetail(runId, scrollIntoView);
+}
+
+function selectDoc(file: string, scrollIntoView: boolean) {
+  openSection("docsSection");
+  openSection("docDetailPanel");
+  selectedDocFile = file;
+  selectedDocUpdatedAt = null;
+  if (state) renderDocs(state);
+  void loadDocDetail(file, scrollIntoView);
+}
+
+function sortIdeaNodes(nodes: IdeaTreeNode[]): IdeaTreeNode[] {
+  return nodes.slice().sort((a, b) => a.label.localeCompare(b.label));
+}
+
+function formatIdeaKind(kind: IdeaTreeNodeKind): string {
+  return kind[0].toUpperCase() + kind.slice(1);
+}
+
+function makeIdeaChipListHtml(values: string[], className: string): string {
+  return values.map((value) => `<span class="${className} mono">${escapeHtml(value)}</span>`).join("");
+}
+
+function makeIdeaSourceListHtml(sourceRefs: string[]): string {
+  if (sourceRefs.length === 0) return `<span class="muted">No explicit evidence refs</span>`;
+  return makeIdeaChipListHtml(sourceRefs, "idea-source-chip");
+}
+
+function positionIdeaTreePopover(popover: HTMLElement, shell: HTMLElement, anchor: { x: number; y: number }) {
+  const shellRect = shell.getBoundingClientRect();
+  const popoverWidth = popover.offsetWidth;
+  const popoverHeight = popover.offsetHeight;
+  const maxLeft = Math.max(12, shellRect.width - popoverWidth - 12);
+  const maxTop = Math.max(12, shellRect.height - popoverHeight - 12);
+  const left = Math.min(Math.max(12, anchor.x + 14), maxLeft);
+  const top = Math.min(Math.max(12, anchor.y + 14), maxTop);
+  popover.style.left = `${left}px`;
+  popover.style.top = `${top}px`;
+}
+
+function showIdeaTreePopover(
+  payload: {
+    eyebrow: string;
+    title: string;
+    summary: string;
+    detail?: string;
+    aliases?: string[];
+    evidenceRefs: string[];
+  },
+  opts: {
+    clientX?: number;
+    clientY?: number;
+    anchorEl?: Element | null;
+  } = {}
+) {
+  const shell = document.getElementById("ideaTreeShell") as HTMLElement | null;
+  const popover = document.getElementById("ideaTreePopover") as HTMLElement | null;
+  if (!shell || !popover) return;
+  popover.innerHTML = `
+    <div class="idea-popover-eyebrow">${escapeHtml(payload.eyebrow)}</div>
+    <div class="idea-popover-title">${escapeHtml(payload.title)}</div>
+    <div class="idea-popover-summary">${escapeHtml(payload.summary)}</div>
+    ${payload.detail ? `<div class="idea-popover-detail">${escapeHtml(payload.detail)}</div>` : ""}
+    ${payload.aliases && payload.aliases.length > 0 ? `<div class="idea-popover-section"><div class="idea-popover-label">Aliases</div><div class="idea-chip-row">${makeIdeaChipListHtml(payload.aliases, "idea-alias-chip")}</div></div>` : ""}
+    <div class="idea-popover-section"><div class="idea-popover-label">Evidence</div><div class="idea-chip-row">${makeIdeaSourceListHtml(payload.evidenceRefs)}</div></div>
+  `;
+  popover.hidden = false;
+  const shellRect = shell.getBoundingClientRect();
+  const anchorRect = opts.anchorEl?.getBoundingClientRect();
+  const anchor =
+    Number.isFinite(opts.clientX ?? NaN) && Number.isFinite(opts.clientY ?? NaN)
+      ? {
+          x: (opts.clientX as number) - shellRect.left,
+          y: (opts.clientY as number) - shellRect.top,
+        }
+      : anchorRect
+        ? {
+            x: anchorRect.left - shellRect.left + anchorRect.width / 2,
+            y: anchorRect.top - shellRect.top + anchorRect.height / 2,
+          }
+        : {
+            x: 24,
+            y: 24,
+          };
+  positionIdeaTreePopover(popover, shell, anchor);
+}
+
+function hideIdeaTreePopover() {
+  const popover = document.getElementById("ideaTreePopover") as HTMLElement | null;
+  if (!popover) return;
+  popover.hidden = true;
+}
+
+function createIdeaNodeCard(node: IdeaTreeNode, opts: { isAnchor?: boolean } = {}): HTMLElement {
+  const card = document.createElement("article");
+  card.className = `idea-node idea-node-kind-${node.kind}${opts.isAnchor ? " is-anchor" : ""}`;
+  card.dataset.nodeId = node.id;
+  card.tabIndex = 0;
+  card.innerHTML = `
+    <div class="idea-node-kicker mono">${opts.isAnchor ? `Anchor • ${formatIdeaKind(node.kind)}` : formatIdeaKind(node.kind)}</div>
+    <div class="idea-node-title">${escapeHtml(node.label)}</div>
+    <div class="idea-node-summary">${escapeHtml(node.summary)}</div>
+    <div class="idea-node-footer mono">${node.evidenceRefs.length} refs${node.aliases.length > 0 ? ` • ${node.aliases.length} aliases` : ""}</div>
+  `;
+  const show = (event?: MouseEvent) =>
+    showIdeaTreePopover(
+      {
+        eyebrow: opts.isAnchor ? `Anchor concept • ${formatIdeaKind(node.kind)}` : formatIdeaKind(node.kind),
+        title: node.label,
+        summary: node.summary,
+        detail: node.detail,
+        aliases: node.aliases,
+        evidenceRefs: node.evidenceRefs,
+      },
+      {
+        clientX: event?.clientX,
+        clientY: event?.clientY,
+        anchorEl: card,
+      }
+    );
+  card.addEventListener("mouseenter", (event) => show(event));
+  card.addEventListener("mousemove", (event) => show(event));
+  card.addEventListener("mouseleave", () => hideIdeaTreePopover());
+  card.addEventListener("focus", () => show());
+  card.addEventListener("blur", () => hideIdeaTreePopover());
+  return card;
+}
+
+function buildIdeaTreeLayout(payload: IdeaTreeResponse) {
+  const nodesById = new Map(payload.graph.nodes.map((node) => [node.id, node] as const));
+  const outgoing = new Map<string, string[]>();
+  for (const edge of payload.graph.edges) {
+    const group = outgoing.get(edge.fromId);
+    if (group) group.push(edge.toId);
+    else outgoing.set(edge.fromId, [edge.toId]);
+  }
+  const anchorIds = payload.anchors.filter((anchorId) => nodesById.has(anchorId));
+  const anchorOrder = new Map(anchorIds.map((anchorId, index) => [anchorId, index] as const));
+  const assignments = new Map<string, { anchorId: string; depth: number; anchorOrder: number }>();
+
+  for (const anchorId of anchorIds) {
+    const queue: Array<{ id: string; depth: number }> = [{ id: anchorId, depth: 0 }];
+    const seen = new Set<string>();
+    while (queue.length > 0) {
+      const current = queue.shift() as { id: string; depth: number };
+      if (seen.has(current.id)) continue;
+      seen.add(current.id);
+      const nextAssignment = {
+        anchorId,
+        depth: current.depth,
+        anchorOrder: anchorOrder.get(anchorId) ?? 0,
+      };
+      const existing = assignments.get(current.id);
+      if (
+        !existing ||
+        nextAssignment.depth < existing.depth ||
+        (nextAssignment.depth === existing.depth && nextAssignment.anchorOrder < existing.anchorOrder)
+      ) {
+        assignments.set(current.id, nextAssignment);
+      }
+      for (const nextId of outgoing.get(current.id) ?? []) queue.push({ id: nextId, depth: current.depth + 1 });
+    }
+  }
+
+  const columns = anchorIds.map((anchorId) => ({
+    anchorId,
+    anchor: nodesById.get(anchorId) as IdeaTreeNode,
+    depthGroups: new Map<number, IdeaTreeNode[]>(),
+  }));
+  const columnsByAnchor = new Map(columns.map((column) => [column.anchorId, column] as const));
+  const overflow: IdeaTreeNode[] = [];
+  for (const node of nodesById.values()) {
+    const assignment = assignments.get(node.id);
+    if (!assignment) {
+      overflow.push(node);
+      continue;
+    }
+    if (assignment.depth === 0) continue;
+    const column = columnsByAnchor.get(assignment.anchorId);
+    if (!column) {
+      overflow.push(node);
+      continue;
+    }
+    const bucket = column.depthGroups.get(assignment.depth);
+    if (bucket) bucket.push(node);
+    else column.depthGroups.set(assignment.depth, [node]);
+  }
+
+  return {
+    columns,
+    overflow: sortIdeaNodes(overflow),
+    assignments,
+  };
+}
+
+function renderIdeaTreeGraph(container: HTMLElement, payload: IdeaTreeResponse) {
+  const layout = buildIdeaTreeLayout(payload);
+  const shell = document.createElement("div");
+  shell.id = "ideaTreeShell";
+  shell.className = "idea-tree-shell";
+
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("id", "ideaTreeEdgeLayer");
+  svg.setAttribute("class", "idea-tree-edge-layer");
+  svg.setAttribute("aria-hidden", "true");
+
+  const columns = document.createElement("div");
+  columns.className = "idea-tree-columns";
+
+  const popover = document.createElement("div");
+  popover.id = "ideaTreePopover";
+  popover.className = "idea-tree-popover";
+  popover.hidden = true;
+  shell.addEventListener("mouseleave", () => hideIdeaTreePopover());
+
+  for (const column of layout.columns) {
+    const columnEl = document.createElement("div");
+    columnEl.className = "idea-anchor-column";
+    columnEl.dataset.anchorId = column.anchorId;
+
+    const header = document.createElement("div");
+    header.className = "idea-column-label mono";
+    header.textContent = "Anchor";
+    columnEl.appendChild(header);
+    columnEl.appendChild(createIdeaNodeCard(column.anchor, { isAnchor: true }));
+
+    for (const depth of [...column.depthGroups.keys()].sort((a, b) => a - b)) {
+      const depthGroup = document.createElement("div");
+      depthGroup.className = "idea-depth-group";
+      const depthLabel = document.createElement("div");
+      depthLabel.className = "idea-depth-label mono";
+      depthLabel.textContent = `Layer ${depth}`;
+      const depthGrid = document.createElement("div");
+      depthGrid.className = "idea-depth-grid";
+      for (const node of sortIdeaNodes(column.depthGroups.get(depth) ?? [])) {
+        depthGrid.appendChild(createIdeaNodeCard(node));
+      }
+      depthGroup.appendChild(depthLabel);
+      depthGroup.appendChild(depthGrid);
+      columnEl.appendChild(depthGroup);
+    }
+    columns.appendChild(columnEl);
+  }
+
+  if (layout.overflow.length > 0) {
+    const overflowEl = document.createElement("div");
+    overflowEl.className = "idea-anchor-column idea-overflow-column";
+    const header = document.createElement("div");
+    header.className = "idea-column-label mono";
+    header.textContent = "Related";
+    const depthGrid = document.createElement("div");
+    depthGrid.className = "idea-depth-grid";
+    for (const node of layout.overflow) depthGrid.appendChild(createIdeaNodeCard(node));
+    overflowEl.appendChild(header);
+    overflowEl.appendChild(depthGrid);
+    columns.appendChild(overflowEl);
+  }
+
+  shell.appendChild(svg);
+  shell.appendChild(columns);
+  shell.appendChild(popover);
+  container.replaceChildren(shell, buildIdeaTreeDebug(payload));
+  scheduleIdeaTreeEdgeRender();
+}
+
+function formatIdeaGraphMs(ms: number): string {
+  if (!Number.isFinite(ms)) return "-";
+  return `${Math.round(ms)}ms`;
+}
+
+function makeIdeaDebugCardHtml(
+  title: string,
+  body: string,
+  refs: string[] = [],
+  eyebrow?: string
+): string {
+  return `
+    <article class="idea-debug-card">
+      ${eyebrow ? `<div class="idea-debug-eyebrow mono">${escapeHtml(eyebrow)}</div>` : ""}
+      <div class="idea-debug-title">${escapeHtml(title)}</div>
+      <div class="idea-debug-body">${escapeHtml(body)}</div>
+      ${refs.length > 0 ? `<div class="idea-chip-row">${makeIdeaChipListHtml(refs, "idea-source-chip")}</div>` : ""}
+    </article>
+  `;
+}
+
+function buildIdeaTreeDebug(payload: IdeaTreeResponse): HTMLElement {
+  const debug = document.createElement("div");
+  debug.className = "idea-debug";
+  const timings = payload.debug.timings;
+  debug.innerHTML = `
+    <div class="idea-debug-summary">
+      <article class="idea-debug-stat"><div class="idea-debug-stat-label mono">Docs</div><div class="idea-debug-stat-value">${payload.debug.evidence.docs.length}</div></article>
+      <article class="idea-debug-stat"><div class="idea-debug-stat-label mono">Snippets</div><div class="idea-debug-stat-value">${payload.debug.evidence.snippets.length}</div></article>
+      <article class="idea-debug-stat"><div class="idea-debug-stat-label mono">Run Families</div><div class="idea-debug-stat-value">${payload.debug.evidence.runFamilies.length}</div></article>
+      <article class="idea-debug-stat"><div class="idea-debug-stat-label mono">Harvested</div><div class="idea-debug-stat-value">${payload.debug.harvest.candidates.length}</div></article>
+      <article class="idea-debug-stat"><div class="idea-debug-stat-label mono">Kept</div><div class="idea-debug-stat-value">${payload.debug.attachment.kept.length}</div></article>
+      <article class="idea-debug-stat"><div class="idea-debug-stat-label mono">Dropped</div><div class="idea-debug-stat-value">${payload.debug.attachment.dropped.length}</div></article>
+      <article class="idea-debug-stat"><div class="idea-debug-stat-label mono">Total</div><div class="idea-debug-stat-value">${formatIdeaGraphMs(timings.totalMs)}</div></article>
+    </div>
+  `;
+
+  const evidenceDetails = document.createElement("details");
+  evidenceDetails.className = "idea-debug-section";
+  evidenceDetails.innerHTML = `
+    <summary>Evidence Pack</summary>
+    <div class="idea-debug-meta muted mono">evidence ${formatIdeaGraphMs(timings.evidenceMs)} • docs ${payload.debug.evidence.docs.length} • snippets ${payload.debug.evidence.snippets.length} • run families ${payload.debug.evidence.runFamilies.length}</div>
+    <div class="idea-debug-grid">
+      ${payload.debug.evidence.docs.map((doc) => makeIdeaDebugCardHtml(doc.title, `${doc.file} • ${doc.snippetIds.length} snippets • ${doc.runRefs.length} run refs`, doc.snippetIds, "Doc")).join("")}
+    </div>
+    <div class="idea-debug-grid">
+      ${payload.debug.evidence.runFamilies.map((family) => makeIdeaDebugCardHtml(family.label, `runs ${family.runCount} • active ${family.activeRuns} • best ${fmtAcc(family.bestAccuracy)} • ce ${fmtAcc(family.lastTrainCe)}`, [...family.docRefs, ...family.sampleRuns].slice(0, 8), "Run Family")).join("")}
+    </div>
+    <div class="idea-debug-grid">
+      ${payload.debug.evidence.snippets.map((snippet) => makeIdeaDebugCardHtml(`${snippet.docFile} • ${snippet.heading}`, snippet.excerpt, [snippet.id, ...snippet.runRefs].slice(0, 6), "Snippet")).join("")}
+    </div>
+  `;
+
+  const harvestDetails = document.createElement("details");
+  harvestDetails.className = "idea-debug-section";
+  harvestDetails.open = true;
+  harvestDetails.innerHTML = `
+    <summary>Harvested Candidates</summary>
+    <div class="idea-debug-meta muted mono">harvest ${formatIdeaGraphMs(timings.harvestMs)} • ${payload.debug.harvest.candidates.length} candidates</div>
+    <div class="idea-debug-grid">
+      ${payload.debug.harvest.candidates.map((candidate) => makeIdeaDebugCardHtml(candidate.label, candidate.notes, candidate.candidateRefs, formatIdeaKind(candidate.kind))).join("")}
+    </div>
+  `;
+
+  const attachmentDetails = document.createElement("details");
+  attachmentDetails.className = "idea-debug-section";
+  attachmentDetails.open = true;
+  attachmentDetails.innerHTML = `
+    <summary>Evidence Attachment</summary>
+    <div class="idea-debug-meta muted mono">attachment ${formatIdeaGraphMs(timings.attachmentMs)} • kept ${payload.debug.attachment.kept.length} • dropped ${payload.debug.attachment.dropped.length}</div>
+    <div class="idea-debug-grid">
+      ${payload.debug.attachment.kept.map((candidate) => makeIdeaDebugCardHtml(candidate.label, `${candidate.coverageNote} ${candidate.summary}`, [...candidate.evidenceRefs, ...candidate.contradictionRefs].slice(0, 8), `Kept • ${formatIdeaKind(candidate.kind)}`)).join("")}
+    </div>
+    ${payload.debug.attachment.dropped.length > 0 ? `<div class="idea-debug-grid">${payload.debug.attachment.dropped.map((candidate) => makeIdeaDebugCardHtml(candidate.label, candidate.reason, candidate.candidateRefs, "Dropped")).join("")}</div>` : ""}
+  `;
+
+  const graphDetails = document.createElement("details");
+  graphDetails.className = "idea-debug-section";
+  graphDetails.innerHTML = `
+    <summary>Graph Build</summary>
+    <div class="idea-debug-meta muted mono">graph ${formatIdeaGraphMs(timings.graphMs)} • anchors ${payload.anchors.length} • edges ${payload.graph.edges.length} • version ${escapeHtml(payload.inputs.pipelineVersion)}</div>
+    <div class="idea-debug-grid">
+      ${payload.graph.edges.map((edge) => makeIdeaDebugCardHtml(`${edge.fromId} -> ${edge.toId}`, edge.reasoning, edge.evidenceRefs, edge.relationPhrase)).join("")}
+    </div>
+  `;
+
+  debug.appendChild(evidenceDetails);
+  debug.appendChild(harvestDetails);
+  debug.appendChild(attachmentDetails);
+  debug.appendChild(graphDetails);
+  return debug;
+}
+
+function renderIdeaTree(data: Bootstrap) {
+  if (ideaTree && ideaTree.taskId !== data.selectedTask.id) {
+    ideaTree = null;
+    ideaTreeError = null;
+  }
+  const meta = $("ideaTreeMeta");
+  const body = $("ideaTreeBody");
+  const generateBtn = $("ideaTreeGenerate") as HTMLButtonElement;
+  generateBtn.disabled = ideaTreeLoadInFlight;
+
+  if (ideaTreeLoadInFlight) {
+    meta.textContent = "generating graph...";
+    meta.title = "";
+  } else if (ideaTreeError) {
+    meta.textContent = `error: ${ideaTreeError}`;
+    meta.title = ideaTreeError;
+  } else if (ideaTree) {
+    meta.textContent = `generated: ${ideaTree.generatedAt} • anchors: ${ideaTree.anchors.length} • docs: ${ideaTree.inputs.docs.length} • snippets: ${ideaTree.inputs.snippetCount} • run families: ${ideaTree.inputs.runFamilyCount} • kept: ${ideaTree.debug.attachment.kept.length} • total: ${formatIdeaGraphMs(ideaTree.debug.timings.totalMs)}`;
+    meta.title = "";
+  } else {
+    meta.textContent = "Not generated yet.";
+    meta.title = "";
+  }
+
+  if (ideaTreeLoadInFlight && !ideaTree) {
+    body.innerHTML = `<div class="idea-tree-empty muted">Generating a multi-stage semantic graph from the full task corpus...</div>`;
+    return;
+  }
+  if (ideaTreeError && !ideaTree) {
+    body.innerHTML = `<div class="idea-tree-empty muted">Graph generation failed: ${escapeHtml(ideaTreeError)}</div>`;
+    return;
+  }
+  if (!ideaTree) {
+    body.innerHTML = `<div class="idea-tree-empty muted">Click <strong>Generate Graph</strong> to harvest candidates from the corpus, attach evidence, and then synthesize the final graph.</div>`;
+    return;
+  }
+  renderIdeaTreeGraph(body, ideaTree);
+}
+
+function scheduleIdeaTreeEdgeRender() {
+  if (ideaTreeEdgeRenderFrame !== null) cancelAnimationFrame(ideaTreeEdgeRenderFrame);
+  ideaTreeEdgeRenderFrame = requestAnimationFrame(() => {
+    ideaTreeEdgeRenderFrame = null;
+    renderIdeaTreeEdges();
+  });
+}
+
+function renderIdeaTreeEdges() {
+  if (!ideaTree) return;
+  const shell = document.getElementById("ideaTreeShell") as HTMLElement | null;
+  const svg = document.getElementById("ideaTreeEdgeLayer") as SVGSVGElement | null;
+  if (!shell || !svg) return;
+  const layout = buildIdeaTreeLayout(ideaTree);
+  const shellRect = shell.getBoundingClientRect();
+  if (shellRect.width <= 0 || shellRect.height <= 0) return;
+
+  svg.innerHTML = "";
+  svg.setAttribute("viewBox", `0 0 ${shellRect.width} ${shellRect.height}`);
+  const nodeEls = new Map(
+    [...shell.querySelectorAll<HTMLElement>(".idea-node")]
+      .map((nodeEl) => [nodeEl.dataset.nodeId ?? "", nodeEl] as const)
+      .filter(([nodeId]) => Boolean(nodeId))
+  );
+  const nodesById = new Map(ideaTree.graph.nodes.map((node) => [node.id, node] as const));
+
+  for (const edge of ideaTree.graph.edges) {
+    const fromEl = nodeEls.get(edge.fromId);
+    const toEl = nodeEls.get(edge.toId);
+    const fromNode = nodesById.get(edge.fromId);
+    const toNode = nodesById.get(edge.toId);
+    if (!fromEl || !toEl || !fromNode || !toNode) continue;
+    const fromRect = fromEl.getBoundingClientRect();
+    const toRect = toEl.getBoundingClientRect();
+    const startX = fromRect.left - shellRect.left + fromRect.width / 2;
+    const startY = fromRect.top - shellRect.top + fromRect.height;
+    const endX = toRect.left - shellRect.left + toRect.width / 2;
+    const endY = toRect.top - shellRect.top;
+    const controlY = startY + Math.max(30, (endY - startY) / 2);
+    const d = `M ${startX} ${startY} C ${startX} ${controlY} ${endX} ${Math.max(startY + 24, endY - 24)} ${endX} ${endY}`;
+
+    const visiblePath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    visiblePath.setAttribute("class", "idea-edge-visible");
+    visiblePath.setAttribute("d", d);
+    const fromAssignment = layout.assignments.get(edge.fromId);
+    const toAssignment = layout.assignments.get(edge.toId);
+    const isCrossLink =
+      (fromAssignment?.anchorId ?? edge.fromId) !== (toAssignment?.anchorId ?? edge.toId) ||
+      (toAssignment?.depth ?? 0) <= (fromAssignment?.depth ?? -1);
+    if (isCrossLink) visiblePath.classList.add("is-cross-link");
+
+    const hitPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    hitPath.setAttribute("class", "idea-edge-hit");
+    hitPath.setAttribute("d", d);
+    const show = (event?: MouseEvent) => {
+      visiblePath.classList.add("is-active");
+      showIdeaTreePopover(
+        {
+          eyebrow: edge.relationPhrase,
+          title: `${fromNode.label} -> ${toNode.label}`,
+          summary: edge.reasoning,
+          evidenceRefs: edge.evidenceRefs,
+        },
+        {
+          clientX: event?.clientX,
+          clientY: event?.clientY,
+          anchorEl: hitPath,
+        }
+      );
+    };
+    const hide = () => {
+      visiblePath.classList.remove("is-active");
+      hideIdeaTreePopover();
+    };
+    hitPath.addEventListener("mouseenter", (event) => show(event));
+    hitPath.addEventListener("mousemove", (event) => show(event));
+    hitPath.addEventListener("mouseleave", hide);
+
+    svg.appendChild(visiblePath);
+    svg.appendChild(hitPath);
   }
 }
 
@@ -774,12 +1379,46 @@ function renderAll(data: Bootstrap) {
   renderSortButtons();
   renderKpis(data);
   renderHighlights(data);
+  renderIdeaTree(data);
   renderTaskQa(data);
   renderSweeps(data);
   renderSweepFilter(data);
   renderActiveToggle(data);
   renderRuns(data);
   renderDocs(data);
+}
+
+async function loadIdeaTree(scrollIntoView: boolean) {
+  const taskId = getActiveTaskId();
+  if (!taskId || ideaTreeLoadInFlight) return;
+  ideaTreeLoadInFlight = true;
+  ideaTreeError = null;
+  openSection("ideaTreeSection");
+  if (state) renderIdeaTree(state);
+  try {
+    const res = await fetch("/api/ideas/tree", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        taskId,
+      }),
+    });
+    const body = (await res.json()) as IdeaTreeResponse | { error?: string };
+    if (!res.ok) throw new Error(body && "error" in body ? body.error ?? `idea graph failed: ${res.status}` : `idea graph failed: ${res.status}`);
+    if (taskId !== getActiveTaskId()) return;
+    ideaTree = body as IdeaTreeResponse;
+    ideaTreeError = null;
+    if (state) renderIdeaTree(state);
+    if (scrollIntoView) $("ideaTreeSection").scrollIntoView({ behavior: "smooth", block: "start" });
+  } catch (error) {
+    if (taskId !== getActiveTaskId()) return;
+    ideaTree = null;
+    ideaTreeError = String(error);
+    if (state) renderIdeaTree(state);
+  } finally {
+    ideaTreeLoadInFlight = false;
+    if (state && state.selectedTask.id === taskId) renderIdeaTree(state);
+  }
 }
 
 async function load() {
@@ -1047,6 +1686,15 @@ function setup() {
     event.preventDefault();
     const input = $("taskQaInput") as HTMLTextAreaElement;
     void submitTaskQa(input.value);
+  });
+
+  const ideaTreeGenerate = $("ideaTreeGenerate") as HTMLButtonElement;
+  ideaTreeGenerate.addEventListener("click", () => {
+    void loadIdeaTree(true);
+  });
+
+  window.addEventListener("resize", () => {
+    scheduleIdeaTreeEdgeRender();
   });
 
   const sweepsPrevBtn = $("sweepsPrev") as HTMLButtonElement;
