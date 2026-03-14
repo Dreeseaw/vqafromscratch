@@ -2,3 +2,6 @@ matplotlib
 scikit-image
 numpy
 PyYAML
+transformers
+huggingface_hub
+safetensors

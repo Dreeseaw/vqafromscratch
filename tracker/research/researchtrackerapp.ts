@@ -668,7 +668,7 @@ function parseSweep(task: TaskContext, sweepDirName: string, isSymlink: boolean,
   });
   const activeRuns = parsedRuns.filter((run) => run.isActive).length;
   const runs = parsedRuns.filter(shouldIncludeRun);
-  const allAcc = runs.map((run) => run.bestAccuracy).filter((value): value is number => Number.isFinite(value));
+  const allAcc = runs.map((run) => run.finalAccuracy).filter((value): value is number => Number.isFinite(value));
   const ceVals = runs.map((run) => run.lastTrainCe).filter((value): value is number => Number.isFinite(value));
   const startLine = lines.find((line) => /\bSTART\b/.test(line)) ?? lines[0] ?? "";
 
@@ -735,7 +735,7 @@ function listSweeps(task: TaskContext): SweepSummary[] {
         }
       }
       const runs = [...runMap.values()];
-      const allAcc = runs.map((run) => run.bestAccuracy).filter((value): value is number => Number.isFinite(value));
+      const allAcc = runs.map((run) => run.finalAccuracy).filter((value): value is number => Number.isFinite(value));
       const ceVals = runs.map((run) => run.lastTrainCe).filter((value): value is number => Number.isFinite(value));
       const representative = group.slice().sort((a, b) => b.runs.length - a.runs.length || b.mtimeMs - a.mtimeMs)[0];
       const startedAt = group.map((sweep) => sweep.startedAt).filter((value): value is string => Boolean(value)).sort()[0] ?? null;

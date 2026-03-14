@@ -157,6 +157,26 @@ Interpretation rule:
 - if the user asks for the largest batch size that fits, maximize raw `batch_size` first
 - only fall back to a smaller raw `batch_size` when the larger one fails memory/stability or the user explicitly asks for a different optimization target
 
+## HF MobileViT Note
+
+For the Hugging Face `mobilevit_hf` frozen-vision path:
+
+- do not use the original `AutoImageProcessor` CPU round-trip in the hot path
+- preprocess tensors directly on-device instead
+- use `--precision bf16` for real probes and long runs unless a future regression is found
+
+Observed result after the direct tensor-preprocess rewrite:
+
+- representative heavy-family probe: `mobilevit_hf + question_hidden_mean + qadaptive + 3-layer LM adapters`
+- raw/effective batch: `192 x 1`
+- train throughput at steps `60-80`: about `4.19` train steps/s
+- measured memory at the `60`-step window: about `13.95 GB / 16.30 GB`
+- final eval at `eval_batch_size=192`: about `0.77` eval steps/s, which is about `148` eval samples/s
+
+Current operating assumption:
+
+- `mobilevit_hf` is now fast enough to run the heavier bridge families at the standard `192 x 1` comparison layout on the current `16 GB` card
+
 ## KV-Cache Eval Note
 
 For the bridge-only eval KV-cache path:

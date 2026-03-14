@@ -38,11 +38,15 @@ class BridgeConfig:
     bridge_hybrid_image_bridge_type: str = "learned_query"
     bridge_question_conditioning: bool = False
     bridge_qcond_scale: float = 0.5
-    bridge_query_bank_mode: str = "learned"  # learned | question_mix | question_hidden_mean | question_hidden_attn
+    bridge_query_bank_mode: str = "learned"  # learned | question_mix | question_hidden_mean | question_hidden_attn | question_hidden_mean_multi | question_hidden_hybrid
     bridge_qquery_basis_count: int = 4
     bridge_qquery_scale: float = 1.0
+    bridge_qquery_multi_count: int = 1
+    bridge_qquery_hybrid_gate_init: float = 0.5
     bridge_query_role_specialization: bool = False
     bridge_question_context_mode: str = "all_text"  # all_text | prompt_only
+    bridge_iterative_qquery_steps: int = 1
+    bridge_iterative_qquery_residual_scale: float = 1.0
     bridge_token_selector_type: str = "none"  # none | topk | qtopk | qadaptive
     bridge_token_select_k: int = 0
     bridge_token_select_k_min: int = 0
@@ -382,18 +386,35 @@ class _PerceiverCore(nn.Module):
         self.qquery_mode = query_bank_mode
         self.uses_question_queries = query_bank_mode != "learned"
         self.uses_question_conditioning = bool(getattr(cfg, "bridge_question_conditioning", False))
-        self.uses_question_tokens = query_bank_mode in ("question_hidden_mean", "question_hidden_attn")
-        if query_bank_mode not in ("learned", "question_mix", "question_hidden_mean", "question_hidden_attn"):
+        self.uses_question_tokens = query_bank_mode in (
+            "question_hidden_mean",
+            "question_hidden_attn",
+            "question_hidden_mean_multi",
+            "question_hidden_hybrid",
+        )
+        if query_bank_mode not in (
+            "learned",
+            "question_mix",
+            "question_hidden_mean",
+            "question_hidden_attn",
+            "question_hidden_mean_multi",
+            "question_hidden_hybrid",
+        ):
             raise ValueError(
                 "Unsupported bridge_query_bank_mode="
-                f"{query_bank_mode}. Supported: learned, question_mix, question_hidden_mean, question_hidden_attn"
+                f"{query_bank_mode}. Supported: learned, question_mix, question_hidden_mean, "
+                "question_hidden_attn, question_hidden_mean_multi, question_hidden_hybrid"
             )
         self.supports_question_context = self.uses_question_conditioning or query_bank_mode in (
             "question_mix",
             "question_hidden_mean",
+            "question_hidden_mean_multi",
+            "question_hidden_hybrid",
         )
         self.qcond_scale = float(getattr(cfg, "bridge_qcond_scale", 0.5))
         self.qquery_scale = float(getattr(cfg, "bridge_qquery_scale", 1.0))
+        self.iterative_steps = max(1, int(getattr(cfg, "bridge_iterative_qquery_steps", 1)))
+        self.iterative_residual_scale = float(getattr(cfg, "bridge_iterative_qquery_residual_scale", 1.0))
         if self.uses_question_conditioning:
             self.qcond_ln = nn.LayerNorm(d_lm)
             self.qcond_proj = nn.Linear(d_lm, 2 * d_lm)
@@ -423,6 +444,10 @@ class _PerceiverCore(nn.Module):
             self.qquery_basis = None
             self.qquery_hidden_ln = None
             self.qquery_hidden_proj = None
+            self.qquery_multi_count = 1
+            self.qquery_multi_ctx_ln = None
+            self.qquery_multi_ctx_proj = None
+            self.qquery_group_ids = None
             self.qquery_token_ln = nn.LayerNorm(d_lm)
             self.qquery_token_attn = nn.MultiheadAttention(
                 d_lm,
@@ -430,14 +455,59 @@ class _PerceiverCore(nn.Module):
                 dropout=float(cfg.bridge_attn_dropout),
                 batch_first=True,
             )
+            self.qquery_hybrid_gate_logit = None
+        elif query_bank_mode == "question_hidden_mean_multi":
+            self.qquery_ln = None
+            self.qquery_mix = None
+            self.qquery_basis = None
+            self.qquery_hidden_ln = None
+            self.qquery_hidden_proj = None
+            self.qquery_multi_count = max(2, int(getattr(cfg, "bridge_qquery_multi_count", 4)))
+            self.qquery_multi_ctx_ln = nn.LayerNorm(d_lm)
+            self.qquery_multi_ctx_proj = nn.Linear(d_lm, self.qquery_multi_count * d_lm)
+            self.qquery_group_ids = torch.arange(k, dtype=torch.long) % self.qquery_multi_count
+            self.register_buffer("qquery_group_ids_buf", self.qquery_group_ids, persistent=False)
+            self.qquery_token_ln = None
+            self.qquery_token_attn = None
+            self.qquery_hybrid_gate_logit = None
+        elif query_bank_mode == "question_hidden_hybrid":
+            self.qquery_ln = None
+            self.qquery_mix = None
+            self.qquery_basis = None
+            self.qquery_hidden_ln = nn.LayerNorm(d_lm)
+            self.qquery_hidden_proj = nn.Linear(d_lm, k * d_lm)
+            self.qquery_multi_count = 1
+            self.qquery_multi_ctx_ln = None
+            self.qquery_multi_ctx_proj = None
+            self.qquery_group_ids = None
+            self.qquery_token_ln = nn.LayerNorm(d_lm)
+            self.qquery_token_attn = nn.MultiheadAttention(
+                d_lm,
+                num_heads=_resolve_num_heads(d_lm, int(cfg.bridge_num_heads)),
+                dropout=float(cfg.bridge_attn_dropout),
+                batch_first=True,
+            )
+            gate = min(1.0 - 1e-4, max(1e-4, float(getattr(cfg, "bridge_qquery_hybrid_gate_init", 0.5))))
+            self.qquery_hybrid_gate_logit = nn.Parameter(torch.full((1, 1, d_lm), math.log(gate / (1.0 - gate))))
         else:
             self.qquery_ln = None
             self.qquery_mix = None
             self.qquery_basis = None
             self.qquery_hidden_ln = None
             self.qquery_hidden_proj = None
+            self.qquery_multi_count = 1
+            self.qquery_multi_ctx_ln = None
+            self.qquery_multi_ctx_proj = None
+            self.qquery_group_ids = None
             self.qquery_token_ln = None
             self.qquery_token_attn = None
+            self.qquery_hybrid_gate_logit = None
+        if self.iterative_steps > 1:
+            self.iter_ln = nn.LayerNorm(2 * d_lm)
+            self.iter_proj = nn.Linear(2 * d_lm, d_lm)
+        else:
+            self.iter_ln = None
+            self.iter_proj = None
         if role_specialization:
             role_count = max(1, int(getattr(cfg, "bridge_num_roles", 4)))
             self.role_embeddings = nn.Parameter(torch.randn(role_count, d_lm) * std)
@@ -473,6 +543,10 @@ class _PerceiverCore(nn.Module):
             return latents
         if self.qquery_mode == "question_hidden_mean" and question_context is None and question_tokens is None:
             return latents
+        if self.qquery_mode == "question_hidden_mean_multi" and question_context is None and question_tokens is None:
+            return latents
+        if self.qquery_mode == "question_hidden_hybrid" and question_context is None and question_tokens is None:
+            return latents
         if self.qquery_mode == "question_hidden_attn" and question_tokens is None:
             return latents
         if self.qquery_mode == "question_mix":
@@ -489,6 +563,19 @@ class _PerceiverCore(nn.Module):
             assert self.qquery_hidden_ln is not None and self.qquery_hidden_proj is not None
             delta = self.qquery_hidden_proj(self.qquery_hidden_ln(pooled)).view_as(latents)
             return latents + float(self.qquery_scale) * torch.tanh(delta)
+        if self.qquery_mode == "question_hidden_mean_multi":
+            pooled = question_context
+            if question_tokens is not None:
+                pooled = self._masked_mean(question_tokens, question_token_mask)
+            assert pooled is not None
+            assert self.qquery_multi_ctx_ln is not None and self.qquery_multi_ctx_proj is not None
+            group_ctx = self.qquery_multi_ctx_proj(self.qquery_multi_ctx_ln(pooled))
+            group_ctx = torch.tanh(group_ctx.view(int(latents.shape[0]), self.qquery_multi_count, int(latents.shape[-1])))
+            group_ids = getattr(self, "qquery_group_ids_buf", None)
+            if group_ids is None:
+                raise RuntimeError("question_hidden_mean_multi missing qquery_group_ids_buf")
+            delta = group_ctx[:, group_ids.to(device=latents.device), :]
+            return latents + float(self.qquery_scale) * delta
         if self.qquery_mode == "question_hidden_attn":
             if question_tokens is None:
                 return latents
@@ -504,6 +591,29 @@ class _PerceiverCore(nn.Module):
                 key_padding_mask=key_padding_mask,
                 need_weights=False,
             )
+            return latents + float(self.qquery_scale) * delta
+        if self.qquery_mode == "question_hidden_hybrid":
+            pooled = question_context
+            if question_tokens is not None:
+                pooled = self._masked_mean(question_tokens, question_token_mask)
+            mean_delta = 0.0
+            attn_delta = 0.0
+            if pooled is not None:
+                assert self.qquery_hidden_ln is not None and self.qquery_hidden_proj is not None
+                mean_delta = torch.tanh(self.qquery_hidden_proj(self.qquery_hidden_ln(pooled)).view_as(latents))
+            if question_tokens is not None:
+                assert self.qquery_token_ln is not None and self.qquery_token_attn is not None
+                tok = self.qquery_token_ln(question_tokens)
+                key_padding_mask = None if question_token_mask is None else ~question_token_mask
+                attn_delta, _ = self.qquery_token_attn(
+                    self.qquery_token_ln(latents),
+                    tok,
+                    tok,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=False,
+                )
+            gate = torch.sigmoid(self.qquery_hybrid_gate_logit) if self.qquery_hybrid_gate_logit is not None else 0.5
+            delta = gate * mean_delta + (1.0 - gate) * attn_delta
             return latents + float(self.qquery_scale) * delta
         return latents
 
@@ -537,16 +647,27 @@ class _PerceiverCore(nn.Module):
         if latents is None:
             latents = self.latents.expand(int(visual_tokens.shape[0]), -1, -1)
         latents = self._apply_role_specialization(latents)
-        latents = self._apply_question_queries(
-            latents,
-            question_context,
-            question_tokens=question_tokens,
-            question_token_mask=question_token_mask,
-        )
-        latents = self._apply_question_conditioning(latents, question_context)
-        for cross_blk, self_blk in zip(self.cross_blocks, self.self_blocks):
-            latents = cross_blk(latents, visual_tokens)
-            latents = self_blk(latents)
+        for step_idx in range(self.iterative_steps):
+            latents = self._apply_question_queries(
+                latents,
+                question_context,
+                question_tokens=question_tokens,
+                question_token_mask=question_token_mask,
+            )
+            latents = self._apply_question_conditioning(latents, question_context)
+            for cross_blk, self_blk in zip(self.cross_blocks, self.self_blocks):
+                latents = cross_blk(latents, visual_tokens)
+                latents = self_blk(latents)
+            if step_idx + 1 < self.iterative_steps:
+                summary = latents.mean(dim=1)
+                if question_context is None:
+                    qctx = summary
+                else:
+                    qctx = question_context
+                fuse = torch.cat([summary, qctx], dim=-1)
+                assert self.iter_ln is not None and self.iter_proj is not None
+                delta = torch.tanh(self.iter_proj(self.iter_ln(fuse))).unsqueeze(1)
+                latents = latents + float(self.iterative_residual_scale) * delta
         return latents
 
 

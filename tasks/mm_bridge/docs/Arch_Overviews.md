@@ -258,7 +258,190 @@ Novelty in this task:
 - potentially novel in the context of this project
 - closer to "interface engineering" than to a new visual extractor
 
-## 9. Token Selection / Oracle Front-End
+## 9. QQuery Perceiver
+
+Instead of keeping the Perceiver query bank mostly static, derive the query tokens from LM-side question state.
+
+```text
+question/prompt -> LM hidden state -> query generator -> K query tokens
+                                                     |
+image -> VM features -> visual tokens ---------------+--> perceiver extraction --> prefix -> LM
+```
+
+Common forms used in this task:
+
+```text
+question_mix:
+learned query basis + question-conditioned mixing weights -> query bank
+
+question_hidden_mean:
+mean-pooled LM question state -> projected query bank
+
+question_hidden_attn:
+attention-derived LM question state -> projected query bank
+```
+
+Purpose in this task:
+- move from generic image compression toward LM-conditioned visual retrieval
+- let the bridge ask for different evidence depending on the question
+
+Novelty in this task:
+- moderate-to-high
+- this is now one of the most important live architecture axes in the project
+
+## 10. Adaptive Token Budget / DynBudget
+
+A token selector scores visual tokens before Perceiver extraction and keeps only the most useful subset.
+
+```text
+visual tokens -> scorer / selector -> top-k kept tokens -> perceiver -> prefix -> LM
+```
+
+Question-aware form used in this task:
+
+```text
+question-aware selector:
+qctx + visual tokens -> scores -> keep top-k / min-k -> bridge extraction
+```
+
+Purpose in this task:
+- reduce wasted bridge compute on low-value visual tokens
+- preserve more relevant evidence before compression into the LM prefix
+
+Important note from this task:
+- if the upstream VM only emits `49` usable tokens, increasing the selector cap above `49` is not a real test
+
+Novelty in this task:
+- moderate
+- useful as a bridge-side efficiency and evidence-filtering modifier
+
+## 11. LM Residual Visual Adapters
+
+Move beyond prefix-only conditioning by inserting residual cross-attention adapters into the top LM blocks.
+
+```text
+visual tokens / bridge tokens -----------------------------+
+                                                          |
+LM hidden state -> residual cross-attn adapter -> LM block +--> next LM layer
+```
+
+Expanded view:
+
+```text
+LM hidden
+   |
+   +-> LN -> cross-attend to visual tokens -> gated residual
+   |
+   +-> FFN residual
+   v
+next LM state
+```
+
+Purpose in this task:
+- let the LM revisit visual evidence during reasoning instead of relying only on a front-loaded prefix
+- improve multimodal interaction depth without fully unfreezing the LM
+
+Novelty in this task:
+- moderate
+- architecturally familiar, but one of the most important practical wins in this project
+
+## 12. Richer LM-Conditioned QQuery Variants
+
+These are refinements of the qquery family rather than completely separate bridge families.
+
+### 12a. Question-Only LMMean QQuery
+
+```text
+LM question-span hidden states only -> pooled query state -> qquery bank -> bridge -> prefix -> LM
+```
+
+Purpose:
+- remove prompt/answer-context pollution from the pooled query signal
+
+### 12b. MultiQ
+
+```text
+LM query state -> multiple learned query groups -> bridge extraction -> prefix -> LM
+```
+
+Purpose:
+- let the bridge issue several LM-conditioned visual requests instead of one pooled request
+
+### 12c. Hybrid LMMean + Attn QQuery
+
+```text
+LM mean query path ----+
+                       +--> learned gate / merge --> qquery bank -> bridge -> prefix
+LM attn query path ----+
+```
+
+Purpose:
+- combine the strong overall behavior of `lmmeanqquery` with the stronger `other` behavior seen from `attnqquery`
+
+### 12d. Iterative QQuery
+
+```text
+LM query state -> bridge query pass 1 -> coarse visual evidence
+                               |
+                               +-> refine / residual -> bridge query pass 2 -> final prefix -> LM
+```
+
+Purpose:
+- test whether one-shot retrieval is the main remaining bottleneck
+
+Novelty in this task:
+- moderate-to-high
+- these are the current main frontier-probing refinements after Nail
+
+## 13. Visual-Side Residual Feature Adapter
+
+Add a small trainable adapter directly on top of frozen VM features before the bridge.
+
+```text
+VM features -> residual MLP adapter -> adapted visual tokens -> bridge -> prefix -> LM
+```
+
+Purpose in this task:
+- allow a small amount of visual-side adaptation without unfreezing the VM itself
+- test whether the bridge needs slightly more malleable visual features
+
+Novelty in this task:
+- low-to-moderate
+- more of a targeted adaptation modifier than a new bridge family
+
+## 14. MobileViT Drop-In Vision Backbone
+
+This is a new VM option, not a new bridge by itself. It keeps the bridge/LM setup but swaps in a stronger frozen visual encoder from Hugging Face.
+
+```text
+image -> MobileViT-small encoder -> token features -> existing bridge family -> prefix / adapters -> LM
+```
+
+Current path in this task:
+
+```text
+image -> mobilevit_hf -> ~49 x 640 visual tokens -> bridge -> prefix -> LM
+```
+
+Purpose in this task:
+- test "same bridge, better vision" directly
+- separate bridge-quality questions from backbone-quality questions
+
+Novelty in this task:
+- low at the architectural level
+- strategically important because it opens a second frozen-VM comparison line
+
+## 15. Practical Frontier Summary
+
+Current high-level interpretation from the newer sweeps:
+
+- `qquery` and its richer LM-conditioned variants are the live bridge frontier
+- `dynbudget` is a useful evidence-filtering modifier, not the whole story by itself
+- LM visual adapters matter more than most bridge-only novelty branches tested so far
+- role specialization and larger token caps were not strong positive directions in the newer adapter-centered family
+- a stronger drop-in VM like MobileViT is now part of the research surface, but should initially be read as "same bridge, better vision," not as a license to change everything at once
+
+## 16. Token Selection / Oracle Front-End
 
 This is another front-end modifier, not a full bridge family.
 
@@ -288,7 +471,7 @@ Novelty in this task:
 - low-to-moderate
 - useful experimentally, but more of a routing/probing tool than a new bridge family
 
-## 10. How These Pieces Relate
+## 17. How These Pieces Relate
 
 A useful mental grouping is:
 
@@ -314,7 +497,7 @@ Interface changes:
 Selection changes:
 - token selector / top-k evidence routing
 
-## 11. Project Read
+## 18. Project Read
 
 Within this task, the main architectural questions have been:
 

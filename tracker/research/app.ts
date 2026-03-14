@@ -255,6 +255,7 @@ const $ = <T extends HTMLElement>(id: string): T => {
 const fmtAcc = (v: number | null) => (Number.isFinite(v ?? NaN) ? (v as number).toFixed(4) : "-");
 const fmtNum = (v: number | null) => (Number.isFinite(v ?? NaN) ? String(v) : "-");
 const fmtRate = (v: number | null) => (Number.isFinite(v ?? NaN) ? (v as number).toFixed(4) : "-");
+const fmtStepsPerSec = (v: number | null) => (Number.isFinite(v ?? NaN) ? (v as number).toFixed(2) : "-");
 const fmtPct = (v: number | null) => (Number.isFinite(v ?? NaN) ? `${(v as number).toFixed(1)}%` : "-");
 const SHORT_DATE_TIME = new Intl.DateTimeFormat(undefined, {
   month: "short",
@@ -1306,11 +1307,11 @@ function renderRuns(data: Bootstrap) {
     const tr = document.createElement("tr");
     tr.className = run.runId === selectedRunId ? "is-selected clickable-row" : "clickable-row";
     tr.innerHTML = `
-      <td><code>${run.runId}</code>${run.isEvalOnly ? '<div><span class="run-badge mono">Eval-only</span></div>' : ""}</td>
+      <td><div class="run-name-cell"><code>${run.runId}</code>${run.isEvalOnly ? '<span class="run-badge mono">Eval-only</span>' : ""}</div></td>
       <td>${fmtAcc(run.finalAccuracy)}</td>
       <td>${fmtAcc(run.lastTrainCe)}</td>
       <td>${fmtNum(run.lastStep)}</td>
-      <td>${fmtNum(run.lastStepsPerSec)}</td>
+      <td>${fmtStepsPerSec(run.lastStepsPerSec)}</td>
       <td>${fmtParams(run.numParams, run.trainableParams)}</td>
       <td>${run.hasFinalCheckpoint ? "yes" : "no"}</td>
     `;
@@ -1561,7 +1562,7 @@ function renderRunDetail(detail: RunDetail) {
     ["Best Acc", fmtAcc(detail.run.bestAccuracy)],
     ["Last Train CE", fmtAcc(detail.run.lastTrainCe)],
     ["Last Step", fmtNum(detail.run.lastStep)],
-    ["Steps/s", fmtNum(detail.run.lastStepsPerSec)],
+    ["Steps/s", fmtStepsPerSec(detail.run.lastStepsPerSec)],
     ["Params", fmtParams(detail.run.numParams, detail.run.trainableParams)],
     ["Val Acc", fmtAcc(detail.latestEvalAccuracy)],
     ["Val Steps/s", fmtRate(detail.latestValStepsPerSec)],

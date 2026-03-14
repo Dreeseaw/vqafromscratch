@@ -385,11 +385,18 @@ tr:hover td {
   background: var(--table-selected);
 }
 
+.run-name-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 24px;
+  flex-wrap: nowrap;
+}
+
 .run-badge {
   display: inline-flex;
   align-items: center;
   min-height: 22px;
-  margin-top: 6px;
   padding: 0 8px;
   border: 1px solid rgba(45, 108, 118, 0.24);
   border-radius: 999px;
