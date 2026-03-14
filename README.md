@@ -41,6 +41,26 @@ bun web app for us to track experiments in both real time and reload old ones.
 ```
 and navigate to `localhost:3000` in your browser. Multiple instances can be run for tab-by-tab comparisons.
 
+Auto-Research Progress Tracker
+------------------------------
+Minimal Bun + HTML/TS/CSS dashboard that works off task configs under `tasks/*/task.json`.
+Each task can point at its own:
+- docs directory
+- task-owned scripts directory
+- logs directory
+
+Current MM bridge task assets live under:
+- `tasks/mm_bridge/docs/*.md`
+- `tasks/mm_bridge/scripts/*`
+
+```bash
+bun run tracker/research/researchtrackerapp.ts -p 4090 --task mm_bridge
+```
+
+Open `http://localhost:4090/?task=mm_bridge`.
+For markdown-only view in a separate tab:
+- `http://localhost:4090/doc?task=mm_bridge&file=<doc_name>.md`
+
 
 Probing
 -------
@@ -50,6 +70,76 @@ Linear probes on mu are used to test downstream task efficiency. Multiple probes
 > python3 -m evals.probe --ckpt logs/sl_d2_b01/step_10001.tar --use_mu
 > python3 -m evals.probe --ckpts logs/model1/step_10001.tar logs/model2/step_10001.tar --use_mu --multi_mode=lockstep
 ```
+
+Multimodal Bridge Diagnostics
+-----------------------------
+Docker-first checkpoint diagnostics for the frozen-bridge VQA setup:
+- image perturbation sensitivity (`clean`, `shuffle`, `zero`, `noise`, `fixed_image`)
+- accuracy deltas vs clean
+- prediction agreement vs clean
+- visual-prefix geometry stats
+
+```bash
+./tasks/mm_bridge/scripts/run_mm_diag.sh mmdiag_example \
+  --checkpoint logs/mmbr_basesweep_on_high/step_3466.tar \
+  --max_batches 80 \
+  --stats_batches 40 \
+  --batch_size 256 \
+  --modes clean,shuffle,zero,noise,fixed_image \
+  --noise_std 0.2
+```
+
+Outputs are written to:
+- `logs/<diag_run_id>/diag_report.json`
+- `logs/<diag_run_id>/diag_report.md`
+
+Prefix Calibration Sweep (MM Training)
+--------------------------------------
+Shortened iterative training sweep for calibrated bridge interface:
+
+```bash
+./tasks/mm_bridge/scripts/launch_prefix_calib_sweep.sh
+```
+
+Key new MM flags:
+- `--prefix_calibration`
+- `--prefix_calib_layernorm`
+- `--prefix_calib_bias`
+- `--prefix_calib_gate_init`
+- `--prefix_norm_target_ratio`
+- `--prefix_norm_reg_weight`
+- `--prefix_batchvar_reg_weight`
+
+Next-Gen Bridge Sweep (Night Plan)
+----------------------------------
+Architecture-focused sequential sweep (Docker via `runmm.sh`) covering:
+- learned-query cross-attention reducer
+- spatial mixer before reduction
+- hybrid constant + image prefix
+- perceiver-style resampler
+- q-former-lite bridge
+
+Launch:
+```bash
+./tasks/mm_bridge/scripts/launch_night_bridge_sweep_v1.sh
+```
+
+Common bridge flags:
+- `--bridge_type {mlp,learned_tokens,learned_query,perceiver_resampler,qformer_lite,hybrid_const_image}`
+- `--bridge_num_heads`
+- `--bridge_query_depth`
+- `--bridge_refine_layers`
+- `--bridge_pre_mixer_type {none,self_attn,conv1d}`
+- `--bridge_pre_mixer_layers`
+- `--bridge_hybrid_alpha_mode {scalar,token}`
+- `--bridge_hybrid_alpha_init`
+- `--bridge_hybrid_image_bridge_type {mlp,learned_query,perceiver_resampler,qformer_lite}`
+
+Throughput knobs (night sweeps):
+- `--precision bf16` (recommended on modern NVIDIA GPUs)
+- `--batch_size`, `--grad_accum_steps`
+- `--num_workers`, `--prefetch_factor`
+- `--vision_device {auto,cpu,cuda,mps}` (CPU vision is supported but usually slower end-to-end)
 
 
 Create mp4 of step_nnn.png's 

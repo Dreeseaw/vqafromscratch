@@ -39,7 +39,7 @@ if [[ -n "${CKPT_STEP}" ]]; then
   CMD+=(--checkpoint "$CKPT_STEP")
 fi
 
-docker run --rm -it --gpus all --ipc=host \
+docker run --rm --gpus all --ipc=host \
   -e PYTORCH_ENABLE_MPS_FALLBACK=1 \
   -v "$(pwd)":/app -w /app myrepo:gpu \
   "${CMD[@]}" \

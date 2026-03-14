@@ -11,11 +11,13 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import math
 import os
 import random
 import re
 import sys
 import time
+import gc
 from contextlib import nullcontext
 from dataclasses import asdict
 from types import SimpleNamespace
@@ -36,6 +38,8 @@ from train.vqa_data import VQAv2Dataset, VQAv2Paths, build_image_transform, prep
 LOGDIR = "logs"
 LOGFILE = "logfile.txt"
 DEFAULT_FINAL_SANITY_COUNT = 4
+DEFAULT_TRAIN_SAMPLE_BUDGET = 1_152_000
+DEFAULT_EVAL_FRACTION = 0.5
 FINAL_SANITY_MIN_PROMPTS = 3
 FINAL_SANITY_MAX_PROMPTS = 5
 
@@ -158,6 +162,7 @@ def _apply_runtime_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "vision_config": None,
         "vision_latent_dim": 768,
         "vision_cbld": 1536,
+        "vision_device": "auto",
         "vision_feature_mode": "auto",
         "vision_feature_source": "posterior_mu",
         "lm_checkpoint": None,
@@ -176,15 +181,62 @@ def _apply_runtime_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "bridge_token_reduce": "adaptive_pool",
         "bridge_learned_init_std": 0.02,
         "bridge_add_2d_pos_emb": False,
+        "bridge_num_heads": 8,
+        "bridge_attn_dropout": 0.0,
+        "bridge_query_depth": 2,
+        "bridge_refine_layers": 0,
+        "bridge_pre_mixer_type": "none",
+        "bridge_pre_mixer_layers": 1,
+        "bridge_pre_mixer_kernel_size": 3,
+        "bridge_hybrid_alpha_mode": "scalar",
+        "bridge_hybrid_alpha_init": 0.5,
+        "bridge_hybrid_image_bridge_type": "learned_query",
+        "bridge_question_conditioning": False,
+        "bridge_qcond_scale": 0.5,
+        "bridge_query_bank_mode": "learned",
+        "bridge_qquery_basis_count": 4,
+        "bridge_qquery_scale": 1.0,
+        "bridge_query_role_specialization": False,
+        "bridge_question_context_mode": "all_text",
+        "eval_use_kv_cache": False,
+        "eval_kv_cache_mode": "batched",
+        "bridge_token_selector_type": "none",
+        "bridge_token_select_k": 0,
+        "bridge_token_select_k_min": 0,
+        "bridge_num_roles": 4,
+        "bridge_evidence_topk": 0,
+        "lm_visual_adapter_type": "none",
+        "lm_visual_adapter_layers": 0,
+        "lm_visual_adapter_num_heads": 8,
+        "lm_visual_adapter_dropout": 0.0,
+        "lm_visual_adapter_gate_init": 0.5,
+        "prefix_calibration": False,
+        "prefix_calib_layernorm": True,
+        "prefix_calib_bias": True,
+        "prefix_calib_gate_init": 1.0,
+        "prefix_geom_mlp_ratio": 0.0,
+        "prefix_geom_token_mixer_layers": 0,
+        "prefix_norm_target_ratio": 0.0,
+        "prefix_norm_reg_weight": 0.0,
+        "prefix_batchvar_reg_weight": 0.0,
+        "prefix_dropout": 0.0,
+        "lr_schedule": "constant",
+        "lr_warmup_steps": 0,
+        "lr_min_ratio": 0.1,
+        "cuda_empty_cache_after_eval": True,
         "images_root": "images",
         "annotations_root": "annotations",
         "max_question_length": 64,
         "max_answer_length": 16,
         "max_text_tokens": 256,
         "batch_size": 16,
+        "eval_batch_size": 0,
+        "eval_image_corruption": "none",
+        "eval_image_corruption_seed": 123,
         "num_workers": 2,
         "prefetch_factor": 2,
         "pin_memory": True,
+        "grad_accum_steps": 1,
         "fixed_eval_count": 5,
         "freeze_mode": "bridge_only",
         "train_top_lm_layers": 1,
@@ -290,11 +342,23 @@ class VisionFeatureAdapter(nn.Module):
     - [B, C, H, W] (converted to [B, Nv, Dv])
     """
 
-    def __init__(self, vision_model: nn.Module, feature_mode: str = "auto", feature_source: str = "posterior_mu"):
+    def __init__(
+        self,
+        vision_model: nn.Module,
+        feature_mode: str = "auto",
+        feature_source: str = "posterior_mu",
+        *,
+        vision_device: Optional[str] = None,
+        output_device: Optional[str] = None,
+        force_no_grad: bool = True,
+    ):
         super().__init__()
         self.vision_model = vision_model
         self.feature_mode = feature_mode
         self.feature_source = feature_source
+        self.vision_device = None if vision_device in (None, "auto") else str(vision_device)
+        self.output_device = None if output_device in (None, "auto") else str(output_device)
+        self.force_no_grad = bool(force_no_grad)
 
     def _extract_raw(self, images: torch.Tensor) -> torch.Tensor:
         src = str(self.feature_source)
@@ -303,6 +367,12 @@ class VisionFeatureAdapter(nn.Module):
             if not hasattr(m, "_encoder"):
                 raise ValueError("feature_source=encoder requires vision model._encoder")
             return m._encoder(images)
+        if src == "encoder_plus_posterior_mu":
+            if not hasattr(m, "_encoder") or not hasattr(m, "_post_head"):
+                raise ValueError("feature_source=encoder_plus_posterior_mu requires _encoder and _post_head")
+            h = m._encoder(images)
+            mu, _ = m._post_head(h)
+            return h, mu
         if src == "posterior_mu":
             if not hasattr(m, "_encoder") or not hasattr(m, "_post_head"):
                 raise ValueError("feature_source=posterior_mu requires _encoder and _post_head")
@@ -318,26 +388,195 @@ class VisionFeatureAdapter(nn.Module):
                     return x
         raise ValueError("Could not extract tensor features from vision model output.")
 
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        x = self._extract_raw(images)
+    def _move_output(self, out: torch.Tensor) -> torch.Tensor:
+        if self.output_device is not None and str(out.device) != self.output_device:
+            out = out.to(self.output_device, non_blocking=True)
+        return out
+
+    def _format_single(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim == 4:
             x = x.flatten(2).transpose(1, 2)  # [B,C,H,W] -> [B,N,C]
         if self.feature_mode == "global":
             if x.ndim == 2:
-                return x
+                return self._move_output(x)
             if x.ndim == 3:
-                return x.mean(dim=1)
+                return self._move_output(x.mean(dim=1))
             raise ValueError(f"Unsupported feature shape for global mode: {tuple(x.shape)}")
         if self.feature_mode == "token":
             if x.ndim == 3:
-                return x
+                return self._move_output(x)
             if x.ndim == 2:
-                return x.unsqueeze(1)
+                return self._move_output(x.unsqueeze(1))
             raise ValueError(f"Unsupported feature shape for token mode: {tuple(x.shape)}")
-        # auto
         if x.ndim in (2, 3):
-            return x
+            return self._move_output(x)
         raise ValueError(f"Unsupported feature shape for auto mode: {tuple(x.shape)}")
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        x_in = images
+        if self.vision_device is not None and str(x_in.device) != self.vision_device:
+            x_in = x_in.to(self.vision_device, non_blocking=True)
+        ctx = torch.no_grad() if self.force_no_grad else nullcontext()
+        with ctx:
+            x = self._extract_raw(x_in)
+        if isinstance(x, (tuple, list)):
+            if self.feature_mode == "global":
+                raise ValueError("feature_source=encoder_plus_posterior_mu does not support feature_mode=global")
+            return tuple(self._format_single(t) for t in x)
+        return self._format_single(x)
+
+
+class _PrefixGeomTokenMixerBlock(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.ln = nn.LayerNorm(int(dim))
+        self.dw = nn.Conv1d(int(dim), int(dim), kernel_size=3, padding=1, groups=int(dim), bias=False)
+        self.pw = nn.Conv1d(int(dim), int(dim), kernel_size=1, bias=True)
+        nn.init.zeros_(self.dw.weight)
+        nn.init.zeros_(self.pw.weight)
+        nn.init.zeros_(self.pw.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.ln(x).transpose(1, 2)
+        y = self.dw(y)
+        y = F.gelu(y)
+        y = self.pw(y).transpose(1, 2)
+        return x + y
+
+
+class PrefixCalibrator(nn.Module):
+    """
+    Optional bridge-output calibrator to better match frozen LM embedding statistics.
+
+    y = gate * LN(x) + bias
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        *,
+        enabled: bool,
+        use_layernorm: bool,
+        use_bias: bool,
+        gate_init: float,
+        geom_mlp_ratio: float,
+        geom_token_mixer_layers: int,
+    ) -> None:
+        super().__init__()
+        self.enabled = bool(enabled)
+        if not self.enabled:
+            self.ln = nn.Identity()
+            self.log_gate = None
+            self.bias = None
+            self.geom_blocks = nn.ModuleList()
+            self.geom_ln = nn.Identity()
+            self.geom_mlp = None
+            return
+
+        self.ln = nn.LayerNorm(int(dim), elementwise_affine=False) if bool(use_layernorm) else nn.Identity()
+        init = max(1e-5, float(gate_init))
+        self.log_gate = nn.Parameter(torch.full((1, 1, int(dim)), math.log(init)))
+        self.bias = nn.Parameter(torch.zeros(1, 1, int(dim))) if bool(use_bias) else None
+        self.geom_blocks = nn.ModuleList(
+            [_PrefixGeomTokenMixerBlock(int(dim)) for _ in range(max(0, int(geom_token_mixer_layers)))]
+        )
+        ratio = float(geom_mlp_ratio)
+        if ratio > 0.0:
+            h = max(4, int(round(int(dim) * ratio)))
+            self.geom_ln = nn.LayerNorm(int(dim))
+            self.geom_mlp = nn.Sequential(
+                nn.Linear(int(dim), h),
+                nn.GELU(),
+                nn.Linear(h, int(dim)),
+            )
+            last = self.geom_mlp[-1]
+            assert isinstance(last, nn.Linear)
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
+        else:
+            self.geom_ln = nn.Identity()
+            self.geom_mlp = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.enabled:
+            return x
+        y = self.ln(x)
+        assert self.log_gate is not None
+        gate = torch.exp(self.log_gate).clamp(min=1e-5, max=100.0)
+        y = y * gate
+        if self.bias is not None:
+            y = y + self.bias
+        for blk in self.geom_blocks:
+            y = blk(y)
+        if self.geom_mlp is not None:
+            y = y + self.geom_mlp(self.geom_ln(y))
+        return y
+
+
+def _resolve_mha_heads(dim: int, requested: int) -> int:
+    d = max(1, int(dim))
+    h = max(1, min(int(requested), d))
+    while h > 1 and (d % h) != 0:
+        h -= 1
+    return h
+
+
+class ResidualVisualAdapter(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        *,
+        num_heads: int,
+        dropout: float,
+        gate_init: float,
+    ) -> None:
+        super().__init__()
+        d = int(dim)
+        p = max(0.0, float(dropout))
+        gate = min(1.0 - 1e-4, max(1e-4, float(gate_init)))
+        logit = math.log(gate / (1.0 - gate))
+        self.ln_q = nn.LayerNorm(d)
+        self.ln_kv = nn.LayerNorm(d)
+        self.cross_attn = nn.MultiheadAttention(
+            d,
+            num_heads=_resolve_mha_heads(d, int(num_heads)),
+            dropout=p,
+            batch_first=True,
+        )
+        self.cross_drop = nn.Dropout(p)
+        self.cross_gate_logit = nn.Parameter(torch.full((1, 1, d), logit))
+        h = max(4, 2 * d)
+        self.ff_ln = nn.LayerNorm(d)
+        self.ffn = nn.Sequential(
+            nn.Linear(d, h),
+            nn.GELU(),
+            nn.Dropout(p),
+            nn.Linear(h, d),
+        )
+        self.ff_drop = nn.Dropout(p)
+        self.ff_gate_logit = nn.Parameter(torch.full((1, 1, d), logit))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        visual_tokens: torch.Tensor,
+        query_keep_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        q = self.ln_q(x)
+        kv = self.ln_kv(visual_tokens)
+        attn_out, _ = self.cross_attn(q, kv, kv, need_weights=False)
+        if query_keep_mask is not None:
+            keep = query_keep_mask.unsqueeze(-1).to(dtype=attn_out.dtype)
+            attn_out = attn_out * keep
+        x = x + torch.sigmoid(self.cross_gate_logit) * self.cross_drop(attn_out)
+
+        ff_out = self.ffn(self.ff_ln(x))
+        if query_keep_mask is not None:
+            keep = query_keep_mask.unsqueeze(-1).to(dtype=ff_out.dtype)
+            ff_out = ff_out * keep
+        x = x + torch.sigmoid(self.ff_gate_logit) * self.ff_drop(ff_out)
+        return x
 
 
 class MultimodalPrefixLM(nn.Module):
@@ -348,12 +587,70 @@ class MultimodalPrefixLM(nn.Module):
         lm: TransformerDecoderOnlyV1,
         *,
         lm_autocast: bool = True,
+        prefix_calibration: bool = False,
+        prefix_calib_layernorm: bool = True,
+        prefix_calib_bias: bool = True,
+        prefix_calib_gate_init: float = 1.0,
+        prefix_geom_mlp_ratio: float = 0.0,
+        prefix_geom_token_mixer_layers: int = 0,
+        prefix_norm_target_ratio: float = 0.0,
+        prefix_norm_reg_weight: float = 0.0,
+        prefix_batchvar_reg_weight: float = 0.0,
+        prefix_dropout: float = 0.0,
+        question_context_mode: str = "all_text",
+        eval_use_kv_cache: bool = False,
+        eval_kv_cache_mode: str = "batched",
+        lm_visual_adapter_type: str = "none",
+        lm_visual_adapter_layers: int = 0,
+        lm_visual_adapter_num_heads: int = 8,
+        lm_visual_adapter_dropout: float = 0.0,
+        lm_visual_adapter_gate_init: float = 0.5,
     ):
         super().__init__()
         self.vision_adapter = vision_adapter
         self.bridge = bridge
         self.lm = lm
         self.lm_autocast = bool(lm_autocast)
+        d_model = int(getattr(lm._config, "embed_size"))
+        self.prefix_calibrator = PrefixCalibrator(
+            d_model,
+            enabled=bool(prefix_calibration),
+            use_layernorm=bool(prefix_calib_layernorm),
+            use_bias=bool(prefix_calib_bias),
+            gate_init=float(prefix_calib_gate_init),
+            geom_mlp_ratio=float(prefix_geom_mlp_ratio),
+            geom_token_mixer_layers=int(prefix_geom_token_mixer_layers),
+        )
+        self.prefix_calibration = bool(prefix_calibration)
+        self.prefix_norm_target_ratio = float(prefix_norm_target_ratio)
+        self.prefix_norm_reg_weight = float(prefix_norm_reg_weight)
+        self.prefix_batchvar_reg_weight = float(prefix_batchvar_reg_weight)
+        self.prefix_dropout = max(0.0, float(prefix_dropout))
+        self.question_context_mode = str(question_context_mode)
+        self.eval_use_kv_cache = bool(eval_use_kv_cache)
+        self.eval_kv_cache_mode = str(eval_kv_cache_mode)
+        if self.eval_kv_cache_mode not in ("serial", "batched"):
+            raise ValueError("eval_kv_cache_mode must be 'serial' or 'batched'.")
+        self.lm_visual_adapter_type = str(lm_visual_adapter_type)
+        self.lm_visual_adapter_layers = max(0, int(lm_visual_adapter_layers))
+        self.visual_adapters = nn.ModuleDict()
+        self.visual_adapter_layer_ids: List[int] = []
+        if self.lm_visual_adapter_type not in ("none", "cross_attn"):
+            raise ValueError(
+                f"Unsupported lm_visual_adapter_type={self.lm_visual_adapter_type}. Supported: none, cross_attn"
+            )
+        if self.lm_visual_adapter_type != "none" and self.lm_visual_adapter_layers > 0:
+            total_layers = len(self.lm._dec_blocks)
+            top_n = max(0, min(self.lm_visual_adapter_layers, total_layers))
+            self.visual_adapter_layer_ids = list(range(total_layers - top_n, total_layers))
+            for layer_idx in self.visual_adapter_layer_ids:
+                self.visual_adapters[str(layer_idx)] = ResidualVisualAdapter(
+                    d_model,
+                    num_heads=int(lm_visual_adapter_num_heads),
+                    dropout=float(lm_visual_adapter_dropout),
+                    gate_init=float(lm_visual_adapter_gate_init),
+                )
+        self.uses_visual_adapters = len(self.visual_adapter_layer_ids) > 0
 
     def _lm_autocast_dtype(self) -> Optional[torch.dtype]:
         if not self.lm_autocast:
@@ -364,60 +661,524 @@ class MultimodalPrefixLM(nn.Module):
             return torch.bfloat16
         return torch.float16
 
-    def forward_logits(
+    @staticmethod
+    def _question_context_from_text(
+        text_emb: torch.Tensor,
+        context_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        valid = context_mask.unsqueeze(-1).float()
+        denom = valid.sum(dim=1).clamp_min(1.0)
+        return (text_emb * valid).sum(dim=1) / denom
+
+    def _bridge_forward(
         self,
-        input_ids: torch.Tensor,
-        images: torch.Tensor,
+        bridge_input: torch.Tensor,
+        question_context: Optional[torch.Tensor],
+        question_tokens: Optional[torch.Tensor] = None,
+        question_token_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if bool(getattr(self.bridge, "supports_question_context", False)) or bool(
+            getattr(self.bridge, "supports_question_tokens", False)
+        ):
+            return self.bridge(
+                bridge_input,
+                question_context=question_context,
+                question_tokens=question_tokens,
+                question_token_mask=question_token_mask,
+            )
+        return self.bridge(bridge_input)
+
+    def _compute_question_views(
+        self,
+        text_emb: torch.Tensor,
         text_pad_mask: torch.Tensor,
+        prompt_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        supports_qctx = bool(getattr(self.bridge, "supports_question_context", False))
+        supports_qtokens = bool(getattr(self.bridge, "supports_question_tokens", False))
+        if not supports_qctx and not supports_qtokens:
+            return None, None, None
+        if self.question_context_mode == "prompt_only" and prompt_mask is not None:
+            context_mask = prompt_mask & (~text_pad_mask)
+        else:
+            context_mask = ~text_pad_mask
+        question_context = None
+        if supports_qctx:
+            question_context = self._question_context_from_text(text_emb, context_mask)
+        question_tokens = text_emb if supports_qtokens else None
+        question_token_mask = context_mask if supports_qtokens else None
+        return question_context, question_tokens, question_token_mask
+
+    def _adapter_query_keep_mask(
+        self,
         *,
-        debug_shapes: bool = False,
-    ) -> Tuple[torch.Tensor, int]:
+        text_pad_mask: torch.Tensor,
+        prefix_k: int,
+    ) -> torch.Tensor:
+        b = int(text_pad_mask.shape[0])
+        prefix_keep = torch.zeros((b, int(prefix_k)), dtype=torch.bool, device=text_pad_mask.device)
+        return torch.cat([prefix_keep, ~text_pad_mask], dim=1)
+
+    def _compute_visual_prefix(
+        self,
+        *,
+        images: torch.Tensor,
+        text_emb: Optional[torch.Tensor] = None,
+        text_pad_mask: Optional[torch.Tensor] = None,
+        prompt_mask: Optional[torch.Tensor] = None,
+        visual_features: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        question_context: Optional[torch.Tensor] = None
+        question_tokens: Optional[torch.Tensor] = None
+        question_token_mask: Optional[torch.Tensor] = None
+        if text_emb is not None and text_pad_mask is not None:
+            question_context, question_tokens, question_token_mask = self._compute_question_views(
+                text_emb=text_emb,
+                text_pad_mask=text_pad_mask,
+                prompt_mask=prompt_mask,
+            )
+
         needs_visual = bool(getattr(self.bridge, "requires_visual_features", True))
-        visual_features: Optional[torch.Tensor] = None
+        used_visual_features = visual_features
         if needs_visual:
-            visual_features = self.vision_adapter(images)
-            visual_prefix = self.bridge(visual_features)
+            if used_visual_features is None:
+                used_visual_features = self.vision_adapter(images)
+            visual_prefix = self._bridge_forward(
+                used_visual_features,
+                question_context,
+                question_tokens=question_tokens,
+                question_token_mask=question_token_mask,
+            )
         else:
             # Image-agnostic bridge baselines only need batch size/device from images.
-            visual_prefix = self.bridge(images)
-        text_emb = self.lm._embed_dropout(self.lm._embed(input_ids))
-        x = torch.cat([visual_prefix, text_emb], dim=1)
+            visual_prefix = self._bridge_forward(
+                images,
+                question_context,
+                question_tokens=question_tokens,
+                question_token_mask=question_token_mask,
+            )
 
-        b = int(input_ids.shape[0])
+        visual_prefix = self.prefix_calibrator(visual_prefix)
+        if self.prefix_dropout > 0.0 and self.training:
+            visual_prefix = F.dropout(visual_prefix, p=self.prefix_dropout, training=True)
+        return visual_prefix, used_visual_features
+
+    def _decode_hidden_with_visual_prefix(
+        self,
+        *,
+        text_emb: torch.Tensor,
+        text_pad_mask: torch.Tensor,
+        visual_prefix: torch.Tensor,
+    ) -> Tuple[torch.Tensor, int]:
+        x = torch.cat([visual_prefix, text_emb], dim=1)
+        b = int(text_emb.shape[0])
         k = int(visual_prefix.shape[1])
-        prefix_pad = torch.zeros((b, k), dtype=torch.bool, device=input_ids.device)
+        prefix_pad = torch.zeros((b, k), dtype=torch.bool, device=text_emb.device)
         full_pad = torch.cat([prefix_pad, text_pad_mask], dim=1)
-        use_lm_amp = (
-            x.device.type == "cuda"
-            and str(getattr(self.lm._config, "attn_impl", "sdpa")) == "sdpa"
-            and self._lm_autocast_dtype() is not None
-        )
-        if use_lm_amp:
-            with torch.autocast(device_type="cuda", dtype=self._lm_autocast_dtype(), enabled=True):
-                hidden = self.lm._decode_only(
-                    x,
-                    pad_mask=full_pad,
-                    is_causal=bool(getattr(self.lm._config, "causal_lm", True)),
-                )
-                logits = self.lm._lm_head(hidden)
-            logits = logits.float()
-        else:
+        if not self.uses_visual_adapters:
             hidden = self.lm._decode_only(
                 x,
                 pad_mask=full_pad,
                 is_causal=bool(getattr(self.lm._config, "causal_lm", True)),
             )
+            return hidden, k
+
+        query_keep_mask = self._adapter_query_keep_mask(text_pad_mask=text_pad_mask, prefix_k=k)
+        hidden = x
+        is_causal = bool(getattr(self.lm._config, "causal_lm", True))
+        for layer_idx, block in enumerate(self.lm._dec_blocks):
+            hidden = block(
+                hidden,
+                pad_mask=full_pad,
+                rope=self.lm._rope,
+                is_causal=is_causal,
+            )
+            adapter_key = str(layer_idx)
+            if adapter_key in self.visual_adapters:
+                hidden = self.visual_adapters[adapter_key](
+                    hidden,
+                    visual_tokens=visual_prefix,
+                    query_keep_mask=query_keep_mask,
+                )
+        return hidden, k
+
+    def _decode_with_visual_prefix(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        text_emb: torch.Tensor,
+        text_pad_mask: torch.Tensor,
+        visual_prefix: torch.Tensor,
+        debug_shapes: bool = False,
+        visual_features: Optional[torch.Tensor] = None,
+        images: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, int]:
+        use_lm_amp = (
+            text_emb.device.type == "cuda"
+            and str(getattr(self.lm._config, "attn_impl", "sdpa")) == "sdpa"
+            and self._lm_autocast_dtype() is not None
+        )
+        if use_lm_amp:
+            with torch.autocast(device_type="cuda", dtype=self._lm_autocast_dtype(), enabled=True):
+                hidden, k = self._decode_hidden_with_visual_prefix(
+                    text_emb=text_emb,
+                    text_pad_mask=text_pad_mask,
+                    visual_prefix=visual_prefix,
+                )
+                logits = self.lm._lm_head(hidden)
+            logits = logits.float()
+        else:
+            hidden, k = self._decode_hidden_with_visual_prefix(
+                text_emb=text_emb,
+                text_pad_mask=text_pad_mask,
+                visual_prefix=visual_prefix,
+            )
             logits = self.lm._lm_head(hidden)
         if debug_shapes:
-            print(f"[mm:shape] images={tuple(images.shape)}")
+            if images is not None:
+                print(f"[mm:shape] images={tuple(images.shape)}")
             if visual_features is None:
                 print("[mm:shape] visual_features=<skipped by bridge>")
             else:
                 print(f"[mm:shape] visual_features={tuple(visual_features.shape)}")
             print(f"[mm:shape] visual_prefix={tuple(visual_prefix.shape)}")
             print(f"[mm:shape] text_ids={tuple(input_ids.shape)} text_emb={tuple(text_emb.shape)}")
-            print(f"[mm:shape] combined={tuple(x.shape)} logits={tuple(logits.shape)}")
+            print(f"[mm:shape] combined={(int(hidden.shape[0]), int(hidden.shape[1]), int(hidden.shape[2]))} logits={tuple(logits.shape)}")
         return logits, k
+
+    def _lm_head_with_amp(self, hidden: torch.Tensor) -> torch.Tensor:
+        use_lm_amp = (
+            hidden.device.type == "cuda"
+            and str(getattr(self.lm._config, "attn_impl", "sdpa")) == "sdpa"
+            and self._lm_autocast_dtype() is not None
+        )
+        if use_lm_amp:
+            with torch.autocast(device_type="cuda", dtype=self._lm_autocast_dtype(), enabled=True):
+                logits = self.lm._lm_head(hidden)
+            return logits.float()
+        return self.lm._lm_head(hidden)
+
+    def _prefill_decode_with_visual_prefix(
+        self,
+        *,
+        text_emb: torch.Tensor,
+        text_pad_mask: torch.Tensor,
+        visual_prefix: torch.Tensor,
+    ) -> Tuple[torch.Tensor, int, Any]:
+        if self.uses_visual_adapters:
+            raise RuntimeError("KV-cache prefill is unsupported when lm_visual_adapter_type is enabled.")
+        x = torch.cat([visual_prefix, text_emb], dim=1)
+        b = int(text_emb.shape[0])
+        k = int(visual_prefix.shape[1])
+        prefix_pad = torch.zeros((b, k), dtype=torch.bool, device=text_emb.device)
+        full_pad = torch.cat([prefix_pad, text_pad_mask], dim=1)
+        hidden, kv_cache = self.lm._prefill_decode_only(
+            x,
+            pad_mask=full_pad,
+            is_causal=bool(getattr(self.lm._config, "causal_lm", True)),
+        )
+        logits = self._lm_head_with_amp(hidden)
+        return logits, k, kv_cache
+
+    @staticmethod
+    def _pack_generation_text_batch(
+        ids: Sequence[Sequence[int]],
+        *,
+        prompt_lengths: Sequence[int],
+        pad_id: int,
+        device: torch.device,
+        legacy_prompt_mask: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if len(ids) != len(prompt_lengths):
+            raise ValueError(f"Expected prompt_lengths len={len(ids)}, got {len(prompt_lengths)}")
+        if not ids:
+            empty_ids = torch.empty((0, 0), dtype=torch.long, device=device)
+            empty_mask = torch.empty((0, 0), dtype=torch.bool, device=device)
+            return empty_ids, empty_mask, empty_mask
+        max_len = max(len(s) for s in ids)
+        input_ids = torch.full((len(ids), max_len), int(pad_id), dtype=torch.long, device=device)
+        text_pad_mask = torch.ones((len(ids), max_len), dtype=torch.bool, device=device)
+        prompt_mask = torch.zeros((len(ids), max_len), dtype=torch.bool, device=device)
+        for i, s in enumerate(ids):
+            if not s:
+                continue
+            t = torch.tensor(s, dtype=torch.long, device=device)
+            seq_len = int(len(s))
+            input_ids[i, :seq_len] = t
+            text_pad_mask[i, :seq_len] = False
+            prompt_len = seq_len if legacy_prompt_mask else min(int(prompt_lengths[i]), seq_len)
+            if prompt_len > 0:
+                prompt_mask[i, :prompt_len] = True
+        return input_ids, text_pad_mask, prompt_mask
+
+    @staticmethod
+    def _select_kv_cache_rows(
+        kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
+        row_indices: torch.Tensor,
+    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        row_idx = row_indices.to(dtype=torch.long)
+        return [
+            (
+                wk.index_select(0, row_idx),
+                wv.index_select(0, row_idx),
+            )
+            for wk, wv in kv_cache
+        ]
+
+    def _generate_answers_with_kv_cache_serial(
+        self,
+        *,
+        seqs: List[List[int]],
+        generated_ids: List[List[int]],
+        done: List[bool],
+        cached_visual_prefix: torch.Tensor,
+        eos_id: int,
+        max_new_tokens: int,
+    ) -> List[List[int]]:
+        device = cached_visual_prefix.device
+        for i in range(len(seqs)):
+            if done[i]:
+                continue
+            cur_ids = list(seqs[i])
+            cur_len = int(len(cur_ids))
+            single_input_ids = torch.tensor(cur_ids, dtype=torch.long, device=device).unsqueeze(0)
+            single_text_pad_mask = torch.zeros((1, cur_len), dtype=torch.bool, device=device)
+            single_text_emb = self.lm._embed_dropout(self.lm._embed(single_input_ids))
+            single_visual_prefix = cached_visual_prefix[i : i + 1]
+            logits_i, prefix_k_i, kv_cache = self._prefill_decode_with_visual_prefix(
+                text_emb=single_text_emb,
+                text_pad_mask=single_text_pad_mask,
+                visual_prefix=single_visual_prefix,
+            )
+            next_id = int(torch.argmax(logits_i[0, prefix_k_i + cur_len - 1]).item())
+            if next_id == int(eos_id):
+                done[i] = True
+                continue
+            seqs[i].append(next_id)
+            generated_ids[i].append(next_id)
+            step_pos = int(prefix_k_i + cur_len)
+            tokens_generated = 2
+
+            while tokens_generated < int(max_new_tokens):
+                step_input_ids = torch.tensor([[next_id]], dtype=torch.long, device=device)
+                step_text_emb = self.lm._embed_dropout(self.lm._embed(step_input_ids))
+                hidden, kv_cache = self.lm._decode_only_incremental(
+                    step_text_emb,
+                    kv_cache=kv_cache,
+                    pad_mask=None,
+                    q_pad_mask=None,
+                    start_pos=step_pos,
+                )
+                step_pos += 1
+                next_id = int(torch.argmax(self._lm_head_with_amp(hidden)[0, 0]).item())
+                if next_id == int(eos_id):
+                    done[i] = True
+                    break
+                seqs[i].append(next_id)
+                generated_ids[i].append(next_id)
+                tokens_generated += 1
+        return generated_ids
+
+    def _generate_answers_with_kv_cache_batched(
+        self,
+        *,
+        seqs: List[List[int]],
+        prompt_lengths: Sequence[int],
+        generated_ids: List[List[int]],
+        done: List[bool],
+        cached_visual_prefix: torch.Tensor,
+        pad_id: int,
+        eos_id: int,
+        max_new_tokens: int,
+    ) -> List[List[int]]:
+        device = cached_visual_prefix.device
+        active_indices = [i for i, finished in enumerate(done) if not finished]
+        if not active_indices:
+            return generated_ids
+
+        select_idx = torch.tensor(active_indices, dtype=torch.long, device=device)
+        active_visual_prefix = cached_visual_prefix.index_select(0, select_idx)
+        active_seqs = [list(seqs[i]) for i in active_indices]
+        active_prompt_lengths = [int(prompt_lengths[i]) for i in active_indices]
+        input_ids, text_pad_mask, _ = self._pack_generation_text_batch(
+            active_seqs,
+            prompt_lengths=active_prompt_lengths,
+            pad_id=pad_id,
+            device=device,
+            legacy_prompt_mask=False,
+        )
+        text_emb = self.lm._embed_dropout(self.lm._embed(input_ids))
+        logits, prefix_k, kv_cache = self._prefill_decode_with_visual_prefix(
+            text_emb=text_emb,
+            text_pad_mask=text_pad_mask,
+            visual_prefix=active_visual_prefix,
+        )
+        prefix_pad = torch.zeros((len(active_indices), prefix_k), dtype=torch.bool, device=device)
+        cache_pad_mask = torch.cat([prefix_pad, text_pad_mask], dim=1)
+        cur_lens = [int(len(s)) for s in active_seqs]
+
+        continue_rows: List[int] = []
+        continue_indices: List[int] = []
+        continue_token_ids: List[int] = []
+        continue_step_pos: List[int] = []
+        for row_idx, global_idx in enumerate(active_indices):
+            next_id = int(torch.argmax(logits[row_idx, prefix_k + cur_lens[row_idx] - 1]).item())
+            if next_id == int(eos_id):
+                done[global_idx] = True
+                continue
+            seqs[global_idx].append(next_id)
+            generated_ids[global_idx].append(next_id)
+            continue_rows.append(row_idx)
+            continue_indices.append(global_idx)
+            continue_token_ids.append(next_id)
+            continue_step_pos.append(prefix_k + cur_lens[row_idx])
+
+        if int(max_new_tokens) <= 2 or not continue_rows:
+            return generated_ids
+
+        keep_rows = torch.tensor(continue_rows, dtype=torch.long, device=device)
+        kv_cache = self._select_kv_cache_rows(kv_cache, keep_rows)
+        cache_pad_mask = cache_pad_mask.index_select(0, keep_rows)
+        step_pos = torch.tensor(continue_step_pos, dtype=torch.long, device=device)
+        active_indices = continue_indices
+        step_input_ids = torch.tensor(continue_token_ids, dtype=torch.long, device=device).unsqueeze(1)
+        tokens_generated = 2
+
+        while tokens_generated < int(max_new_tokens) and active_indices:
+            step_text_emb = self.lm._embed_dropout(self.lm._embed(step_input_ids))
+            # Batched prefill keeps padded prompt slots in-cache; keep them masked
+            # while letting newly appended generated tokens participate normally.
+            step_pad_mask = torch.cat(
+                [cache_pad_mask, torch.zeros((len(active_indices), 1), dtype=torch.bool, device=device)],
+                dim=1,
+            )
+            hidden, kv_cache = self.lm._decode_only_incremental(
+                step_text_emb,
+                kv_cache=kv_cache,
+                pad_mask=step_pad_mask,
+                q_pad_mask=None,
+                start_pos=step_pos,
+            )
+            step_pos = step_pos + 1
+            next_ids = torch.argmax(self._lm_head_with_amp(hidden)[:, 0], dim=-1)
+
+            keep_rows_list: List[int] = []
+            keep_indices: List[int] = []
+            keep_token_ids: List[int] = []
+            for row_idx, global_idx in enumerate(active_indices):
+                next_id = int(next_ids[row_idx].item())
+                if next_id == int(eos_id):
+                    done[global_idx] = True
+                    continue
+                seqs[global_idx].append(next_id)
+                generated_ids[global_idx].append(next_id)
+                keep_rows_list.append(row_idx)
+                keep_indices.append(global_idx)
+                keep_token_ids.append(next_id)
+
+            tokens_generated += 1
+            if tokens_generated >= int(max_new_tokens) or not keep_rows_list:
+                break
+
+            keep_rows = torch.tensor(keep_rows_list, dtype=torch.long, device=device)
+            kv_cache = self._select_kv_cache_rows(kv_cache, keep_rows)
+            cache_pad_mask = step_pad_mask.index_select(0, keep_rows)
+            step_pos = step_pos.index_select(0, keep_rows)
+            active_indices = keep_indices
+            step_input_ids = torch.tensor(keep_token_ids, dtype=torch.long, device=device).unsqueeze(1)
+        return generated_ids
+
+    def _generate_answers_with_kv_cache(
+        self,
+        *,
+        seqs: List[List[int]],
+        prompt_lengths: Sequence[int],
+        cached_visual_prefix: torch.Tensor,
+        pad_id: int,
+        eos_id: int,
+        max_new_tokens: int,
+    ) -> List[List[int]]:
+        generated_ids: List[List[int]] = [[] for _ in seqs]
+        input_ids, text_pad_mask, _ = self._pack_generation_text_batch(
+            seqs,
+            prompt_lengths=prompt_lengths,
+            pad_id=pad_id,
+            device=cached_visual_prefix.device,
+            legacy_prompt_mask=False,
+        )
+        text_emb = self.lm._embed_dropout(self.lm._embed(input_ids))
+        logits, prefix_k = self._decode_with_visual_prefix(
+            input_ids=input_ids,
+            text_emb=text_emb,
+            text_pad_mask=text_pad_mask,
+            visual_prefix=cached_visual_prefix,
+        )
+        text_logits = logits[:, prefix_k:, :]
+        done = [False for _ in seqs]
+        for i in range(len(seqs)):
+            next_id = int(torch.argmax(text_logits[i, len(seqs[i]) - 1]).item())
+            if next_id == int(eos_id):
+                done[i] = True
+                continue
+            seqs[i].append(next_id)
+            generated_ids[i].append(next_id)
+
+        if int(max_new_tokens) <= 1 or all(done):
+            return generated_ids
+        if str(getattr(self, "eval_kv_cache_mode", "batched")) == "serial":
+            return self._generate_answers_with_kv_cache_serial(
+                seqs=seqs,
+                generated_ids=generated_ids,
+                done=done,
+                cached_visual_prefix=cached_visual_prefix,
+                eos_id=eos_id,
+                max_new_tokens=max_new_tokens,
+            )
+        return self._generate_answers_with_kv_cache_batched(
+            seqs=seqs,
+            prompt_lengths=prompt_lengths,
+            generated_ids=generated_ids,
+            done=done,
+            cached_visual_prefix=cached_visual_prefix,
+            pad_id=pad_id,
+            eos_id=eos_id,
+            max_new_tokens=max_new_tokens,
+        )
+
+    def forward_logits(
+        self,
+        input_ids: torch.Tensor,
+        images: torch.Tensor,
+        text_pad_mask: torch.Tensor,
+        prompt_mask: Optional[torch.Tensor] = None,
+        *,
+        debug_shapes: bool = False,
+        return_aux: bool = False,
+    ) -> Tuple[torch.Tensor, int] | Tuple[torch.Tensor, int, Dict[str, torch.Tensor]]:
+        text_emb = self.lm._embed_dropout(self.lm._embed(input_ids))
+        visual_prefix, visual_features = self._compute_visual_prefix(
+            images=images,
+            text_emb=text_emb,
+            text_pad_mask=text_pad_mask,
+            prompt_mask=prompt_mask,
+        )
+        logits, k = self._decode_with_visual_prefix(
+            input_ids=input_ids,
+            text_emb=text_emb,
+            text_pad_mask=text_pad_mask,
+            visual_prefix=visual_prefix,
+            debug_shapes=debug_shapes,
+            visual_features=visual_features,
+            images=images,
+        )
+        if not return_aux:
+            return logits, k
+        aux = {
+            "prefix_norm_mean": visual_prefix.norm(dim=-1).mean(),
+            "text_norm_mean": text_emb.norm(dim=-1).mean(),
+            "prefix_batch_variance_mean": visual_prefix.var(dim=0, unbiased=False).mean(),
+        }
+        return logits, k, aux
 
     def compute_loss(
         self,
@@ -426,11 +1187,13 @@ class MultimodalPrefixLM(nn.Module):
         answer_only: bool = True,
         debug_shapes: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        logits, prefix_k = self.forward_logits(
+        logits, prefix_k, aux = self.forward_logits(
             input_ids=batch["input_ids"],
             images=batch["images"],
             text_pad_mask=batch["text_pad_mask"],
+            prompt_mask=batch.get("prompt_mask"),
             debug_shapes=debug_shapes,
+            return_aux=True,
         )
         text_logits = logits[:, prefix_k:, :]
         if text_logits.shape[1] < 2:
@@ -445,8 +1208,29 @@ class MultimodalPrefixLM(nn.Module):
         if answer_only:
             valid = valid & batch["answer_loss_mask"]
         denom = valid.sum().clamp_min(1)
-        loss = (ce * valid.float()).sum() / denom
-        return loss, {"loss_tokens": float(denom.item())}
+        ce_loss = (ce * valid.float()).sum() / denom
+        loss = ce_loss
+
+        info: Dict[str, float] = {
+            "loss_tokens": float(denom.item()),
+            "loss_ce": float(ce_loss.item()),
+            "prefix_norm_mean": float(aux["prefix_norm_mean"].item()),
+            "text_norm_mean": float(aux["text_norm_mean"].item()),
+            "prefix_batch_variance_mean": float(aux["prefix_batch_variance_mean"].item()),
+        }
+
+        if self.prefix_norm_reg_weight > 0.0 and self.prefix_norm_target_ratio > 0.0:
+            ratio = aux["prefix_norm_mean"] / aux["text_norm_mean"].clamp_min(1e-8)
+            reg = (ratio - float(self.prefix_norm_target_ratio)) ** 2
+            loss = loss + float(self.prefix_norm_reg_weight) * reg
+            info["loss_prefix_norm_reg"] = float(reg.item())
+            info["prefix_text_norm_ratio"] = float(ratio.item())
+        if self.prefix_batchvar_reg_weight > 0.0:
+            reg_var = aux["prefix_batch_variance_mean"]
+            loss = loss + float(self.prefix_batchvar_reg_weight) * reg_var
+            info["loss_prefix_batchvar_reg"] = float(reg_var.item())
+
+        return loss, info
 
     @torch.no_grad()
     def generate_answers(
@@ -463,18 +1247,86 @@ class MultimodalPrefixLM(nn.Module):
         if not seqs:
             return []
 
-        for _ in range(int(max_new_tokens)):
-            max_len = max(len(s) for s in seqs)
-            input_ids = torch.full((len(seqs), max_len), int(pad_id), dtype=torch.long, device=images.device)
-            text_pad_mask = torch.ones((len(seqs), max_len), dtype=torch.bool, device=images.device)
-            for i, s in enumerate(seqs):
-                if not s:
-                    continue
-                t = torch.tensor(s, dtype=torch.long, device=images.device)
-                input_ids[i, : len(s)] = t
-                text_pad_mask[i, : len(s)] = False
+        device = images.device
+        prompt_lengths = [int(len(x)) for x in prompt_ids]
+        legacy_prompt_conditioned = bool(
+            getattr(self.bridge, "supports_question_context", False)
+            and self.question_context_mode == "prompt_only"
+        )
 
-            logits, prefix_k = self.forward_logits(input_ids=input_ids, images=images, text_pad_mask=text_pad_mask)
+        needs_visual = bool(getattr(self.bridge, "requires_visual_features", True))
+        supports_qcond = bool(getattr(self.bridge, "supports_question_context", False))
+        prompt_conditioned = supports_qcond and self.question_context_mode == "prompt_only"
+
+        cached_visual_features: Optional[torch.Tensor] = None
+        if needs_visual:
+            cached_visual_features = self.vision_adapter(images)
+
+        cached_visual_prefix: Optional[torch.Tensor] = None
+        if (not supports_qcond) or prompt_conditioned:
+            prompt_input_ids, prompt_text_pad_mask, prompt_mask = self._pack_generation_text_batch(
+                prompt_ids,
+                prompt_lengths=prompt_lengths,
+                pad_id=pad_id,
+                device=device,
+                legacy_prompt_mask=False,
+            )
+            prompt_text_emb = self.lm._embed_dropout(self.lm._embed(prompt_input_ids))
+            cached_visual_prefix, cached_visual_features = self._compute_visual_prefix(
+                images=images,
+                text_emb=prompt_text_emb,
+                text_pad_mask=prompt_text_pad_mask,
+                prompt_mask=prompt_mask,
+                visual_features=cached_visual_features,
+            )
+
+        can_use_kv_cache = (
+            bool(self.eval_use_kv_cache)
+            and cached_visual_prefix is not None
+            and not self.uses_visual_adapters
+            and hasattr(self.lm, "_prefill_decode_only")
+            and hasattr(self.lm, "_decode_only_incremental")
+            and int(max_new_tokens) > 0
+        )
+        if can_use_kv_cache:
+            assert cached_visual_prefix is not None
+            # Preserve exact historical first-token behavior by using the original
+            # mixed-length full-batch decode once before switching to cached continuation.
+            return self._generate_answers_with_kv_cache(
+                seqs=seqs,
+                prompt_lengths=prompt_lengths,
+                cached_visual_prefix=cached_visual_prefix,
+                pad_id=pad_id,
+                eos_id=eos_id,
+                max_new_tokens=max_new_tokens,
+            )
+
+        for _ in range(int(max_new_tokens)):
+            input_ids, text_pad_mask, prompt_mask = self._pack_generation_text_batch(
+                seqs,
+                prompt_lengths=prompt_lengths,
+                pad_id=pad_id,
+                device=device,
+                legacy_prompt_mask=legacy_prompt_conditioned,
+            )
+            text_emb = self.lm._embed_dropout(self.lm._embed(input_ids))
+
+            visual_prefix = cached_visual_prefix
+            if visual_prefix is None:
+                visual_prefix, cached_visual_features = self._compute_visual_prefix(
+                    images=images,
+                    text_emb=text_emb,
+                    text_pad_mask=text_pad_mask,
+                    prompt_mask=prompt_mask,
+                    visual_features=cached_visual_features,
+                )
+
+            logits, prefix_k = self._decode_with_visual_prefix(
+                input_ids=input_ids,
+                text_emb=text_emb,
+                text_pad_mask=text_pad_mask,
+                visual_prefix=visual_prefix,
+            )
             text_logits = logits[:, prefix_k:, :]
 
             for i in range(len(seqs)):
@@ -537,14 +1389,17 @@ class QACollator:
         max_len = max(len(x["input_ids"]) for x in enc) if enc else 1
         input_ids = torch.full((b, max_len), int(self.tok.pad_id), dtype=torch.long)
         text_pad_mask = torch.ones((b, max_len), dtype=torch.bool)
+        prompt_mask = torch.zeros((b, max_len), dtype=torch.bool)
         target_mask = torch.zeros((b, max_len - 1), dtype=torch.bool)
         answer_loss_mask = torch.zeros((b, max_len - 1), dtype=torch.bool)
 
         for i, e in enumerate(enc):
             ids = e["input_ids"]
             L = len(ids)
+            P = len(e["prompt_ids"])
             input_ids[i, :L] = torch.tensor(ids, dtype=torch.long)
             text_pad_mask[i, :L] = False
+            prompt_mask[i, :P] = True
             if L > 1:
                 target_mask[i, : L - 1] = True
                 if e["has_answer"]:
@@ -555,6 +1410,7 @@ class QACollator:
             "images": torch.stack([s["image"] for s in samples], dim=0),
             "input_ids": input_ids,
             "text_pad_mask": text_pad_mask,
+            "prompt_mask": prompt_mask,
             "target_mask": target_mask,
             "answer_loss_mask": answer_loss_mask,
             "prompt_ids": [e["prompt_ids"] for e in enc],
@@ -585,6 +1441,16 @@ def build_loader(
         limit=limit,
         skip_missing_images=True,
     )
+    if (not train_mode) and int(limit) <= 0:
+        eval_fraction = float(getattr(args, "eval_fraction", 1.0))
+        if 0.0 < eval_fraction < 1.0:
+            keep = max(1, int(math.ceil(float(len(ds)) * eval_fraction)))
+            ds.items = ds.items[:keep]
+    if not train_mode:
+        ds.set_image_corruption(
+            str(getattr(args, "eval_image_corruption", "none")),
+            seed=int(getattr(args, "eval_image_corruption_seed", 123)),
+        )
     collator = QACollator(
         tokenizer=tokenizer,
         max_q=args.max_question_length,
@@ -592,7 +1458,11 @@ def build_loader(
         max_text_tokens=args.max_text_tokens,
     )
     kwargs: Dict[str, Any] = {
-        "batch_size": int(args.batch_size),
+        "batch_size": (
+            int(args.batch_size)
+            if bool(train_mode) or int(getattr(args, "eval_batch_size", 0)) <= 0
+            else int(args.eval_batch_size)
+        ),
         "shuffle": bool(train_mode),
         "drop_last": bool(train_mode),
         "num_workers": int(args.num_workers),
@@ -621,6 +1491,10 @@ def configure_freezing(model: MultimodalPrefixLM, args: argparse.Namespace) -> N
     for p in model.parameters():
         p.requires_grad_(False)
     for p in model.bridge.parameters():
+        p.requires_grad_(True)
+    for p in model.prefix_calibrator.parameters():
+        p.requires_grad_(True)
+    for p in model.visual_adapters.parameters():
         p.requires_grad_(True)
 
     mode = str(args.freeze_mode)
@@ -653,7 +1527,7 @@ def _set_module_modes(model: MultimodalPrefixLM, freeze_mode: str) -> None:
 
 def _to_device(batch: Dict[str, Any], device: str) -> Dict[str, Any]:
     out = dict(batch)
-    for k in ("images", "input_ids", "text_pad_mask", "target_mask", "answer_loss_mask"):
+    for k in ("images", "input_ids", "text_pad_mask", "prompt_mask", "target_mask", "answer_loss_mask"):
         out[k] = batch[k].to(device)
     return out
 
@@ -665,6 +1539,7 @@ def _materialize_lazy_params(model: MultimodalPrefixLM, batch: Dict[str, Any], d
             input_ids=b["input_ids"],
             images=b["images"],
             text_pad_mask=b["text_pad_mask"],
+            prompt_mask=b.get("prompt_mask"),
             debug_shapes=False,
         )
 
@@ -742,7 +1617,8 @@ def build_runtime_from_args(
     args.tokenizer_path = tokenizer_path
     tokenizer = ByteBPETokenizer.load(tokenizer_path)
 
-    vision = build_vision_model_from_args(args, device=device, ckpt_payload=checkpoint_payload)
+    vision_device = device if str(args.vision_device) == "auto" else resolve_device(str(args.vision_device))
+    vision = build_vision_model_from_args(args, device=vision_device, ckpt_payload=checkpoint_payload)
     lm = build_lm_from_args(args, tokenizer=tokenizer, device=device, ckpt_payload=checkpoint_payload)
     feature_mode = args.vision_feature_mode
     feature_source = args.vision_feature_source
@@ -754,6 +1630,9 @@ def build_runtime_from_args(
         vision_model=vision,
         feature_mode=feature_mode,
         feature_source=feature_source,
+        vision_device=vision_device,
+        output_device=device,
+        force_no_grad=True,
     )
 
     bcfg_data = {
@@ -765,6 +1644,28 @@ def build_runtime_from_args(
         "token_reduce": args.bridge_token_reduce,
         "learned_init_std": args.bridge_learned_init_std,
         "add_2d_pos_emb": bool(args.bridge_add_2d_pos_emb),
+        "bridge_num_heads": int(args.bridge_num_heads),
+        "bridge_attn_dropout": float(args.bridge_attn_dropout),
+        "bridge_query_depth": int(args.bridge_query_depth),
+        "bridge_refine_layers": int(args.bridge_refine_layers),
+        "bridge_pre_mixer_type": str(args.bridge_pre_mixer_type),
+        "bridge_pre_mixer_layers": int(args.bridge_pre_mixer_layers),
+        "bridge_pre_mixer_kernel_size": int(args.bridge_pre_mixer_kernel_size),
+        "bridge_hybrid_alpha_mode": str(args.bridge_hybrid_alpha_mode),
+        "bridge_hybrid_alpha_init": float(args.bridge_hybrid_alpha_init),
+        "bridge_hybrid_image_bridge_type": str(args.bridge_hybrid_image_bridge_type),
+        "bridge_question_conditioning": bool(args.bridge_question_conditioning),
+        "bridge_qcond_scale": float(args.bridge_qcond_scale),
+        "bridge_query_bank_mode": str(args.bridge_query_bank_mode),
+        "bridge_qquery_basis_count": int(args.bridge_qquery_basis_count),
+        "bridge_qquery_scale": float(args.bridge_qquery_scale),
+        "bridge_query_role_specialization": bool(args.bridge_query_role_specialization),
+        "bridge_question_context_mode": str(args.bridge_question_context_mode),
+        "bridge_token_selector_type": str(args.bridge_token_selector_type),
+        "bridge_token_select_k": int(args.bridge_token_select_k),
+        "bridge_token_select_k_min": int(args.bridge_token_select_k_min),
+        "bridge_num_roles": int(args.bridge_num_roles),
+        "bridge_evidence_topk": int(args.bridge_evidence_topk),
     }
     if checkpoint_payload is not None and isinstance(checkpoint_payload.get("bridge_config"), dict):
         bcfg_data.update(dict(checkpoint_payload["bridge_config"]))
@@ -776,7 +1677,27 @@ def build_runtime_from_args(
         bridge=bridge,
         lm=lm,
         lm_autocast=bool(args.mm_lm_autocast),
+        prefix_calibration=bool(args.prefix_calibration),
+        prefix_calib_layernorm=bool(args.prefix_calib_layernorm),
+        prefix_calib_bias=bool(args.prefix_calib_bias),
+        prefix_calib_gate_init=float(args.prefix_calib_gate_init),
+        prefix_geom_mlp_ratio=float(args.prefix_geom_mlp_ratio),
+        prefix_geom_token_mixer_layers=int(args.prefix_geom_token_mixer_layers),
+        prefix_norm_target_ratio=float(args.prefix_norm_target_ratio),
+        prefix_norm_reg_weight=float(args.prefix_norm_reg_weight),
+        prefix_batchvar_reg_weight=float(args.prefix_batchvar_reg_weight),
+        prefix_dropout=float(args.prefix_dropout),
+        question_context_mode=str(args.bridge_question_context_mode),
+        eval_use_kv_cache=bool(getattr(args, "eval_use_kv_cache", False)),
+        eval_kv_cache_mode=str(getattr(args, "eval_kv_cache_mode", "batched")),
+        lm_visual_adapter_type=str(getattr(args, "lm_visual_adapter_type", "none")),
+        lm_visual_adapter_layers=int(getattr(args, "lm_visual_adapter_layers", 0)),
+        lm_visual_adapter_num_heads=int(getattr(args, "lm_visual_adapter_num_heads", 8)),
+        lm_visual_adapter_dropout=float(getattr(args, "lm_visual_adapter_dropout", 0.0)),
+        lm_visual_adapter_gate_init=float(getattr(args, "lm_visual_adapter_gate_init", 0.5)),
     ).to(device)
+    if str(vision_device) != str(device):
+        model.vision_adapter.vision_model.to(vision_device)
     return model, tokenizer, bridge_cfg
 
 
@@ -812,6 +1733,7 @@ def run_generation_predictions(
     logger: Optional[Logger] = None,
     split_name: str = "eval",
     log_every: int = 10,
+    cuda_empty_cache_every: int = 0,
 ) -> List[Dict[str, Any]]:
     model.eval()
     records: List[Dict[str, Any]] = []
@@ -847,15 +1769,22 @@ def run_generation_predictions(
                 }
             )
         if int(log_every) > 0 and ((bidx + 1) % int(log_every) == 0 or (bidx == 0)):
+            elapsed = max(1e-6, float(time.time() - t0))
             msg = (
                 f"[eval:{split_name}] batch={bidx + 1}"
                 + (f"/{max_batches}" if int(max_batches) > 0 else "")
-                + f" samples={len(records)} elapsed_s={time.time() - t0:.1f}"
+                + f" samples={len(records)} elapsed_s={elapsed:.1f} steps_per_s={(float(bidx + 1) / elapsed):.2f}"
             )
             if logger is not None:
                 logger.log(msg)
             else:
                 print(msg)
+        if int(cuda_empty_cache_every) > 0 and ((bidx + 1) % int(cuda_empty_cache_every) == 0):
+            if torch.cuda.is_available():
+                gc.collect()
+                torch.cuda.empty_cache()
+                if logger is not None:
+                    logger.log(f"[mm] cuda empty_cache during eval batch={bidx + 1}")
         if max_batches > 0 and (bidx + 1) >= int(max_batches):
             break
     return records
@@ -1104,6 +2033,34 @@ def print_eval_summary(logger: Logger, split: str, summary: Dict[str, Any]) -> N
         )
 
 
+def maybe_cuda_empty_cache(logger: Logger, *, enabled: bool, tag: str) -> None:
+    if not bool(enabled):
+        return
+    if not torch.cuda.is_available():
+        return
+    gc.collect()
+    torch.cuda.empty_cache()
+    logger.log(f"[mm] cuda empty_cache after {tag}")
+
+
+def maybe_shutdown_loader_workers(logger: Logger, loader: Optional[DataLoader], *, tag: str) -> None:
+    if loader is None:
+        return
+    iterator = getattr(loader, "_iterator", None)
+    shutdown = getattr(iterator, "_shutdown_workers", None) if iterator is not None else None
+    if not callable(shutdown):
+        return
+    try:
+        shutdown()
+        try:
+            loader._iterator = None
+        except Exception:
+            pass
+        logger.log(f"[mm] dataloader workers shut down for {tag}")
+    except Exception as e:
+        logger.log(f"[mm] dataloader worker shutdown skipped for {tag}: {e}")
+
+
 def log_startup_config(
     logger: Logger,
     args: argparse.Namespace,
@@ -1124,7 +2081,8 @@ def log_startup_config(
     )
     logger.log(
         f"[mm] vision model={args.vision_model} ckpt={args.vision_checkpoint} "
-        f"feature_source={args.vision_feature_source} feature_mode={args.vision_feature_mode}"
+        f"feature_source={args.vision_feature_source} feature_mode={args.vision_feature_mode} "
+        f"vision_device={args.vision_device}"
     )
     logger.log(
         f"[mm] lm ckpt={args.lm_checkpoint} tokenizer={args.tokenizer_path} vocab={tokenizer.vocab_size}"
@@ -1132,7 +2090,41 @@ def log_startup_config(
     logger.log(
         f"[mm] bridge type={bridge_cfg.bridge_type} visual_tokens={bridge_cfg.num_visual_tokens} "
         f"hidden={bridge_cfg.bridge_hidden_dim} token_reduce={bridge_cfg.token_reduce} "
-        f"learned_init_std={bridge_cfg.learned_init_std:.6g} add_2d_pos_emb={int(bool(bridge_cfg.add_2d_pos_emb))}"
+        f"learned_init_std={bridge_cfg.learned_init_std:.6g} add_2d_pos_emb={int(bool(bridge_cfg.add_2d_pos_emb))} "
+        f"heads={bridge_cfg.bridge_num_heads} depth={bridge_cfg.bridge_query_depth} "
+        f"refine={bridge_cfg.bridge_refine_layers} pre_mixer={bridge_cfg.bridge_pre_mixer_type} "
+        f"hybrid_alpha_mode={bridge_cfg.bridge_hybrid_alpha_mode} "
+        f"qcond={int(bool(bridge_cfg.bridge_question_conditioning))} qcond_scale={bridge_cfg.bridge_qcond_scale:.6g} "
+        f"query_bank_mode={bridge_cfg.bridge_query_bank_mode} "
+        f"qquery_basis={bridge_cfg.bridge_qquery_basis_count} qquery_scale={bridge_cfg.bridge_qquery_scale:.6g} "
+        f"qquery_role_specialization={int(bool(getattr(bridge_cfg, 'bridge_query_role_specialization', False)))} "
+        f"qctx_mode={bridge_cfg.bridge_question_context_mode} "
+        f"token_selector={bridge_cfg.bridge_token_selector_type} token_select_k={bridge_cfg.bridge_token_select_k} "
+        f"token_select_k_min={bridge_cfg.bridge_token_select_k_min} "
+        f"num_roles={bridge_cfg.bridge_num_roles} evidence_topk={bridge_cfg.bridge_evidence_topk}"
+    )
+    logger.log(
+        f"[mm] lm_visual_adapter_type={getattr(args, 'lm_visual_adapter_type', 'none')} "
+        f"lm_visual_adapter_layers={int(getattr(args, 'lm_visual_adapter_layers', 0))} "
+        f"lm_visual_adapter_heads={int(getattr(args, 'lm_visual_adapter_num_heads', 8))} "
+        f"lm_visual_adapter_dropout={float(getattr(args, 'lm_visual_adapter_dropout', 0.0)):.6g} "
+        f"lm_visual_adapter_gate_init={float(getattr(args, 'lm_visual_adapter_gate_init', 0.5)):.6g}"
+    )
+    logger.log(
+        f"[mm] eval_image_corruption={str(getattr(args, 'eval_image_corruption', 'none'))} "
+        f"eval_image_corruption_seed={int(getattr(args, 'eval_image_corruption_seed', 123))}"
+    )
+    logger.log(
+        f"[mm] prefix_calibration={int(bool(args.prefix_calibration))} "
+        f"prefix_calib_layernorm={int(bool(args.prefix_calib_layernorm))} "
+        f"prefix_calib_bias={int(bool(args.prefix_calib_bias))} "
+        f"prefix_calib_gate_init={float(args.prefix_calib_gate_init):.6g} "
+        f"prefix_geom_mlp_ratio={float(args.prefix_geom_mlp_ratio):.6g} "
+        f"prefix_geom_token_mixer_layers={int(args.prefix_geom_token_mixer_layers)} "
+        f"prefix_norm_target_ratio={float(args.prefix_norm_target_ratio):.6g} "
+        f"prefix_norm_reg_weight={float(args.prefix_norm_reg_weight):.6g} "
+        f"prefix_batchvar_reg_weight={float(args.prefix_batchvar_reg_weight):.6g} "
+        f"prefix_dropout={float(args.prefix_dropout):.6g}"
     )
     logger.log(
         f"[mm] freeze_mode={args.freeze_mode} train_top_lm_layers={args.train_top_lm_layers} "
@@ -1142,16 +2134,26 @@ def log_startup_config(
         f"[mm] seq_lens q={args.max_question_length} a={args.max_answer_length} text={args.max_text_tokens}"
     )
     logger.log(
-        f"[mm] dataloader batch_size={args.batch_size} num_workers={args.num_workers} "
-        f"prefetch_factor={args.prefetch_factor} pin_memory={int(bool(args.pin_memory))}"
+        f"[mm] dataloader batch_size={args.batch_size} "
+        f"eval_batch_size={(int(args.eval_batch_size) if int(getattr(args, 'eval_batch_size', 0)) > 0 else int(args.batch_size))} "
+        f"num_workers={args.num_workers} "
+        f"prefetch_factor={args.prefetch_factor} pin_memory={int(bool(args.pin_memory))} "
+        f"grad_accum_steps={args.grad_accum_steps} effective_batch_size={int(args.batch_size) * max(1, int(args.grad_accum_steps))}"
     )
     logger.log(
         f"[mm] data images_root={args.images_root} annotations_root={args.annotations_root} "
-        f"limit_train={args.limit_train} limit_val={args.limit_val} limit_eval={args.limit_eval}"
+        f"limit_train={args.limit_train} limit_val={args.limit_val} limit_eval={args.limit_eval} "
+        f"eval_fraction={float(args.eval_fraction):.4g}"
     )
     logger.log(
         f"[mm] loop epochs={args.epochs} max_steps={args.max_steps} overfit_small_batch={int(bool(args.overfit_small_batch))} "
+        f"lr_schedule={args.lr_schedule} lr_warmup_steps={args.lr_warmup_steps} lr_min_ratio={args.lr_min_ratio} "
+        f"train_sample_budget={int(args.train_sample_budget)} manual_max_steps={int(bool(args.manual_max_steps))} "
+        f"eval_use_kv_cache={int(bool(getattr(args, 'eval_use_kv_cache', False)))} "
+        f"eval_kv_cache_mode={str(getattr(args, 'eval_kv_cache_mode', 'batched'))} "
+        f"cuda_empty_cache_after_eval={int(bool(args.cuda_empty_cache_after_eval))} "
         f"log_every={args.log_every} eval_every={args.eval_every} eval_batches={args.eval_batches} "
+        f"final_eval_batches={args.final_eval_batches} "
         f"eval_log_every={args.eval_log_every} eval_scorer={args.eval_scorer} "
         f"fixed_eval_count={args.fixed_eval_count} ckpt_every={args.ckpt_every} "
         f"final_sanity_count={args.final_sanity_count}"
@@ -1175,10 +2177,17 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--vision_latent_dim", type=int, default=768)
     ap.add_argument("--vision_cbld", type=int, default=1536)
     ap.add_argument(
+        "--vision_device",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda", "mps"],
+        help="Device used for frozen vision encoder forward. 'auto' follows main --device.",
+    )
+    ap.add_argument(
         "--vision_feature_source",
         type=str,
         default="posterior_mu",
-        choices=["posterior_mu", "encoder", "model_output"],
+        choices=["posterior_mu", "encoder", "encoder_plus_posterior_mu", "model_output"],
     )
     ap.add_argument("--vision_feature_mode", type=str, default="auto", choices=["auto", "global", "token"])
 
@@ -1205,7 +2214,23 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--tokenizer_path", type=str, default=None)
 
-    ap.add_argument("--bridge_type", type=str, default="mlp", choices=["mlp", "learned_tokens"])
+    ap.add_argument(
+        "--bridge_type",
+        type=str,
+        default="mlp",
+        choices=[
+            "mlp",
+            "learned_tokens",
+            "learned_query",
+            "query_cross_attn",
+            "perceiver_resampler",
+            "multiscale_perceiver",
+            "qformer_lite",
+            "structured_roles",
+            "evidence_sparse",
+            "hybrid_const_image",
+        ],
+    )
     ap.add_argument("--bridge_hidden_dim", type=int, default=1024)
     ap.add_argument("--num_visual_tokens", type=int, default=8)
     ap.add_argument(
@@ -1226,6 +2251,168 @@ def parse_args() -> argparse.Namespace:
         default="adaptive_pool",
         choices=["adaptive_pool", "mean_expand", "all"],
     )
+    ap.add_argument("--bridge_num_heads", type=int, default=8)
+    ap.add_argument("--bridge_attn_dropout", type=float, default=0.0)
+    ap.add_argument("--bridge_query_depth", type=int, default=2)
+    ap.add_argument("--bridge_refine_layers", type=int, default=0)
+    ap.add_argument(
+        "--bridge_pre_mixer_type",
+        type=str,
+        default="none",
+        choices=["none", "self_attn", "conv1d"],
+    )
+    ap.add_argument("--bridge_pre_mixer_layers", type=int, default=1)
+    ap.add_argument("--bridge_pre_mixer_kernel_size", type=int, default=3)
+    ap.add_argument(
+        "--bridge_hybrid_alpha_mode",
+        type=str,
+        default="scalar",
+        choices=["scalar", "token"],
+    )
+    ap.add_argument("--bridge_hybrid_alpha_init", type=float, default=0.5)
+    ap.add_argument(
+        "--bridge_hybrid_image_bridge_type",
+        type=str,
+        default="learned_query",
+        choices=[
+            "mlp",
+            "learned_query",
+            "query_cross_attn",
+            "perceiver_resampler",
+            "multiscale_perceiver",
+            "qformer_lite",
+            "structured_roles",
+            "evidence_sparse",
+        ],
+    )
+    ap.add_argument(
+        "--bridge_question_conditioning",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Condition perceiver/hybrid image extraction on pooled question embeddings.",
+    )
+    ap.add_argument(
+        "--bridge_qcond_scale",
+        type=float,
+        default=0.5,
+        help="Scale factor for question-conditioned FiLM modulation in perceiver latents.",
+    )
+    ap.add_argument(
+        "--bridge_query_bank_mode",
+        type=str,
+        default="learned",
+        choices=["learned", "question_mix", "question_hidden_mean", "question_hidden_attn"],
+        help=(
+            "Use the standard learned perceiver latent bank, question-mixed query latents, "
+            "mean-projected question-token latents, or attention-derived question-token latents."
+        ),
+    )
+    ap.add_argument(
+        "--bridge_qquery_basis_count",
+        type=int,
+        default=4,
+        help="Number of learned question-query basis tensors mixed by the pooled question context.",
+    )
+    ap.add_argument(
+        "--bridge_qquery_scale",
+        type=float,
+        default=1.0,
+        help="Residual scale applied to question-mixed perceiver queries.",
+    )
+    ap.add_argument(
+        "--bridge_query_role_specialization",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Add learned role-specialization embeddings to perceiver query slots.",
+    )
+    ap.add_argument(
+        "--bridge_question_context_mode",
+        type=str,
+        default="all_text",
+        choices=["all_text", "prompt_only"],
+        help="Pool q-conditioning context from all text tokens or prompt/question tokens only.",
+    )
+    ap.add_argument(
+        "--bridge_token_selector_type",
+        type=str,
+        default="none",
+        choices=["none", "topk", "qtopk", "qadaptive"],
+        help="Optional token selector before query/cross-attention bridges.",
+    )
+    ap.add_argument(
+        "--bridge_token_select_k",
+        type=int,
+        default=0,
+        help="Selected token count (or max token budget for qadaptive) before the bridge extractor.",
+    )
+    ap.add_argument(
+        "--bridge_token_select_k_min",
+        type=int,
+        default=0,
+        help="Minimum kept token budget for --bridge_token_selector_type=qadaptive (<=0 uses max_k/2).",
+    )
+    ap.add_argument("--bridge_num_roles", type=int, default=4)
+    ap.add_argument("--bridge_evidence_topk", type=int, default=0)
+    ap.add_argument(
+        "--prefix_calibration",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable bridge output calibration: y = gate * LN(prefix) + bias.",
+    )
+    ap.add_argument(
+        "--prefix_calib_layernorm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply LayerNorm inside prefix calibration.",
+    )
+    ap.add_argument(
+        "--prefix_calib_bias",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use trainable additive bias in prefix calibration.",
+    )
+    ap.add_argument(
+        "--prefix_calib_gate_init",
+        type=float,
+        default=1.0,
+        help="Initial multiplicative gate for calibrated prefix tokens.",
+    )
+    ap.add_argument(
+        "--prefix_geom_mlp_ratio",
+        type=float,
+        default=0.0,
+        help="Optional residual geometry MLP ratio inside prefix calibration. <=0 disables.",
+    )
+    ap.add_argument(
+        "--prefix_geom_token_mixer_layers",
+        type=int,
+        default=0,
+        help="Optional token-mixer layers inside prefix calibration.",
+    )
+    ap.add_argument(
+        "--prefix_norm_target_ratio",
+        type=float,
+        default=0.0,
+        help="Target ratio (prefix_norm / text_norm). <=0 disables ratio target.",
+    )
+    ap.add_argument(
+        "--prefix_norm_reg_weight",
+        type=float,
+        default=0.0,
+        help="Weight for (prefix/text norm ratio - target)^2 regularization.",
+    )
+    ap.add_argument(
+        "--prefix_batchvar_reg_weight",
+        type=float,
+        default=0.0,
+        help="Weight for prefix batch-variance penalty (stability regularization).",
+    )
+    ap.add_argument(
+        "--prefix_dropout",
+        type=float,
+        default=0.0,
+        help="Dropout probability applied to calibrated visual prefix during training.",
+    )
 
     ap.add_argument(
         "--freeze_mode",
@@ -1234,6 +2421,22 @@ def parse_args() -> argparse.Namespace:
         choices=["bridge_only", "bridge_plus_top_lm", "full_finetune"],
     )
     ap.add_argument("--train_top_lm_layers", type=int, default=1)
+    ap.add_argument(
+        "--lm_visual_adapter_type",
+        type=str,
+        default="none",
+        choices=["none", "cross_attn"],
+        help="Optional residual visual adapters inserted into the top LM blocks.",
+    )
+    ap.add_argument(
+        "--lm_visual_adapter_layers",
+        type=int,
+        default=0,
+        help="Number of top LM layers that receive residual visual adapters.",
+    )
+    ap.add_argument("--lm_visual_adapter_num_heads", type=int, default=8)
+    ap.add_argument("--lm_visual_adapter_dropout", type=float, default=0.0)
+    ap.add_argument("--lm_visual_adapter_gate_init", type=float, default=0.5)
 
     ap.add_argument("--images_root", type=str, default="images")
     ap.add_argument("--annotations_root", type=str, default="annotations")
@@ -1247,22 +2450,82 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--loss_on_answer_only", action=argparse.BooleanOptionalAction, default=True)
 
     ap.add_argument("--batch_size", type=int, default=16)
+    ap.add_argument(
+        "--eval_batch_size",
+        type=int,
+        default=0,
+        help="Eval dataloader batch size. <=0 reuses --batch_size.",
+    )
+    ap.add_argument(
+        "--eval_image_corruption",
+        type=str,
+        default="none",
+        choices=["none", "zero", "shuffle", "random_swap"],
+        help="Optional eval-only image corruption mode for grounding diagnostics.",
+    )
+    ap.add_argument(
+        "--eval_image_corruption_seed",
+        type=int,
+        default=123,
+        help="Seed for eval image corruption modes that require a randomized image remap.",
+    )
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--max_steps", type=int, default=0)
+    ap.add_argument(
+        "--manual_max_steps",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Respect the provided --max_steps exactly instead of deriving it from effective batch size.",
+    )
+    ap.add_argument(
+        "--train_sample_budget",
+        type=int,
+        default=DEFAULT_TRAIN_SAMPLE_BUDGET,
+        help="Total training samples budget used to derive max_steps for normal runs.",
+    )
     ap.add_argument("--overfit_small_batch", action="store_true")
     ap.add_argument("--overfit_steps", type=int, default=200)
 
     ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--lr_schedule", type=str, default="constant", choices=["constant", "cosine"])
+    ap.add_argument("--lr_warmup_steps", type=int, default=0)
+    ap.add_argument("--lr_min_ratio", type=float, default=0.1)
     ap.add_argument("--weight_decay", type=float, default=0.0)
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--prefetch_factor", type=int, default=2)
     ap.add_argument("--pin_memory", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--grad_accum_steps", type=int, default=1)
 
     ap.add_argument("--log_every", type=int, default=20)
     ap.add_argument("--eval_every", type=int, default=500)
     ap.add_argument("--eval_batches", type=int, default=20)
+    ap.add_argument(
+        "--final_eval_batches",
+        type=int,
+        default=0,
+        help="Maximum eval batches for the end-of-training eval; <=0 means full eval split.",
+    )
     ap.add_argument("--eval_log_every", type=int, default=10)
+    ap.add_argument(
+        "--eval_use_kv_cache",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use incremental LM KV-cache during eval generation when the visual prefix is decode-invariant.",
+    )
+    ap.add_argument(
+        "--eval_kv_cache_mode",
+        type=str,
+        default="batched",
+        choices=["serial", "batched"],
+        help="KV-cache eval continuation mode after the first generated token.",
+    )
+    ap.add_argument(
+        "--cuda_empty_cache_after_eval",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Call gc.collect()+torch.cuda.empty_cache() before/after eval loops to reduce eval-induced slowdown.",
+    )
     ap.add_argument("--fixed_eval_count", type=int, default=5)
     ap.add_argument(
         "--final_sanity_count",
@@ -1274,6 +2537,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--limit_train", type=int, default=0)
     ap.add_argument("--limit_val", type=int, default=0)
     ap.add_argument("--limit_eval", type=int, default=0)
+    ap.add_argument(
+        "--eval_fraction",
+        type=float,
+        default=DEFAULT_EVAL_FRACTION,
+        help="Fraction of the eval split to use when --limit_eval is not set.",
+    )
     ap.add_argument("--qualitative_samples", type=int, default=8)
     ap.add_argument("--confusion_top_k", type=int, default=20)
     ap.add_argument(
@@ -1288,9 +2557,33 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
+def _resolve_training_max_steps(args: argparse.Namespace) -> int:
+    explicit_max_steps = int(args.max_steps)
+    if bool(args.overfit_small_batch):
+        return explicit_max_steps
+    if bool(args.manual_max_steps):
+        return explicit_max_steps
+    eff_batch = max(1, int(args.batch_size) * max(1, int(args.grad_accum_steps)))
+    budget = max(1, int(args.train_sample_budget))
+    return int(math.ceil(float(budget) / float(eff_batch)))
+
+
 def main() -> None:
     args = parse_args()
     args = _apply_runtime_defaults(args)
+    resolved_max_steps = _resolve_training_max_steps(args)
+    max_steps_override_msg = None
+    if (not bool(args.overfit_small_batch)) and (not bool(args.manual_max_steps)):
+        explicit_max_steps = int(args.max_steps)
+        args.max_steps = int(resolved_max_steps)
+        eff_batch = max(1, int(args.batch_size) * max(1, int(args.grad_accum_steps)))
+        if explicit_max_steps > 0 and explicit_max_steps != int(resolved_max_steps):
+            max_steps_override_msg = (
+                f"[mm] overriding explicit --max_steps {explicit_max_steps} with derived max_steps={resolved_max_steps} "
+                f"from train_sample_budget={int(args.train_sample_budget)} effective_batch_size={eff_batch}"
+            )
+    else:
+        args.max_steps = int(resolved_max_steps)
     set_seed(int(args.seed))
     device = resolve_device(args.device)
     amp_enabled, amp_dtype, use_scaler = resolve_amp(device, args.precision)
@@ -1299,6 +2592,8 @@ def main() -> None:
     run_dir = os.path.join(LOGDIR, args.run_id)
     os.makedirs(run_dir, exist_ok=True)
     logger = Logger(run_id=args.run_id, checkpoint_id=args.checkpoint)
+    if max_steps_override_msg:
+        logger.log(max_steps_override_msg)
     if args.auto_download:
         prepare_vqav2(
             VQAv2Paths(images_root=args.images_root, annotations_root=args.annotations_root),
@@ -1405,6 +2700,11 @@ def main() -> None:
         opt.load_state_dict(resume_payload["optimizer_state_dict"])
 
     if args.eval_only:
+        maybe_cuda_empty_cache(
+            logger,
+            enabled=bool(args.cuda_empty_cache_after_eval),
+            tag="eval_only_pre_eval",
+        )
         records = run_generation_predictions(
             model=model,
             loader=val_loader,
@@ -1416,6 +2716,7 @@ def main() -> None:
             logger=logger,
             split_name=args.eval_split,
             log_every=int(args.eval_log_every),
+            cuda_empty_cache_every=(400 if int(args.eval_batches) == 0 else 0),
         )
         summary = evaluate_records(
             records,
@@ -1431,6 +2732,16 @@ def main() -> None:
             epoch=start_epoch,
             tag="eval_only",
             logger=logger,
+        )
+        maybe_cuda_empty_cache(
+            logger,
+            enabled=bool(args.cuda_empty_cache_after_eval),
+            tag="eval_only_post_eval",
+        )
+        maybe_shutdown_loader_workers(
+            logger,
+            val_loader,
+            tag="val_loader_post_eval_only",
         )
         if args.save_predictions_jsonl:
             with open(args.save_predictions_jsonl, "w", encoding="utf-8") as f:
@@ -1450,6 +2761,7 @@ def main() -> None:
         return
 
     debug_shape_once = bool(args.debug_shapes)
+    accum_steps = max(1, int(args.grad_accum_steps))
     train_iter: Iterable[Dict[str, Any]]
     fixed_batch = None
     if args.overfit_small_batch:
@@ -1466,8 +2778,145 @@ def main() -> None:
         train_iter = ()
 
     steps_budget = int(args.max_steps) if int(args.max_steps) > 0 else None
+    for pg in opt.param_groups:
+        pg["base_lr"] = float(pg.get("base_lr", pg["lr"]))
+
+    def _lr_scale(step_id: int) -> float:
+        sched = str(args.lr_schedule)
+        if sched == "constant":
+            return 1.0
+        if sched != "cosine":
+            raise ValueError(f"Unsupported lr schedule: {sched}")
+        warm = max(0, int(args.lr_warmup_steps))
+        min_ratio = float(args.lr_min_ratio)
+        min_ratio = max(0.0, min(1.0, min_ratio))
+        if warm > 0 and step_id <= warm:
+            return max(1e-8, float(step_id) / float(warm))
+        if steps_budget is None or int(steps_budget) <= 0:
+            return 1.0
+        if step_id >= int(steps_budget):
+            return min_ratio
+        denom = max(1, int(steps_budget) - warm)
+        progress = (float(step_id) - float(warm)) / float(denom)
+        progress = max(0.0, min(1.0, progress))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_ratio + (1.0 - min_ratio) * cosine
+
+    def _set_optimizer_lr(scale: float) -> float:
+        for pg in opt.param_groups:
+            pg["lr"] = float(pg["base_lr"]) * float(scale)
+        return float(opt.param_groups[0]["lr"])
+
+    def _optimizer_step() -> None:
+        if use_scaler:
+            if float(args.grad_clip) > 0:
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(optim_params, float(args.grad_clip))
+            scaler.step(opt)
+            scaler.update()
+        else:
+            if float(args.grad_clip) > 0:
+                torch.nn.utils.clip_grad_norm_(optim_params, float(args.grad_clip))
+            opt.step()
+        opt.zero_grad(set_to_none=True)
+
+    train_log_time_sec = 0.0
+    train_log_steps = 0
+
+    def _post_optimizer_step(
+        *,
+        loss_value: float,
+        info_dict: Dict[str, float],
+        current_lr: float,
+        step_train_elapsed: float,
+    ) -> None:
+        nonlocal train_log_time_sec, train_log_steps
+        train_log_time_sec += max(0.0, float(step_train_elapsed))
+        train_log_steps += 1
+        if global_step % int(args.log_every) == 0:
+            tok_count = int(info_dict.get("loss_tokens", 0.0))
+            loss_ce = float(info_dict.get("loss_ce", loss_value))
+            ratio = info_dict.get("prefix_text_norm_ratio", None)
+            reg_norm = info_dict.get("loss_prefix_norm_reg", None)
+            reg_var = info_dict.get("loss_prefix_batchvar_reg", None)
+            ratio_txt = "" if ratio is None else f" pfx_txt_norm_ratio={float(ratio):.4f}"
+            reg_txt = ""
+            if reg_norm is not None:
+                reg_txt += f" reg_norm={float(reg_norm):.6f}"
+            if reg_var is not None:
+                reg_txt += f" reg_var={float(reg_var):.6f}"
+            steps_per_s = float(train_log_steps) / max(1e-6, float(train_log_time_sec))
+            logger.log(
+                f"[mm] step={global_step} epoch={epoch} loss={float(loss_value):.4f} "
+                f"loss_ce={loss_ce:.4f} loss_tokens={tok_count}{ratio_txt}{reg_txt} "
+                f"lr={current_lr:.6g} steps_per_s={steps_per_s:.2f}"
+            )
+            train_log_time_sec = 0.0
+            train_log_steps = 0
+
+        if int(args.eval_every) > 0 and global_step % int(args.eval_every) == 0:
+            maybe_cuda_empty_cache(
+                logger,
+                enabled=bool(args.cuda_empty_cache_after_eval),
+                tag=f"periodic_eval_pre_step_{global_step}",
+            )
+            records = run_generation_predictions(
+                model=model,
+                loader=val_loader,
+                tokenizer=tokenizer,
+                device=device,
+                max_answer_length=int(args.max_answer_length),
+                max_batches=int(args.eval_batches),
+                debug_shapes=False,
+                logger=logger,
+                split_name=args.eval_split,
+                log_every=int(args.eval_log_every),
+            )
+            summary = evaluate_records(
+                records,
+                qualitative_samples=int(args.qualitative_samples),
+                confusion_top_k=int(args.confusion_top_k),
+                scorer=str(args.eval_scorer),
+            )
+            print_eval_summary(logger, args.eval_split, summary)
+            append_fixed_eval_answers(
+                fixed_eval_tracker,
+                records,
+                global_step=global_step,
+                epoch=epoch,
+                tag="periodic_eval",
+                logger=logger,
+            )
+            maybe_cuda_empty_cache(
+                logger,
+                enabled=bool(args.cuda_empty_cache_after_eval),
+                tag=f"periodic_eval_post_step_{global_step}",
+            )
+            maybe_shutdown_loader_workers(
+                logger,
+                val_loader,
+                tag=f"val_loader_post_periodic_eval_step_{global_step}",
+            )
+
+        if int(args.ckpt_every) > 0 and global_step % int(args.ckpt_every) == 0:
+            ckpt_path = _checkpoint_path(args.run_id, global_step)
+            save_mm_checkpoint(
+                ckpt_path,
+                model,
+                opt,
+                global_step=global_step,
+                epoch=epoch,
+                args=args,
+                bridge_cfg=bridge_cfg,
+            )
+            logger.log(f"[mm] checkpoint saved: {ckpt_path}")
+
     epoch = start_epoch
-    start_time = time.time()
+    opt.zero_grad(set_to_none=True)
+    accum_count = 0
+    accum_loss_sum = 0.0
+    accum_info_sums: Dict[str, float] = {}
+    optimizer_step_started_at: Optional[float] = None
 
     while True:
         epoch += 1
@@ -1479,6 +2928,9 @@ def main() -> None:
             iter_obj = train_loader
 
         for batch in iter_obj:
+            if accum_count == 0:
+                optimizer_step_started_at = time.perf_counter()
+            current_lr = _set_optimizer_lr(_lr_scale(global_step + 1))
             _set_module_modes(model, args.freeze_mode)
             batch = _to_device(batch, device)
             ctx = torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_enabled) if amp_enabled else nullcontext()
@@ -1490,73 +2942,69 @@ def main() -> None:
                 )
             debug_shape_once = False
 
-            opt.zero_grad(set_to_none=True)
+            loss_back = loss / float(accum_steps)
             if use_scaler:
-                scaler.scale(loss).backward()
-                if float(args.grad_clip) > 0:
-                    scaler.unscale_(opt)
-                    torch.nn.utils.clip_grad_norm_(optim_params, float(args.grad_clip))
-                scaler.step(opt)
-                scaler.update()
+                scaler.scale(loss_back).backward()
             else:
-                loss.backward()
-                if float(args.grad_clip) > 0:
-                    torch.nn.utils.clip_grad_norm_(optim_params, float(args.grad_clip))
-                opt.step()
+                loss_back.backward()
+            accum_count += 1
+            accum_loss_sum += float(loss.item())
+            for k, v in info.items():
+                accum_info_sums[k] = float(accum_info_sums.get(k, 0.0)) + float(v)
 
+            should_step = accum_count >= accum_steps
+            if steps_budget is not None and (global_step + 1) >= steps_budget:
+                should_step = True
+            if not should_step:
+                continue
+
+            _optimizer_step()
             global_step += 1
-            if global_step % int(args.log_every) == 0:
-                elapsed = max(1e-6, time.time() - start_time)
-                tok_count = int(info.get("loss_tokens", 0.0))
-                logger.log(
-                    f"[mm] step={global_step} epoch={epoch} loss={float(loss.item()):.4f} "
-                    f"loss_tokens={tok_count} steps_per_s={global_step / elapsed:.2f}"
-                )
+            step_train_elapsed = 0.0 if optimizer_step_started_at is None else (time.perf_counter() - optimizer_step_started_at)
+            optimizer_step_started_at = None
+            info_step: Dict[str, float] = {}
+            for k, v in accum_info_sums.items():
+                if k == "loss_tokens":
+                    info_step[k] = float(v)
+                else:
+                    info_step[k] = float(v) / max(1.0, float(accum_count))
+            loss_step = float(accum_loss_sum) / max(1.0, float(accum_count))
+            accum_count = 0
+            accum_loss_sum = 0.0
+            accum_info_sums = {}
 
-            if int(args.eval_every) > 0 and global_step % int(args.eval_every) == 0:
-                records = run_generation_predictions(
-                    model=model,
-                    loader=val_loader,
-                    tokenizer=tokenizer,
-                    device=device,
-                    max_answer_length=int(args.max_answer_length),
-                    max_batches=int(args.eval_batches),
-                    debug_shapes=False,
-                    logger=logger,
-                    split_name=args.eval_split,
-                    log_every=int(args.eval_log_every),
-                )
-                summary = evaluate_records(
-                    records,
-                    qualitative_samples=int(args.qualitative_samples),
-                    confusion_top_k=int(args.confusion_top_k),
-                    scorer=str(args.eval_scorer),
-                )
-                print_eval_summary(logger, args.eval_split, summary)
-                append_fixed_eval_answers(
-                    fixed_eval_tracker,
-                    records,
-                    global_step=global_step,
-                    epoch=epoch,
-                    tag="periodic_eval",
-                    logger=logger,
-                )
-
-            if int(args.ckpt_every) > 0 and global_step % int(args.ckpt_every) == 0:
-                ckpt_path = _checkpoint_path(args.run_id, global_step)
-                save_mm_checkpoint(
-                    ckpt_path,
-                    model,
-                    opt,
-                    global_step=global_step,
-                    epoch=epoch,
-                    args=args,
-                    bridge_cfg=bridge_cfg,
-                )
-                logger.log(f"[mm] checkpoint saved: {ckpt_path}")
+            _post_optimizer_step(
+                loss_value=loss_step,
+                info_dict=info_step,
+                current_lr=current_lr,
+                step_train_elapsed=step_train_elapsed,
+            )
 
             if steps_budget is not None and global_step >= steps_budget:
                 break
+
+        if accum_count > 0 and (steps_budget is None or global_step < steps_budget):
+            current_lr = _set_optimizer_lr(_lr_scale(global_step + 1))
+            _optimizer_step()
+            global_step += 1
+            step_train_elapsed = 0.0 if optimizer_step_started_at is None else (time.perf_counter() - optimizer_step_started_at)
+            optimizer_step_started_at = None
+            info_step = {}
+            for k, v in accum_info_sums.items():
+                if k == "loss_tokens":
+                    info_step[k] = float(v)
+                else:
+                    info_step[k] = float(v) / max(1.0, float(accum_count))
+            loss_step = float(accum_loss_sum) / max(1.0, float(accum_count))
+            accum_count = 0
+            accum_loss_sum = 0.0
+            accum_info_sums = {}
+            _post_optimizer_step(
+                loss_value=loss_step,
+                info_dict=info_step,
+                current_lr=current_lr,
+                step_train_elapsed=step_train_elapsed,
+            )
 
         if steps_budget is not None and global_step >= steps_budget:
             break
@@ -1577,17 +3025,31 @@ def main() -> None:
     )
     logger.log(f"[mm] final checkpoint: {final_ckpt}")
 
+    maybe_shutdown_loader_workers(
+        logger,
+        train_loader,
+        tag="train_loader_pre_final_eval",
+    )
+    train_loader = None
+    gc.collect()
+
+    maybe_cuda_empty_cache(
+        logger,
+        enabled=bool(args.cuda_empty_cache_after_eval),
+        tag="final_eval_pre",
+    )
     records = run_generation_predictions(
         model=model,
         loader=val_loader,
         tokenizer=tokenizer,
         device=device,
         max_answer_length=int(args.max_answer_length),
-        max_batches=int(args.eval_batches),
+        max_batches=int(args.final_eval_batches),
         debug_shapes=False,
         logger=logger,
         split_name=args.eval_split,
         log_every=int(args.eval_log_every),
+        cuda_empty_cache_every=(400 if int(args.final_eval_batches) == 0 else 0),
     )
     summary = evaluate_records(
         records,
@@ -1603,6 +3065,16 @@ def main() -> None:
         epoch=epoch,
         tag="final_eval",
         logger=logger,
+    )
+    maybe_cuda_empty_cache(
+        logger,
+        enabled=bool(args.cuda_empty_cache_after_eval),
+        tag="final_eval_post",
+    )
+    maybe_shutdown_loader_workers(
+        logger,
+        val_loader,
+        tag="val_loader_post_final_eval",
     )
     if args.save_predictions_jsonl:
         with open(args.save_predictions_jsonl, "w", encoding="utf-8") as f:
