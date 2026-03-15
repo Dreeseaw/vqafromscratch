@@ -6,29 +6,33 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 cd "${REPO_ROOT}"
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
-SWEEP_ID="mmhammer_perfprobe_v1_${STAMP}"
+SWEEP_ID="mmcrane_perfprobe_v1_${STAMP}"
 SWEEP_DIR="logs/${SWEEP_ID}"
 mkdir -pv "${SWEEP_DIR}"
-ln -sfn "${SWEEP_ID}" "logs/mmhammer_perfprobe_v1_latest"
+ln -sfn "${SWEEP_ID}" "logs/mmcrane_perfprobe_v1_latest"
 
-RUN_PREFIX="${RUN_PREFIX:-mmhammer_perf_v1_20260312}"
+RUN_PREFIX="${RUN_PREFIX:-mmcrane_perf_v1_20260314}"
 MAX_STEPS="${MAX_STEPS:-40}"
 FINAL_EVAL_BATCHES="${FINAL_EVAL_BATCHES:-4}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
-TRAIN_MIN_STEPS_PER_S="${TRAIN_MIN_STEPS_PER_S:-3.0}"
-EVAL_MIN_STEPS_PER_S="${EVAL_MIN_STEPS_PER_S:-0.8}"
+TRAIN_MIN_STEPS_PER_S="${TRAIN_MIN_STEPS_PER_S:-1.0}"
+EVAL_MIN_STEPS_PER_S="${EVAL_MIN_STEPS_PER_S:-0.5}"
 DRY_RUN="${DRY_RUN:-0}"
+
+MOBILECLIP_MODEL_DIR="${MOBILECLIP_MODEL_DIR:-logs/hf_vision/apple_mobileclip_s0}"
+DINOV2_MODEL_DIR="${DINOV2_MODEL_DIR:-logs/hf_vision/facebook_dinov2_small}"
 
 RESULTS_PATH="${SWEEP_DIR}/probe_results.tsv"
 CHOICES_PATH="${SWEEP_DIR}/recommended_layouts.tsv"
 
 cat > "${SWEEP_DIR}/README.md" <<EOF
-# Hammer Performance Probes V1
+# Crane Performance Probes V1
 
 Purpose:
-- verify the new Hammer architecture families can keep effective batch size 192
-- pick the fastest batch_size x grad_accum layout that clears throughput floors
+- determine safe batch layouts for MobileCLIP2-S0 and DINOv2-small
+- test the full attnqquery + dynbudget + adapter d3 stack with each new VM
+- record train and eval throughput at each layout
 
 Thresholds:
 - train steps/s > ${TRAIN_MIN_STEPS_PER_S}
@@ -37,15 +41,14 @@ Thresholds:
 Runtime:
 - MAX_STEPS=${MAX_STEPS}
 - FINAL_EVAL_BATCHES=${FINAL_EVAL_BATCHES}
-- NUM_WORKERS=${NUM_WORKERS}
-- PREFETCH_FACTOR=${PREFETCH_FACTOR}
+
+Models:
+- MobileCLIP2-S0: ${MOBILECLIP_MODEL_DIR} (49 tokens @ 1024-dim, 11.4M params)
+- DINOv2-small: ${DINOV2_MODEL_DIR} (256 tokens @ 384-dim, 22M params)
 
 Probe order:
 - try 192x1 first
-- fall back to 96x2
-- then 64x3
-- then 48x4
-- then 32x6
+- fall back to 96x2 -> 64x3 -> 48x4 -> 32x6
 EOF
 
 COMMON_ARGS=(
@@ -55,7 +58,7 @@ COMMON_ARGS=(
   --epochs 20
   --max_steps "${MAX_STEPS}"
   --manual_max_steps
-  --log_every 20
+  --log_every 10
   --eval_every 0
   --eval_batches 0
   --final_eval_batches "${FINAL_EVAL_BATCHES}"
@@ -65,6 +68,7 @@ COMMON_ARGS=(
   --final_sanity_count 0
   --cuda_empty_cache_after_eval
   --eval_use_kv_cache
+  --eval_kv_cache_mode batched
   --vision_feature_source encoder
   --num_visual_tokens 49
   --bridge_token_reduce adaptive_pool
@@ -91,6 +95,20 @@ COMMON_ARGS=(
   --lr_schedule cosine
   --lr_warmup_steps 200
   --lr_min_ratio 0.15
+)
+
+# Full attnqquery + dynbudget + adapter d3 stack (the frontier config)
+ATTN_DYN_ADAPTER_ARGS=(
+  --bridge_query_bank_mode question_hidden_attn
+  --bridge_qquery_scale 1.0
+  --bridge_token_selector_type qadaptive
+  --bridge_token_select_k 64
+  --bridge_token_select_k_min 24
+  --lm_visual_adapter_type cross_attn
+  --lm_visual_adapter_layers 3
+  --lm_visual_adapter_num_heads 8
+  --lm_visual_adapter_dropout 0.0
+  --lm_visual_adapter_gate_init 0.5
 )
 
 extract_metric() {
@@ -129,6 +147,7 @@ run_attempt() {
     "${COMMON_ARGS[@]}"
     --batch_size "${bs}"
     --grad_accum_steps "${ga}"
+    --eval_batch_size "${bs}"
     "$@"
   )
 
@@ -214,70 +233,57 @@ echo -e "variant\tbatch_size\tgrad_accum\tstatus" > "${CHOICES_PATH}"
 
 overall_status=0
 
-probe_variant \
-  "qquery_earlylayer_geomcal" \
-  --bridge_query_bank_mode question_mix \
-  --bridge_qquery_basis_count 4 \
-  --bridge_qquery_scale 1.0 || overall_status=1
+# === MobileCLIP2-S0 probes ===
+# 49 tokens at 1024-dim, 11.4M params — expect similar to MobileViT or slightly heavier
+
+echo "[$(date)] === MobileCLIP2-S0 probes ===" | tee -a "${SWEEP_DIR}/timeline.log"
 
 probe_variant \
-  "adapter_safeqcond_earlylayer_geomcal" \
-  --lm_visual_adapter_type cross_attn \
-  --lm_visual_adapter_layers 2 \
-  --lm_visual_adapter_num_heads 8 \
-  --lm_visual_adapter_dropout 0.0 \
-  --lm_visual_adapter_gate_init 0.5 || overall_status=1
+  "mobileclip_attnqquery_dynbudget_adapter_d3" \
+  --vision_model mobileclip_s0 \
+  --vision_checkpoint "${MOBILECLIP_MODEL_DIR}" \
+  --vision_feature_mode auto \
+  "${ATTN_DYN_ADAPTER_ARGS[@]}" || overall_status=1
+
+# === DINOv2-small probes ===
+# 256 tokens at 384-dim, 22M params — expect heavier due to token count
+
+echo "[$(date)] === DINOv2-small probes ===" | tee -a "${SWEEP_DIR}/timeline.log"
 
 probe_variant \
-  "dynbudget_qscore_earlylayer_geomcal" \
-  --bridge_token_selector_type qadaptive \
-  --bridge_token_select_k 64 \
-  --bridge_token_select_k_min 24 || overall_status=1
+  "dinov2s_attnqquery_dynbudget_adapter_d3" \
+  --vision_model dinov2_small \
+  --vision_checkpoint "${DINOV2_MODEL_DIR}" \
+  --vision_feature_mode auto \
+  "${ATTN_DYN_ADAPTER_ARGS[@]}" || overall_status=1
+
+# === DINOv2-small with no dynbudget (all 256 tokens to perceiver) ===
+# This is the heaviest config — perceiver cross-attends over 256 tokens
+
+echo "[$(date)] === DINOv2-small NO dynbudget probes ===" | tee -a "${SWEEP_DIR}/timeline.log"
 
 probe_variant \
-  "qquery_adapter_earlylayer_geomcal" \
-  --bridge_query_bank_mode question_mix \
-  --bridge_qquery_basis_count 4 \
+  "dinov2s_attnqquery_nodynbudget_adapter_d3" \
+  --vision_model dinov2_small \
+  --vision_checkpoint "${DINOV2_MODEL_DIR}" \
+  --vision_feature_mode auto \
+  --bridge_query_bank_mode question_hidden_attn \
   --bridge_qquery_scale 1.0 \
+  --bridge_token_selector_type none \
+  --bridge_token_select_k 0 \
   --lm_visual_adapter_type cross_attn \
-  --lm_visual_adapter_layers 2 \
-  --lm_visual_adapter_num_heads 8 \
-  --lm_visual_adapter_dropout 0.0 \
-  --lm_visual_adapter_gate_init 0.5 || overall_status=1
-
-probe_variant \
-  "qquery_dynbudget_earlylayer_geomcal" \
-  --bridge_query_bank_mode question_mix \
-  --bridge_qquery_basis_count 4 \
-  --bridge_qquery_scale 1.0 \
-  --bridge_token_selector_type qadaptive \
-  --bridge_token_select_k 64 \
-  --bridge_token_select_k_min 24 || overall_status=1
-
-probe_variant \
-  "dynbudget_adapter_earlylayer_geomcal" \
-  --bridge_token_selector_type qadaptive \
-  --bridge_token_select_k 64 \
-  --bridge_token_select_k_min 24 \
-  --lm_visual_adapter_type cross_attn \
-  --lm_visual_adapter_layers 2 \
-  --lm_visual_adapter_num_heads 8 \
-  --lm_visual_adapter_dropout 0.0 \
-  --lm_visual_adapter_gate_init 0.5 || overall_status=1
-
-probe_variant \
-  "qquery_dynbudget_adapter_earlylayer_geomcal" \
-  --bridge_query_bank_mode question_mix \
-  --bridge_qquery_basis_count 4 \
-  --bridge_qquery_scale 1.0 \
-  --bridge_token_selector_type qadaptive \
-  --bridge_token_select_k 64 \
-  --bridge_token_select_k_min 24 \
-  --lm_visual_adapter_type cross_attn \
-  --lm_visual_adapter_layers 2 \
+  --lm_visual_adapter_layers 3 \
   --lm_visual_adapter_num_heads 8 \
   --lm_visual_adapter_dropout 0.0 \
   --lm_visual_adapter_gate_init 0.5 || overall_status=1
 
 echo "[$(date)] PROBES COMPLETE ${SWEEP_ID} overall_status=${overall_status}" | tee -a "${SWEEP_DIR}/timeline.log"
+
+echo ""
+echo "=== RESULTS ==="
+cat "${RESULTS_PATH}"
+echo ""
+echo "=== RECOMMENDED LAYOUTS ==="
+cat "${CHOICES_PATH}"
+
 exit "${overall_status}"

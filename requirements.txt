@@ -5,3 +5,5 @@ PyYAML
 transformers
 huggingface_hub
 safetensors
+open_clip_torch
+timm

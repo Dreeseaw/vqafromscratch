@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader, Sampler
 
 from models.bpe_tokenizer import ByteBPETokenizer
 from models.bridge import BridgeConfig, build_bridge
-from models.hf_vision import HFMobileViTSmallBackbone
+from models.hf_vision import HFMobileViTSmallBackbone, HFDINOv2SmallBackbone, OpenCLIPBackbone
 from models.lm import LMConfig, TransformerDecoderOnlyV1
 from models.vae import VAEConfig, VariationalAutoEncoder, VariationalAutoEncoderRes, ViTVAE, ViTVAE2
 from train.vqa_data import VQAv2Dataset, VQAv2Paths, build_image_transform, prepare_vqav2
@@ -342,6 +342,25 @@ def build_vision_model_from_args(args: argparse.Namespace, device: str, ckpt_pay
         if not model_dir:
             raise SystemExit("--vision_checkpoint must point to a local MobileViT directory for --vision_model mobilevit_hf")
         model = HFMobileViTSmallBackbone(model_dir=model_dir, device=device)
+        return model.to(device)
+    elif vision_model_name == "dinov2_small":
+        if int(getattr(args, "train_vision_last_n_blocks", 0)) > 0 or str(getattr(args, "freeze_mode", "")) == "full_finetune":
+            raise SystemExit("dinov2_small is currently frozen-vision only; VM finetuning is not wired for this path.")
+        model_dir = str(args.vision_checkpoint or meta.get("vision_checkpoint", ""))
+        if not model_dir:
+            raise SystemExit("--vision_checkpoint must point to a local DINOv2-small directory for --vision_model dinov2_small")
+        model = HFDINOv2SmallBackbone(model_dir=model_dir, device=device)
+        return model.to(device)
+    elif vision_model_name == "mobileclip_s0":
+        if int(getattr(args, "train_vision_last_n_blocks", 0)) > 0 or str(getattr(args, "freeze_mode", "")) == "full_finetune":
+            raise SystemExit("mobileclip_s0 is currently frozen-vision only; VM finetuning is not wired for this path.")
+        model_dir = str(args.vision_checkpoint or meta.get("vision_checkpoint", ""))
+        if not model_dir:
+            raise SystemExit("--vision_checkpoint must point to a local MobileCLIP-S0 directory for --vision_model mobileclip_s0")
+        ckpt_path = os.path.join(model_dir, "open_clip_model.pt")
+        if not os.path.isfile(ckpt_path):
+            raise SystemExit(f"Expected checkpoint at {ckpt_path}. Run the download script first.")
+        model = OpenCLIPBackbone("MobileCLIP2-S0", checkpoint_path=ckpt_path, device=device)
         return model.to(device)
     else:
         raise ValueError(f"Unsupported --vision_model: {vision_model_name}")
@@ -2402,7 +2421,7 @@ def parse_args() -> argparse.Namespace:
         "--vision_model",
         type=str,
         default="vitvae2",
-        choices=["vae", "vaer", "vitvae", "vitvae2", "mobilevit_hf"],
+        choices=["vae", "vaer", "vitvae", "vitvae2", "mobilevit_hf", "dinov2_small", "mobileclip_s0"],
     )
     ap.add_argument("--vision_checkpoint", type=str, default=None)
     ap.add_argument("--vision_config", type=str, default=None)
