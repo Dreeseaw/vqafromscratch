@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader, Sampler
 
 from models.bpe_tokenizer import ByteBPETokenizer
 from models.bridge import BridgeConfig, build_bridge
-from models.hf_vision import HFMobileViTSmallBackbone, HFDINOv2SmallBackbone, OpenCLIPBackbone
+from models.hf_vision import HFMobileViTSmallBackbone, HFDINOv2SmallBackbone, OpenCLIPBackbone, HFSigLIPBasePatch16Backbone
 from models.lm import LMConfig, TransformerDecoderOnlyV1
 from models.vae import VAEConfig, VariationalAutoEncoder, VariationalAutoEncoderRes, ViTVAE, ViTVAE2
 from train.vqa_data import VQAv2Dataset, VQAv2Paths, build_image_transform, prepare_vqav2
@@ -361,6 +361,14 @@ def build_vision_model_from_args(args: argparse.Namespace, device: str, ckpt_pay
         if not os.path.isfile(ckpt_path):
             raise SystemExit(f"Expected checkpoint at {ckpt_path}. Run the download script first.")
         model = OpenCLIPBackbone("MobileCLIP2-S0", checkpoint_path=ckpt_path, device=device)
+        return model.to(device)
+    elif vision_model_name == "siglip_base":
+        if int(getattr(args, "train_vision_last_n_blocks", 0)) > 0 or str(getattr(args, "freeze_mode", "")) == "full_finetune":
+            raise SystemExit("siglip_base is currently frozen-vision only; VM finetuning is not wired for this path.")
+        model_dir = str(args.vision_checkpoint or meta.get("vision_checkpoint", ""))
+        if not model_dir:
+            raise SystemExit("--vision_checkpoint must point to a local SigLIP directory for --vision_model siglip_base")
+        model = HFSigLIPBasePatch16Backbone(model_dir=model_dir, device=device)
         return model.to(device)
     else:
         raise ValueError(f"Unsupported --vision_model: {vision_model_name}")
@@ -2410,6 +2418,7 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("run_id", type=str)
     ap.add_argument("--checkpoint", type=int, default=None, help="Resume from logs/<run_id>/step_<N>.tar")
+    ap.add_argument("--reset_schedule", action="store_true", help="Load model weights from checkpoint but reset step/epoch/LR to 0 (for two-stage training)")
     ap.add_argument("--eval_only", action="store_true")
     ap.add_argument("--eval_split", type=str, default="val", choices=["train", "val", "test"])
 
@@ -2421,7 +2430,7 @@ def parse_args() -> argparse.Namespace:
         "--vision_model",
         type=str,
         default="vitvae2",
-        choices=["vae", "vaer", "vitvae", "vitvae2", "mobilevit_hf", "dinov2_small", "mobileclip_s0"],
+        choices=["vae", "vaer", "vitvae", "vitvae2", "mobilevit_hf", "dinov2_small", "mobileclip_s0", "siglip_base"],
     )
     ap.add_argument("--vision_checkpoint", type=str, default=None)
     ap.add_argument("--vision_config", type=str, default=None)
@@ -2923,15 +2932,28 @@ def main() -> None:
         start_epoch = int(resume_payload.get("epoch", 0))
         legacy_resume_no_batch = "batch_in_epoch" not in resume_payload
         resume_batch_in_epoch = int(resume_payload.get("batch_in_epoch", 0))
-        logger.log(
-            f"[mm] resuming from {ckpt_path} "
-            f"(step={global_step}, epoch={start_epoch}, batch_in_epoch={resume_batch_in_epoch})"
-        )
+        if getattr(args, "reset_schedule", False):
+            logger.log(
+                f"[mm] loading weights from {ckpt_path} (checkpoint step={global_step}) "
+                f"but resetting schedule: global_step=0, epoch=0"
+            )
+            global_step = 0
+            start_epoch = 0
+            resume_batch_in_epoch = 0
+        else:
+            logger.log(
+                f"[mm] resuming from {ckpt_path} "
+                f"(step={global_step}, epoch={start_epoch}, batch_in_epoch={resume_batch_in_epoch})"
+            )
 
     model, tokenizer, bridge_cfg = build_runtime_from_args(args, device=device, checkpoint_payload=resume_payload)
     if resume_payload is not None:
         _maybe_initialize_bridge_from_state_dict(model, resume_payload["model_state_dict"])
-        model.load_state_dict(resume_payload["model_state_dict"], strict=True)
+        missing, unexpected = model.load_state_dict(resume_payload["model_state_dict"], strict=False)
+        if unexpected:
+            logger.log(f"[mm] WARNING: unexpected keys in checkpoint: {unexpected}")
+        if missing:
+            logger.log(f"[mm] note: {len(missing)} keys not in checkpoint (newly initialized): {missing[:5]}{'...' if len(missing) > 5 else ''}")
     block_backend = getattr(model.lm._dec_blocks[0], "_sdp_backend", "n/a") if len(model.lm._dec_blocks) > 0 else "n/a"
     logger.log(
         f"[mm] lm attn_impl={model.lm._config.attn_impl} "
@@ -3027,7 +3049,10 @@ def main() -> None:
         f"weight_decay={float(args.weight_decay):.6g} grad_clip={float(args.grad_clip):.4g}"
     )
     if resume_payload is not None and "optimizer_state_dict" in resume_payload and not args.eval_only:
-        opt.load_state_dict(resume_payload["optimizer_state_dict"])
+        try:
+            opt.load_state_dict(resume_payload["optimizer_state_dict"])
+        except (ValueError, RuntimeError) as e:
+            logger.log(f"[mm] optimizer state incompatible (two-stage handoff?), reinitializing optimizer: {e}")
     if resume_payload is not None:
         restore_rng_state(resume_payload.get("rng_state"))
 

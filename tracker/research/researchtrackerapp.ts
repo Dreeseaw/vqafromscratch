@@ -65,6 +65,7 @@ type TaskConfigFile = {
   docsDir?: string;
   scriptsDir?: string;
   logsDir?: string;
+  logPrefixes?: string[];
   default?: boolean;
   qaPromptHint?: string;
 };
@@ -79,6 +80,7 @@ type TaskContext = {
   docsRoot: string;
   scriptsRoot: string;
   logsRoot: string;
+  logPrefixes: string[];
   isDefault: boolean;
   qaPromptHint: string | null;
   taskFile: string;
@@ -474,6 +476,15 @@ function assertRelativeDir(value: string, field: string, taskFile: string): stri
   return value.replace(/\\/g, "/");
 }
 
+function parseTaskLogPrefixes(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return uniq(
+    value
+      .map((entry) => String(entry ?? "").trim())
+      .filter((entry) => /^[A-Za-z0-9._-]+$/.test(entry))
+  );
+}
+
 function loadTasks(): TaskContext[] {
   if (!fs.existsSync(tasksRoot) || !fs.statSync(tasksRoot).isDirectory()) {
     throw new Error(`Missing tasks root: ${path.relative(repoRoot, tasksRoot)}`);
@@ -493,6 +504,7 @@ function loadTasks(): TaskContext[] {
     const docsDir = assertRelativeDir(String(raw.docsDir ?? "").trim(), "docsDir", taskFile);
     const scriptsDir = assertRelativeDir(String(raw.scriptsDir ?? "").trim(), "scriptsDir", taskFile);
     const logsDir = assertRelativeDir(String(raw.logsDir ?? "").trim(), "logsDir", taskFile);
+    const logPrefixes = parseTaskLogPrefixes(raw.logPrefixes);
     if (!id || !title) throw new Error(`${taskFile}: missing id/title`);
     const docsRoot = path.resolve(repoRoot, docsDir);
     const scriptsRoot = path.resolve(repoRoot, scriptsDir);
@@ -507,6 +519,7 @@ function loadTasks(): TaskContext[] {
       docsRoot,
       scriptsRoot,
       logsRoot,
+      logPrefixes,
       isDefault: Boolean(raw.default),
       qaPromptHint: String(raw.qaPromptHint ?? "").trim() || null,
       taskFile,
@@ -534,7 +547,29 @@ function resolveTaskContext(taskId: string | null | undefined): TaskContext | nu
   return tasksById.get(requested) ?? null;
 }
 
+function taskIncludesLogName(task: TaskContext, name: string): boolean {
+  return task.logPrefixes.length === 0 || task.logPrefixes.some((prefix) => name.startsWith(prefix));
+}
+
 function parseRunSummary(task: TaskContext, runId: string): RunSummary {
+  if (!taskIncludesLogName(task, runId)) {
+    return {
+      runId,
+      runDir: path.join(task.logsRoot, runId),
+      finalAccuracy: null,
+      bestAccuracy: null,
+      lastTrainCe: null,
+      lastStep: null,
+      lastStepsPerSec: null,
+      numParams: null,
+      trainableParams: null,
+      isActive: false,
+      hasFinalCheckpoint: false,
+      isEvalOnly: false,
+      logfile: null,
+      logfileMtimeMs: null,
+    };
+  }
   const runDir = path.join(task.logsRoot, runId);
   const out: RunSummary = {
     runId,
@@ -595,6 +630,23 @@ function parseTimelineLineDate(line: string): string | null {
   return match ? match[1] : null;
 }
 
+const TIMELINE_RUN_MARKERS = new Set(["caption-align", "two-stage"]);
+
+function parseTimelineRunId(task: TaskContext, line: string, event: "START" | "END" | "FAIL" | "SKIP" | "RESTART"): string | null {
+  const match = line.match(new RegExp(`\\b${event}\\b\\s+(.+)$`));
+  if (!match) return null;
+  const tokens = (match[1].match(/[A-Za-z0-9._-]+/g) ?? []).filter((token) => !TIMELINE_RUN_MARKERS.has(token));
+  if (tokens.length === 0) return null;
+
+  const existingRunDirs = tokens.filter((token) => {
+    const full = path.join(task.logsRoot, token);
+    return fs.existsSync(full) && fs.statSync(full).isDirectory();
+  });
+  if (existingRunDirs.length > 0) return existingRunDirs.at(-1) ?? null;
+
+  return tokens[0] ?? null;
+}
+
 function normalizeSweepId(sweepId: string): string {
   return sweepId.replace(/_latest$/, "").replace(/_\d{8}_\d{6}$/, "");
 }
@@ -635,24 +687,23 @@ function parseSweep(task: TaskContext, sweepDirName: string, isSymlink: boolean,
   const lines = readText(timeline).split("\n").filter((line) => line.trim().length > 0);
   const runIds = uniq(
     lines
-      .map((line) => {
-        const match = line.match(/\bSTART\s+([A-Za-z0-9._-]+)/);
-        return match ? match[1] : null;
-      })
+      .map((line) => parseTimelineRunId(task, line, "START"))
       .filter((value): value is string => Boolean(value))
   );
 
   const activeRunIds = new Set<string>();
   for (const line of lines) {
-    const startMatch = line.match(/\bSTART\s+([A-Za-z0-9._-]+)/);
-    if (startMatch) {
-      activeRunIds.add(startMatch[1]);
+    const startedRunId = parseTimelineRunId(task, line, "START");
+    if (startedRunId) {
+      activeRunIds.add(startedRunId);
       continue;
     }
-    const terminalMatch =
-      line.match(/\b(?:END|FAIL|SKIP)\s+([A-Za-z0-9._-]+)/) ??
-      line.match(/\bSTOP\b.*\bbefore\s+([A-Za-z0-9._-]+)/);
-    if (terminalMatch) activeRunIds.delete(terminalMatch[1]);
+    const terminalRunId =
+      parseTimelineRunId(task, line, "END") ??
+      parseTimelineRunId(task, line, "FAIL") ??
+      parseTimelineRunId(task, line, "SKIP") ??
+      (line.match(/\bSTOP\b.*\bbefore\s+([A-Za-z0-9._-]+)/)?.[1] ?? null);
+    if (terminalRunId) activeRunIds.delete(terminalRunId);
   }
   const completionLine = [...lines].reverse().find((line) => /\b(?:SWEEP|PROBES)\s+COMPLETE\b/.test(line)) ?? null;
   const terminalLine =
@@ -692,6 +743,7 @@ function listSweeps(task: TaskContext): SweepSummary[] {
   const dirs = fs
     .readdirSync(task.logsRoot)
     .map((name) => {
+      if (!taskIncludesLogName(task, name)) return null;
       const full = path.join(task.logsRoot, name);
       if (!fs.existsSync(full) || !fs.statSync(full).isDirectory() || !fs.existsSync(path.join(full, "timeline.log"))) {
         return null;
@@ -795,6 +847,20 @@ function listDocs(task: TaskContext): DocSummary[] {
     .map((file) => parseDoc(task, file));
 }
 
+function listStandaloneRuns(task: TaskContext): RunSummary[] {
+  if (task.logPrefixes.length === 0) return [];
+  if (!fs.existsSync(task.logsRoot) || !fs.statSync(task.logsRoot).isDirectory()) return [];
+  return fs
+    .readdirSync(task.logsRoot)
+    .filter((name) => taskIncludesLogName(task, name))
+    .filter((name) => {
+      const full = path.join(task.logsRoot, name);
+      return fs.existsSync(full) && fs.statSync(full).isDirectory();
+    })
+    .map((runId) => parseRunSummary(task, runId))
+    .filter(shouldIncludeRun);
+}
+
 function getBootstrap(task: TaskContext) {
   const sweeps = listSweeps(task);
   const docs = listDocs(task);
@@ -802,8 +868,12 @@ function getBootstrap(task: TaskContext) {
   for (const sweep of sweeps) {
     for (const run of sweep.runs) runMap.set(run.runId, run);
   }
+  for (const run of listStandaloneRuns(task)) {
+    if (!runMap.has(run.runId)) runMap.set(run.runId, run);
+  }
   for (const doc of docs) {
     for (const runId of doc.runRefs) {
+      if (!taskIncludesLogName(task, runId)) continue;
       if (runMap.has(runId)) continue;
       const run = parseRunSummary(task, runId);
       if (shouldIncludeRun(run)) runMap.set(runId, run);
@@ -1386,6 +1456,7 @@ function resolveDocPath(task: TaskContext, fileName: string | null): string | nu
 function resolveRunId(task: TaskContext, runId: string | null): string | null {
   const name = String(runId ?? "").trim();
   if (!name || !/^[A-Za-z0-9._-]+$/.test(name)) return null;
+  if (!taskIncludesLogName(task, name)) return null;
   const full = path.join(task.logsRoot, name);
   if (!fs.existsSync(full) || !fs.statSync(full).isDirectory()) return null;
   return name;

@@ -743,3 +743,55 @@ The sweep establishes whether the bridge research is ready to graduate to a larg
 | 18 | dinov2s_d5 | 6 | DINOv2 | d5 adapters | 5.0 | LOW |
 | 19 | seed2 (frontier) | 1 | MobileViT | seed=53 | 3.5 | HIGH |
 | 20 | seed2 (final) | 5 | best | seed=53 | 3.5–5.0 | NON-NEGOTIABLE |
+
+## Run Index with Throughput Estimates (Updated 2026-03-14)
+
+Based on perf probe measurements (b96a2 for all VMs) and Plank wall-clock calibration (~5 min startup overhead per run).
+
+**Throughput reference (from perf probes):**
+
+| VM | Train sps | Train samples/s | Train tokens/s | Eval samples/s | Eval sps |
+|---|---:|---:|---:|---:|---:|
+| MobileViT (49tok, 640d) | 3.50 | 672 | 23,520 | 334 | ~1.74 |
+| MobileCLIP (49tok, 1024d) | 3.53 | 678 | 23,722 | 240 | 2.50 |
+| DINOv2+dyn (256→64tok, 384d) | 4.31 | 828 | 28,963 | 1,266 | 13.19 |
+| DINOv2 nodyn (256tok, 384d) | 4.20 | 806 | 28,224 | 235 | 2.45 |
+| Caption-align (any VM, b96) | ~7.5 | 720 | — | — | — |
+
+*Train tokens/s = train samples/s × 35 (avg answer length). Eval samples/s = eval sps × batch_size (96).*
+
+**Time model:** `T = startup (5 min) + train_steps / train_sps / 3600 + n_evals × eval_time`
+- Periodic eval (100 batches): ~57s for MobileViT/MobileCLIP/DINOv2-nodyn, ~7s for DINOv2+dyn
+- Final eval (214,354 samples): ~11 min for MobileViT/MobileCLIP/DINOv2-nodyn, ~3 min for DINOv2+dyn
+
+| # | Run ID | Tier | VM | Steps | Train h | Eval h | Startup | **Total h** |
+|---|---|---:|---|---:|---:|---:|---:|---:|
+| 1 | questiononly_attnqquery | 1 | MobileViT | 9k | 0.71 | 0.33 | 0.08 | **1.1** |
+| 2 | adapter_d4 | 1 | MobileViT | 9k | 0.71 | 0.33 | 0.08 | **1.1** |
+| 3 | 18k | 1 | MobileViT | 18k | 1.43 | 0.50 | 0.08 | **2.0** |
+| 19 | seed2 (frontier) | 1 | MobileViT | 9k | 0.71 | 0.33 | 0.08 | **1.1** |
+| | | | | | | | **T1 subtotal** | **5.3** |
+| 4 | mobileclip_attnqquery | 2 | MobileCLIP | 9k | 0.71 | 0.34 | 0.08 | **1.1** |
+| 5 | dinov2s_attnqquery | 2 | DINOv2+dyn | 9k | 0.58 | 0.06 | 0.08 | **0.7** |
+| 6 | dinov2s_lmmeanqquery | 2 | DINOv2+dyn | 9k | 0.58 | 0.06 | 0.08 | **0.7** |
+| | | | | | | | **T2 subtotal** | **2.5** |
+| 7 | dinov2s_nodynbudget | 3 | DINOv2 nodyn | 9k | 0.60 | 0.33 | 0.08 | **1.0** |
+| 8 | dinov2s_cap128 | 3 | DINOv2+dyn | 9k | 0.58 | 0.06 | 0.08 | **0.7** |
+| 9 | dinov2s_cap32 | 3 | DINOv2+dyn | 9k | 0.58 | 0.06 | 0.08 | **0.7** |
+| | | | | | | | **T3 subtotal** | **2.4** |
+| 10 | mobilevit_captionalign | 4 | MobileViT | 3k+9k | 0.83 | 0.33 | 0.17 | **1.3** |
+| 11 | dinov2s_captionalign | 4 | DINOv2+dyn | 3k+9k | 0.69 | 0.06 | 0.17 | **0.9** |
+| 12 | mobileclip_captionalign | 4 | MobileCLIP | 3k+9k | 0.82 | 0.34 | 0.17 | **1.3** |
+| | | | | | | | **T4 subtotal** | **3.5** |
+| 13 | stacked winner | 5 | best | 9k | 0.58–0.71 | 0.06–0.33 | 0.08 | **0.7–1.1** |
+| 14 | stacked_18k | 5 | best | 18k | 1.16–1.43 | 0.09–0.50 | 0.08 | **1.3–2.0** |
+| 15 | full_stack_18k | 5 | best | 3k+18k | 1.27–1.54 | 0.09–0.50 | 0.17 | **1.5–2.2** |
+| 20 | seed2 (final) | 5 | best | 9k | 0.58–0.71 | 0.06–0.33 | 0.08 | **0.7–1.1** |
+| | | | | | | | **T5 subtotal** | **4.2–6.4** |
+| 16 | dinov2s_questiononly | 6 | DINOv2+dyn | 9k | 0.58 | 0.06 | 0.08 | **0.7** |
+| 17 | mobileclip_d4 | 6 | MobileCLIP | 9k | 0.71 | 0.34 | 0.08 | **1.1** |
+| 18 | dinov2s_d5 | 6 | DINOv2+dyn | 9k | 0.58 | 0.06 | 0.08 | **0.7** |
+| | | | | | | | **T6 subtotal** | **2.5** |
+| | | | | | | | **GRAND TOTAL** | **20.4–22.6** |
+
+**Key insight:** The original budget estimate was 30–50h. With measured throughput, the full 20-run sweep fits in **~21h** — well under budget. DINOv2+dynbudget runs are especially fast (eval is 5× faster due to token reduction). Two-stage runs add only ~7 min for the caption-align pre-training phase.

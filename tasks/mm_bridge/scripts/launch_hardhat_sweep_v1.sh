@@ -6,25 +6,32 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 cd "${REPO_ROOT}"
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
-SWEEP_ID="mmcrane_v1_${STAMP}"
+SWEEP_ID="mmhardhat_v1_${STAMP}"
 SWEEP_DIR="logs/${SWEEP_ID}"
 mkdir -pv "${SWEEP_DIR}"
-ln -sfn "${SWEEP_ID}" "logs/mmcrane_v1_latest"
+ln -sfn "${SWEEP_ID}" "logs/mmhardhat_v1_latest"
 
-RUN_PREFIX="${RUN_PREFIX:-mmcrane_v1_20260314}"
+RUN_PREFIX="${RUN_PREFIX:-mmhardhat_v1_$(date +%Y%m%d)}"
 TARGET_STEP="${TARGET_STEP:-9000}"
 TARGET_STEP_18K="${TARGET_STEP_18K:-18000}"
 
-# All VMs use b96a2 (confirmed by perf probes 2026-03-14)
-BS="${BS:-96}"
-GA="${GA:-2}"
-EVAL_BS="${EVAL_BS:-96}"
+# DINOv2-S: b96a2 (confirmed Crane probes)
+DINOV2S_BS="${DINOV2S_BS:-96}"
+DINOV2S_GA="${DINOV2S_GA:-2}"
+DINOV2S_EVAL_BS="${DINOV2S_EVAL_BS:-96}"
+
+# SigLIP-B: b192a1 train, b96 eval (confirmed Hardhat probes)
+SIGLIP_BS="${SIGLIP_BS:-192}"
+SIGLIP_GA="${SIGLIP_GA:-1}"
+SIGLIP_EVAL_BS="${SIGLIP_EVAL_BS:-96}"
+
+# Caption-align
 CAPALIGN_BS="${CAPALIGN_BS:-96}"
 CAPALIGN_STEPS="${CAPALIGN_STEPS:-3000}"
 
-MOBILEVIT_MODEL_DIR="${MOBILEVIT_MODEL_DIR:-logs/hf_vision/apple_mobilevit_small}"
-MOBILECLIP_MODEL_DIR="${MOBILECLIP_MODEL_DIR:-logs/hf_vision/apple_mobileclip_s0}"
-DINOV2_MODEL_DIR="${DINOV2_MODEL_DIR:-logs/hf_vision/facebook_dinov2_small}"
+# Model directories
+DINOV2S_MODEL_DIR="${DINOV2S_MODEL_DIR:-logs/hf_vision/facebook_dinov2_small}"
+SIGLIP_MODEL_DIR="${SIGLIP_MODEL_DIR:-logs/hf_vision/google_siglip_base_patch16_224}"
 
 LOG_EVERY="${LOG_EVERY:-20}"
 EVAL_EVERY="${EVAL_EVERY:-1000}"
@@ -39,37 +46,32 @@ MIN_TRAIN_WINDOW="${MIN_TRAIN_WINDOW:-100}"
 LOW_TRAIN_SPS_EXIT_CODE="${LOW_TRAIN_SPS_EXIT_CODE:-86}"
 MAX_LOW_SPS_RESTARTS="${MAX_LOW_SPS_RESTARTS:-8}"
 
+# Skip controls
 SKIP_TIER1="${SKIP_TIER1:-0}"
 SKIP_TIER2="${SKIP_TIER2:-0}"
 SKIP_TIER3="${SKIP_TIER3:-0}"
 SKIP_TIER4="${SKIP_TIER4:-0}"
-SKIP_TIER5="${SKIP_TIER5:-0}"
-SKIP_TIER6="${SKIP_TIER6:-0}"
-SKIP_RUN3_18K="${SKIP_RUN3_18K:-0}"
-
-# MobileViT-specific loader overrides (lower workers to avoid OOM in loader)
-MOBILEVIT_NUM_WORKERS="${MOBILEVIT_NUM_WORKERS:-2}"
-MOBILEVIT_PREFETCH_FACTOR="${MOBILEVIT_PREFETCH_FACTOR:-1}"
-MOBILEVIT_PIN_MEMORY="${MOBILEVIT_PIN_MEMORY:-0}"
-
-if (( BS * GA != 192 )); then
-  echo "[crane] ERROR effective batch must be 192, got $((BS * GA))"
-  exit 1
-fi
 
 cat > "${SWEEP_DIR}/README.md" <<EOF
-# Crane Extended Sweep V1
+# Hardhat Sweep V1
 
 Sweep ID: ${SWEEP_ID}
 Start time: $(date)
 
-Plan: tasks/mm_bridge/docs/34_crane_extended_sweep_plan_2026-03-14.md
+Plan: tasks/mm_bridge/docs/37claude_hardhat_sweep_plan_2026-03-15.md
 
-Layout: ${BS}x${GA} for all VMs (effective batch 192)
+Phase 1 layout:
+  DINOv2-S: ${DINOV2S_BS}x${DINOV2S_GA} train / ${DINOV2S_EVAL_BS} eval
+  SigLIP-B: ${SIGLIP_BS}x${SIGLIP_GA} train / ${SIGLIP_EVAL_BS} eval
+
 Target step: ${TARGET_STEP} (${TARGET_STEP_18K} for 18k runs)
 
-Skip controls: SKIP_TIER1=${SKIP_TIER1} SKIP_TIER2=${SKIP_TIER2} SKIP_TIER3=${SKIP_TIER3} SKIP_TIER4=${SKIP_TIER4} SKIP_TIER5=${SKIP_TIER5} SKIP_TIER6=${SKIP_TIER6}
+Skip controls: SKIP_TIER1=${SKIP_TIER1} SKIP_TIER2=${SKIP_TIER2} SKIP_TIER3=${SKIP_TIER3} SKIP_TIER4=${SKIP_TIER4}
 EOF
+
+# ============================================================================
+# Common args (identical to Crane)
+# ============================================================================
 
 COMMON_ARGS=(
   --precision bf16
@@ -120,11 +122,12 @@ COMMON_ARGS=(
   --min_train_steps_window "${MIN_TRAIN_WINDOW}"
 )
 
-DYN_ADAPTER_ARGS=(
-  --eval_batch_size "${EVAL_BS}"
-  --bridge_token_selector_type qadaptive
-  --bridge_token_select_k 64
-  --bridge_token_select_k_min 24
+# Hardhat default: nodynbudget + attnqquery + adapter d3
+NODYN_ATTNQ_ADAPTER_ARGS=(
+  --bridge_query_bank_mode question_hidden_attn
+  --bridge_qquery_scale 1.0
+  --bridge_token_selector_type none
+  --bridge_token_select_k 0
   --lm_visual_adapter_type cross_attn
   --lm_visual_adapter_layers 3
   --lm_visual_adapter_num_heads 8
@@ -132,38 +135,27 @@ DYN_ADAPTER_ARGS=(
   --lm_visual_adapter_gate_init 0.5
 )
 
-ATTNQQUERY_ARGS=(
-  --bridge_query_bank_mode question_hidden_attn
-  --bridge_qquery_scale 1.0
-)
-
-MOBILEVIT_ARGS=(
-  --vision_model mobilevit_hf
-  --vision_checkpoint "${MOBILEVIT_MODEL_DIR}"
-  --vision_feature_mode auto
-)
-
-MOBILEVIT_LOADER_ARGS=(
-  --num_workers "${MOBILEVIT_NUM_WORKERS}"
-  --prefetch_factor "${MOBILEVIT_PREFETCH_FACTOR}"
-)
-if [[ "${MOBILEVIT_PIN_MEMORY}" == "0" ]]; then
-  MOBILEVIT_LOADER_ARGS+=(--no-pin_memory)
-fi
-
-MOBILECLIP_ARGS=(
-  --vision_model mobileclip_s0
-  --vision_checkpoint "${MOBILECLIP_MODEL_DIR}"
-  --vision_feature_mode auto
-)
-
-DINOV2_ARGS=(
+DINOV2S_ARGS=(
   --vision_model dinov2_small
-  --vision_checkpoint "${DINOV2_MODEL_DIR}"
+  --vision_checkpoint "${DINOV2S_MODEL_DIR}"
   --vision_feature_mode auto
+  --batch_size "${DINOV2S_BS}"
+  --grad_accum_steps "${DINOV2S_GA}"
+  --eval_batch_size "${DINOV2S_EVAL_BS}"
 )
 
-# --- Utility functions (same pattern as Plank launcher) ---
+SIGLIP_ARGS=(
+  --vision_model siglip_base
+  --vision_checkpoint "${SIGLIP_MODEL_DIR}"
+  --vision_feature_mode auto
+  --batch_size "${SIGLIP_BS}"
+  --grad_accum_steps "${SIGLIP_GA}"
+  --eval_batch_size "${SIGLIP_EVAL_BS}"
+)
+
+# ============================================================================
+# Utility functions (same as Crane launcher)
+# ============================================================================
 
 latest_ckpt_step() {
   local run_id="$1"
@@ -218,8 +210,6 @@ run_one() {
       cmd+=(
         "${COMMON_ARGS[@]}"
         --max_steps "${target_step}"
-        --batch_size "${BS}"
-        --grad_accum_steps "${GA}"
         "$@"
         --eval_only
         --eval_batches 0
@@ -237,8 +227,6 @@ run_one() {
       cmd+=(
         "${COMMON_ARGS[@]}"
         --max_steps "${target_step}"
-        --batch_size "${BS}"
-        --grad_accum_steps "${GA}"
         "$@"
       )
     fi
@@ -277,8 +265,7 @@ run_one() {
 }
 
 run_capalign() {
-  # NOTE: This function is called inside $(...) so all log messages go to stderr.
-  # Only the checkpoint path goes to stdout for capture.
+  # NOTE: stdout is captured — log messages go to stderr.
   local suffix="$1"
   shift
 
@@ -350,9 +337,8 @@ run_twostage() {
 
   local capalign_step
   capalign_step="$(echo "${capalign_ckpt}" | grep -oP 'step_\K[0-9]+')"
-  capalign_step=$((10#${capalign_step}))  # strip leading zeros to match mm.py naming
+  capalign_step=$((10#${capalign_step}))  # strip leading zeros
 
-  # VQA stage uses the checkpoint from caption-align
   local done_ckpt="logs/${run_id}/step_${target_step}.tar"
   if [[ -f "${done_ckpt}" ]] && has_completed_eval "${run_id}" "${target_step}"; then
     echo "[$(date)] SKIP  ${run_id} (complete: ${done_ckpt})" | tee -a "${SWEEP_DIR}/timeline.log"
@@ -370,8 +356,6 @@ run_twostage() {
       cmd+=(
         "${COMMON_ARGS[@]}"
         --max_steps "${target_step}"
-        --batch_size "${BS}"
-        --grad_accum_steps "${GA}"
         "$@"
         --eval_only
         --eval_batches 0
@@ -382,32 +366,30 @@ run_twostage() {
         --cuda_empty_cache_after_eval
       )
     elif (( resume_step > 0 )); then
+      # Resuming mid-VQA training — schedule already reset on first launch
       cmd+=("${resume_step}")
       cmd+=(
         "${COMMON_ARGS[@]}"
         --max_steps "${target_step}"
-        --batch_size "${BS}"
-        --grad_accum_steps "${GA}"
         "$@"
       )
     else
-      # First launch: use caption-align checkpoint
-      cmd+=("${capalign_step}")
-      cmd+=(
-        "${COMMON_ARGS[@]}"
-        --max_steps "${target_step}"
-        --batch_size "${BS}"
-        --grad_accum_steps "${GA}"
-        "$@"
-      )
-      # Copy the caption-align checkpoint into the run dir for runmm.sh to find
+      # First launch: load caption-align weights, reset schedule for clean 9k VQA
       mkdir -p "logs/${run_id}"
       if [[ ! -f "logs/${run_id}/step_${capalign_step}.tar" ]]; then
         cp "${capalign_ckpt}" "logs/${run_id}/step_${capalign_step}.tar"
       fi
+      cmd+=("${capalign_step}")
+      cmd+=(
+        "${COMMON_ARGS[@]}"
+        --max_steps "${target_step}"
+        --reset_schedule
+        "$@"
+      )
     fi
 
     echo "[$(date)] START two-stage ${run_id} target=${target_step} resume=${resume_step}" | tee -a "${SWEEP_DIR}/timeline.log"
+    echo "[$(date)] CMD ${cmd[*]}" >> "${SWEEP_DIR}/timeline.log"
     if [[ "${DRY_RUN}" == "1" ]]; then
       echo "[$(date)] DRY_RUN skip ${run_id}" | tee -a "${SWEEP_DIR}/timeline.log"
       return 0
@@ -437,183 +419,91 @@ run_twostage() {
 
 
 # ============================================================================
-# TIER 1: MobileViT Completion
+# PHASE 1 — All non-conditional runs
+# ============================================================================
+
+# ============================================================================
+# TIER 1: DINOv2-S Nodynbudget Solidification (4 runs, ~2.8h)
 # ============================================================================
 
 if [[ "${SKIP_TIER1}" != "1" ]]; then
-  echo "[$(date)] === TIER 1: MobileViT Completion ===" | tee -a "${SWEEP_DIR}/timeline.log"
+  echo "[$(date)] === TIER 1: DINOv2-S Nodynbudget Solidification ===" | tee -a "${SWEEP_DIR}/timeline.log"
 
-  # Run 1: questiononly
-  run_one "mobilevit_questiononly_attnqquery_dynbudget_adapter_d3_cap64" "${TARGET_STEP}" \
-    "${MOBILEVIT_ARGS[@]}" "${MOBILEVIT_LOADER_ARGS[@]}" "${DYN_ADAPTER_ARGS[@]}" "${ATTNQQUERY_ARGS[@]}" \
+  # Run 1: seed2 of 0.5762 frontier
+  run_one "dinov2s_attnqquery_nodynbudget_adapter_d3_seed2" "${TARGET_STEP}" \
+    "${DINOV2S_ARGS[@]}" "${NODYN_ATTNQ_ADAPTER_ARGS[@]}" \
+    --seed 53
+
+  # Run 2: questiononly
+  run_one "dinov2s_questiononly_attnqquery_nodynbudget_adapter_d3" "${TARGET_STEP}" \
+    "${DINOV2S_ARGS[@]}" "${NODYN_ATTNQ_ADAPTER_ARGS[@]}" \
     --bridge_question_context_mode question_only
 
-  # Run 2: adapter d4
-  run_one "mobilevit_attnqquery_dynbudget_adapter_d4_cap64" "${TARGET_STEP}" \
-    "${MOBILEVIT_ARGS[@]}" "${MOBILEVIT_LOADER_ARGS[@]}" "${DYN_ADAPTER_ARGS[@]}" "${ATTNQQUERY_ARGS[@]}" \
+  # Run 3: d4 adapters
+  run_one "dinov2s_attnqquery_nodynbudget_adapter_d4" "${TARGET_STEP}" \
+    "${DINOV2S_ARGS[@]}" "${NODYN_ATTNQ_ADAPTER_ARGS[@]}" \
     --lm_visual_adapter_layers 4
 
-  # Run 3: 18k training (skip-controllable)
-  if [[ "${SKIP_RUN3_18K}" != "1" ]]; then
-    run_one "mobilevit_attnqquery_dynbudget_adapter_d3_cap64_18k" "${TARGET_STEP_18K}" \
-      "${MOBILEVIT_ARGS[@]}" "${MOBILEVIT_LOADER_ARGS[@]}" "${DYN_ADAPTER_ARGS[@]}" "${ATTNQQUERY_ARGS[@]}" \
-      --lr_warmup_steps 1200
-  fi
-
-  # Run 19: seed2
-  run_one "mobilevit_attnqquery_dynbudget_adapter_d3_cap64_seed2" "${TARGET_STEP}" \
-    "${MOBILEVIT_ARGS[@]}" "${MOBILEVIT_LOADER_ARGS[@]}" "${DYN_ADAPTER_ARGS[@]}" "${ATTNQQUERY_ARGS[@]}" \
-    --seed 53
+  # Run 4: perceiver query_depth=4
+  run_one "dinov2s_attnqquery_nodynbudget_adapter_d3_qdepth4" "${TARGET_STEP}" \
+    "${DINOV2S_ARGS[@]}" "${NODYN_ATTNQ_ADAPTER_ARGS[@]}" \
+    --bridge_query_depth 4
 fi
 
 
 # ============================================================================
-# TIER 2: New VM Baselines
+# TIER 2: Longer Training (1-2 runs, ~1.3-2.6h)
 # ============================================================================
 
 if [[ "${SKIP_TIER2}" != "1" ]]; then
-  echo "[$(date)] === TIER 2: New VM Baselines ===" | tee -a "${SWEEP_DIR}/timeline.log"
+  echo "[$(date)] === TIER 2: Longer Training ===" | tee -a "${SWEEP_DIR}/timeline.log"
 
-  # Run 4: MobileCLIP with attnqquery
-  run_one "mobileclip_attnqquery_dynbudget_adapter_d3_cap64" "${TARGET_STEP}" \
-    "${MOBILECLIP_ARGS[@]}" "${DYN_ADAPTER_ARGS[@]}" "${ATTNQQUERY_ARGS[@]}"
+  # Run 5: 18k baseline
+  run_one "dinov2s_attnqquery_nodynbudget_adapter_d3_18k" "${TARGET_STEP_18K}" \
+    "${DINOV2S_ARGS[@]}" "${NODYN_ATTNQ_ADAPTER_ARGS[@]}" \
+    --lr_warmup_steps 1200
 
-  # Run 5: DINOv2 with attnqquery + dynbudget
-  run_one "dinov2s_attnqquery_dynbudget_adapter_d3_cap64" "${TARGET_STEP}" \
-    "${DINOV2_ARGS[@]}" "${DYN_ADAPTER_ARGS[@]}" "${ATTNQQUERY_ARGS[@]}"
-
-  # Run 6: DINOv2 with lmmeanqquery + dynbudget
-  run_one "dinov2s_lmmeanqquery_dynbudget_adapter_d3_cap64" "${TARGET_STEP}" \
-    "${DINOV2_ARGS[@]}" "${DYN_ADAPTER_ARGS[@]}" \
-    --bridge_query_bank_mode question_hidden_mean \
-    --bridge_qquery_scale 1.0
+  # Run 6 is CONDITIONAL on Tier 1 — deferred to Phase 2 launcher
 fi
 
 
 # ============================================================================
-# TIER 3: DINOv2 Dynbudget Sweep
+# TIER 3: Corrected Caption-Align (1 run, ~0.9h)
 # ============================================================================
 
 if [[ "${SKIP_TIER3}" != "1" ]]; then
-  echo "[$(date)] === TIER 3: DINOv2 Dynbudget Sweep ===" | tee -a "${SWEEP_DIR}/timeline.log"
+  echo "[$(date)] === TIER 3: Corrected Caption-Align ===" | tee -a "${SWEEP_DIR}/timeline.log"
 
-  # Run 7: DINOv2 no dynbudget (all 256 tokens to perceiver)
-  run_one "dinov2s_attnqquery_nodynbudget_adapter_d3" "${TARGET_STEP}" \
-    "${DINOV2_ARGS[@]}" "${ATTNQQUERY_ARGS[@]}" \
-    --eval_batch_size "${EVAL_BS}" \
-    --bridge_token_selector_type none \
-    --bridge_token_select_k 0 \
-    --lm_visual_adapter_type cross_attn \
-    --lm_visual_adapter_layers 3 \
-    --lm_visual_adapter_num_heads 8 \
-    --lm_visual_adapter_dropout 0.0 \
-    --lm_visual_adapter_gate_init 0.5
+  # Caption-align stage (DINOv2-S, ~7 min)
+  capalign_ckpt_dinov2s="$(run_capalign "dinov2s_nodyn" \
+    --vision_model dinov2_small \
+    --vision_checkpoint "${DINOV2S_MODEL_DIR}" \
+    --vision_feature_source encoder \
+    --vision_feature_mode auto)"
 
-  # Run 8: DINOv2 cap128
-  run_one "dinov2s_attnqquery_dynbudget_adapter_d3_cap128" "${TARGET_STEP}" \
-    "${DINOV2_ARGS[@]}" "${ATTNQQUERY_ARGS[@]}" \
-    --eval_batch_size "${EVAL_BS}" \
-    --bridge_token_selector_type qadaptive \
-    --bridge_token_select_k 128 \
-    --bridge_token_select_k_min 48 \
-    --lm_visual_adapter_type cross_attn \
-    --lm_visual_adapter_layers 3 \
-    --lm_visual_adapter_num_heads 8 \
-    --lm_visual_adapter_dropout 0.0 \
-    --lm_visual_adapter_gate_init 0.5
-
-  # Run 9: DINOv2 cap32
-  run_one "dinov2s_attnqquery_dynbudget_adapter_d3_cap32" "${TARGET_STEP}" \
-    "${DINOV2_ARGS[@]}" "${ATTNQQUERY_ARGS[@]}" \
-    --eval_batch_size "${EVAL_BS}" \
-    --bridge_token_selector_type qadaptive \
-    --bridge_token_select_k 32 \
-    --bridge_token_select_k_min 12 \
-    --lm_visual_adapter_type cross_attn \
-    --lm_visual_adapter_layers 3 \
-    --lm_visual_adapter_num_heads 8 \
-    --lm_visual_adapter_dropout 0.0 \
-    --lm_visual_adapter_gate_init 0.5
+  # Run 7: VQA with --reset_schedule (clean 9k from pre-trained bridge)
+  run_twostage "dinov2s_captionalign_attnqquery_nodynbudget_adapter_d3" "${TARGET_STEP}" \
+    "${capalign_ckpt_dinov2s}" \
+    "${DINOV2S_ARGS[@]}" "${NODYN_ATTNQ_ADAPTER_ARGS[@]}"
 fi
 
 
 # ============================================================================
-# TIER 4: Caption-Align Pre-Training
+# TIER 4: SigLIP-B/16 Baseline (1 run, ~0.7h)
 # ============================================================================
 
 if [[ "${SKIP_TIER4}" != "1" ]]; then
-  echo "[$(date)] === TIER 4: Caption-Align Pre-Training ===" | tee -a "${SWEEP_DIR}/timeline.log"
+  echo "[$(date)] === TIER 4: SigLIP-B/16 ===" | tee -a "${SWEEP_DIR}/timeline.log"
 
-  # Run 10: MobileViT caption-align → VQA
-  capalign_ckpt_mobilevit="$(run_capalign "mobilevit" \
-    --vision_model mobilevit_hf \
-    --vision_checkpoint "${MOBILEVIT_MODEL_DIR}" \
-    --vision_feature_source encoder \
-    --vision_feature_mode auto)"
-  run_twostage "mobilevit_captionalign_attnqquery_dynbudget_adapter_d3_cap64" "${TARGET_STEP}" \
-    "${capalign_ckpt_mobilevit}" \
-    "${MOBILEVIT_ARGS[@]}" "${MOBILEVIT_LOADER_ARGS[@]}" "${DYN_ADAPTER_ARGS[@]}" "${ATTNQQUERY_ARGS[@]}"
-
-  # Run 11: DINOv2 caption-align → VQA
-  capalign_ckpt_dinov2="$(run_capalign "dinov2s" \
-    --vision_model dinov2_small \
-    --vision_checkpoint "${DINOV2_MODEL_DIR}" \
-    --vision_feature_source encoder \
-    --vision_feature_mode auto)"
-  run_twostage "dinov2s_captionalign_attnqquery_dynbudget_adapter_d3_cap64" "${TARGET_STEP}" \
-    "${capalign_ckpt_dinov2}" \
-    "${DINOV2_ARGS[@]}" "${DYN_ADAPTER_ARGS[@]}" "${ATTNQQUERY_ARGS[@]}"
-
-  # Run 12: MobileCLIP caption-align → VQA (low priority)
-  capalign_ckpt_mobileclip="$(run_capalign "mobileclip" \
-    --vision_model mobileclip_s0 \
-    --vision_checkpoint "${MOBILECLIP_MODEL_DIR}" \
-    --vision_feature_source encoder \
-    --vision_feature_mode auto)"
-  run_twostage "mobileclip_captionalign_attnqquery_dynbudget_adapter_d3_cap64" "${TARGET_STEP}" \
-    "${capalign_ckpt_mobileclip}" \
-    "${MOBILECLIP_ARGS[@]}" "${DYN_ADAPTER_ARGS[@]}" "${ATTNQQUERY_ARGS[@]}"
+  # Run 8: SigLIP-B nodynbudget baseline
+  run_one "siglip_attnqquery_nodynbudget_adapter_d3" "${TARGET_STEP}" \
+    "${SIGLIP_ARGS[@]}" "${NODYN_ATTNQ_ADAPTER_ARGS[@]}"
 fi
 
 
-# ============================================================================
-# TIER 5: Stacking Winners (configs selected post-hoc based on tier 1-4 results)
-# ============================================================================
-
-if [[ "${SKIP_TIER5}" != "1" ]]; then
-  echo "[$(date)] === TIER 5: Stacking Winners ===" | tee -a "${SWEEP_DIR}/timeline.log"
-  echo "[$(date)] NOTE: Tier 5 runs must be configured manually based on Tier 1-4 results." | tee -a "${SWEEP_DIR}/timeline.log"
-  echo "[$(date)] Edit this section after analyzing results from Tiers 1-4." | tee -a "${SWEEP_DIR}/timeline.log"
-
-  # Example stacking run (uncomment and configure after Tier 1-4 results):
-  # run_one "best_vm_stacked_attnqquery_dynbudget_adapter_d3_cap64" "${TARGET_STEP}" \
-  #   "${DINOV2_ARGS[@]}" "${DYN_ADAPTER_ARGS[@]}" "${ATTNQQUERY_ARGS[@]}" \
-  #   --bridge_question_context_mode question_only
-fi
-
-
-# ============================================================================
-# TIER 6: Diagnostics (low priority)
-# ============================================================================
-
-if [[ "${SKIP_TIER6}" != "1" ]]; then
-  echo "[$(date)] === TIER 6: Diagnostics ===" | tee -a "${SWEEP_DIR}/timeline.log"
-
-  # Run 16: questiononly on DINOv2
-  run_one "dinov2s_questiononly_attnqquery_dynbudget_adapter_d3_cap64" "${TARGET_STEP}" \
-    "${DINOV2_ARGS[@]}" "${DYN_ADAPTER_ARGS[@]}" "${ATTNQQUERY_ARGS[@]}" \
-    --bridge_question_context_mode question_only
-
-  # Run 17: d4 adapters on MobileCLIP
-  run_one "mobileclip_attnqquery_dynbudget_adapter_d4_cap64" "${TARGET_STEP}" \
-    "${MOBILECLIP_ARGS[@]}" "${DYN_ADAPTER_ARGS[@]}" "${ATTNQQUERY_ARGS[@]}" \
-    --lm_visual_adapter_layers 4
-
-  # Run 18: d5 adapters on DINOv2
-  run_one "dinov2s_attnqquery_dynbudget_adapter_d5_cap64" "${TARGET_STEP}" \
-    "${DINOV2_ARGS[@]}" "${DYN_ADAPTER_ARGS[@]}" "${ATTNQQUERY_ARGS[@]}" \
-    --lm_visual_adapter_layers 5
-fi
-
-
-echo "[$(date)] SWEEP COMPLETE ${SWEEP_ID}" | tee -a "${SWEEP_DIR}/timeline.log"
+echo "[$(date)] PHASE 1 COMPLETE ${SWEEP_ID}" | tee -a "${SWEEP_DIR}/timeline.log"
+echo ""
+echo "============================================================================"
+echo "Phase 1 done. Review Tier 1-4 results, then update and run Phase 2:"
+echo "  tasks/mm_bridge/scripts/launch_hardhat_sweep_v1_phase2.sh"
+echo "============================================================================"

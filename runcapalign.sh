@@ -17,7 +17,7 @@ docker run --rm --gpus all --ipc=host \
   -v "$(pwd)":/app -w /app myrepo:gpu \
   python -m train.caption_pretrain "$RUN_ID" \
   --tokenizer_path logs/mix_bpe_16k/tokenizer.pt \
-  --lm_checkpoint logs/lm_boom2/step_45000.tar \
+  --lm_checkpoint logs/lm_final/step_45000.tar \
   --images_root images \
   --annotations_root data/vqav2 \
   "${EXTRA_ARGS[@]}"
