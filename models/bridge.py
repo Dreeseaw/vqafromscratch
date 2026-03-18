@@ -165,13 +165,29 @@ class _CrossAttnFFNBlock(nn.Module):
             nn.Linear(h, int(dim)),
         )
 
-    def forward(self, q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        *,
+        return_attn: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         qq = self.ln_q(q)
         kvn = self.ln_kv(kv)
-        attn_out, _ = self.cross_attn(qq, kvn, kvn, need_weights=False)
+        attn_out, attn_weights = self.cross_attn(
+            qq,
+            kvn,
+            kvn,
+            need_weights=bool(return_attn),
+            average_attn_weights=False,
+        )
         q = q + attn_out
         q = q + self.ffn(self.ln2(q))
-        return q
+        if not bool(return_attn):
+            return q
+        if attn_weights is None:
+            raise RuntimeError("Requested cross-attention weights but none were returned.")
+        return q, attn_weights
 
 
 class _TokenConvMixerBlock(nn.Module):
@@ -643,10 +659,12 @@ class _PerceiverCore(nn.Module):
         question_tokens: torch.Tensor | None = None,
         question_token_mask: torch.Tensor | None = None,
         latents: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_attn: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         if latents is None:
             latents = self.latents.expand(int(visual_tokens.shape[0]), -1, -1)
         latents = self._apply_role_specialization(latents)
+        attn_maps: list[torch.Tensor] = []
         for step_idx in range(self.iterative_steps):
             latents = self._apply_question_queries(
                 latents,
@@ -656,7 +674,11 @@ class _PerceiverCore(nn.Module):
             )
             latents = self._apply_question_conditioning(latents, question_context)
             for cross_blk, self_blk in zip(self.cross_blocks, self.self_blocks):
-                latents = cross_blk(latents, visual_tokens)
+                if bool(return_attn):
+                    latents, attn = cross_blk(latents, visual_tokens, return_attn=True)
+                    attn_maps.append(attn)
+                else:
+                    latents = cross_blk(latents, visual_tokens)
                 latents = self_blk(latents)
             if step_idx + 1 < self.iterative_steps:
                 summary = latents.mean(dim=1)
@@ -668,7 +690,9 @@ class _PerceiverCore(nn.Module):
                 assert self.iter_ln is not None and self.iter_proj is not None
                 delta = torch.tanh(self.iter_proj(self.iter_ln(fuse))).unsqueeze(1)
                 latents = latents + float(self.iterative_residual_scale) * delta
-        return latents
+        if not bool(return_attn):
+            return latents
+        return latents, attn_maps
 
 
 class MLPVisualBridge(nn.Module):
@@ -843,13 +867,21 @@ class LearnedQueryCrossAttentionBridge(_QueryBridgeBase):
         question_context: torch.Tensor | None = None,
         question_tokens: torch.Tensor | None = None,
         question_token_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_attn: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         visual_tokens = self._prepare_visual_tokens(visual_features, question_context=question_context)
         q = self.query_tokens.expand(int(visual_tokens.shape[0]), -1, -1)
-        q = self.cross(q, visual_tokens)
+        attn_maps: list[torch.Tensor] = []
+        if bool(return_attn):
+            q, attn = self.cross(q, visual_tokens, return_attn=True)
+            attn_maps.append(attn)
+        else:
+            q = self.cross(q, visual_tokens)
         for blk in self.refine:
             q = blk(q)
-        return q
+        if not bool(return_attn):
+            return q
+        return q, attn_maps
 
 
 class PerceiverResamplerBridge(_QueryBridgeBase):
@@ -869,13 +901,15 @@ class PerceiverResamplerBridge(_QueryBridgeBase):
         question_context: torch.Tensor | None = None,
         question_tokens: torch.Tensor | None = None,
         question_token_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_attn: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         visual_tokens = self._prepare_visual_tokens(visual_features, question_context=question_context)
         return self.core(
             visual_tokens,
             question_context=question_context,
             question_tokens=question_tokens,
             question_token_mask=question_token_mask,
+            return_attn=return_attn,
         )
 
 
@@ -926,7 +960,8 @@ class MultiScalePerceiverBridge(nn.Module):
         question_context: torch.Tensor | None = None,
         question_tokens: torch.Tensor | None = None,
         question_token_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_attn: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         low, high = _as_multiscale_token_pair(visual_features)
         low_t = self._prepare_tokens(low, self.low_proj, self.low_log_scale)
         high_t = self._prepare_tokens(high, self.high_proj, self.high_log_scale)
@@ -936,6 +971,7 @@ class MultiScalePerceiverBridge(nn.Module):
             question_context=question_context,
             question_tokens=question_tokens,
             question_token_mask=question_token_mask,
+            return_attn=return_attn,
         )
 
 
@@ -982,14 +1018,22 @@ class StructuredRolesBridge(_QueryBridgeBase):
         question_context: torch.Tensor | None = None,
         question_tokens: torch.Tensor | None = None,
         question_token_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_attn: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         visual_tokens = self._prepare_visual_tokens(visual_features, question_context=question_context)
         role_emb = self.role_embeddings[self.role_ids].unsqueeze(0)
         q = self.query_tokens.expand(int(visual_tokens.shape[0]), -1, -1) + role_emb
+        attn_maps: list[torch.Tensor] = []
         for cross_blk, self_blk in zip(self.cross_blocks, self.self_blocks):
-            q = cross_blk(q, visual_tokens)
+            if bool(return_attn):
+                q, attn = cross_blk(q, visual_tokens, return_attn=True)
+                attn_maps.append(attn)
+            else:
+                q = cross_blk(q, visual_tokens)
             q = self_blk(q)
-        return q
+        if not bool(return_attn):
+            return q
+        return q, attn_maps
 
 
 class EvidenceSparseBridge(_QueryBridgeBase):

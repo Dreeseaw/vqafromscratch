@@ -129,6 +129,64 @@ class HFDINOv2SmallBackbone(nn.Module):
         return self.forward(images)
 
 
+class HFDINOv2BaseBackbone(nn.Module):
+    """
+    DINOv2 ViT-B/14 wrapper.  ~86 M params, self-supervised on LVD-142M.
+    Returns 256 patch tokens (CLS stripped) at 768-dim for 224×224 input.
+    """
+
+    def __init__(
+        self,
+        model_dir: str,
+        *,
+        device: Optional[str] = None,
+    ) -> None:
+        super().__init__()
+        from transformers import AutoModel
+
+        model_dir = os.path.abspath(str(model_dir))
+        self.model_dir = model_dir
+        self.model = AutoModel.from_pretrained(model_dir, local_files_only=True)
+        if device is not None:
+            self.model.to(device)
+
+        mean = torch.tensor(_IMAGENET_MEAN, dtype=torch.float32).view(1, 3, 1, 1)
+        std = torch.tensor(_IMAGENET_STD, dtype=torch.float32).view(1, 3, 1, 1)
+        self.register_buffer("_input_mean", mean, persistent=False)
+        self.register_buffer("_input_std", std, persistent=False)
+        self._target_hw = (224, 224)
+
+    def _prepare_inputs(self, images: torch.Tensor) -> torch.Tensor:
+        if images.ndim != 4 or int(images.shape[1]) != 3:
+            raise ValueError(f"Expected images [B,3,H,W], got {tuple(images.shape)}")
+        device = next(self.model.parameters()).device
+        imgs = images.detach().float()
+        mean = self._input_mean.to(device=imgs.device, dtype=imgs.dtype)
+        std = self._input_std.to(device=imgs.device, dtype=imgs.dtype)
+        imgs = (imgs * std) + mean
+        imgs = imgs.clamp(0.0, 1.0)
+        if tuple(imgs.shape[-2:]) != self._target_hw:
+            imgs = F.interpolate(imgs, size=self._target_hw, mode="bilinear", align_corners=False)
+        return imgs.to(device=device, non_blocking=True)
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        pixel_values = self._prepare_inputs(images)
+        use_amp = pixel_values.device.type == "cuda" and bool(
+            getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+        )
+        if use_amp:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                outputs = self.model(pixel_values=pixel_values, return_dict=True)
+        else:
+            outputs = self.model(pixel_values=pixel_values, return_dict=True)
+        # Strip the CLS token (index 0), keep only patch tokens.
+        hidden = outputs.last_hidden_state[:, 1:, :]
+        return hidden.float()
+
+    def _encoder(self, images: torch.Tensor) -> torch.Tensor:
+        return self.forward(images)
+
+
 class HFSigLIPBasePatch16Backbone(nn.Module):
     """
     SigLIP ViT-B/16 wrapper.  ~86M vision params, sigmoid CLIP on WebLI.
@@ -351,6 +409,15 @@ def download_mobileclip_s0(out_dir: str) -> str:
     torch.save(model.state_dict(), ckpt_path)
     with open(os.path.join(out_dir, "model_name.txt"), "w") as f:
         f.write("MobileCLIP2-S0\n")
+    return os.path.abspath(out_dir)
+
+
+def download_dinov2_base(repo_id: str, out_dir: str) -> str:
+    from transformers import AutoModel, AutoImageProcessor
+
+    os.makedirs(out_dir, exist_ok=True)
+    AutoModel.from_pretrained(repo_id).save_pretrained(out_dir)
+    AutoImageProcessor.from_pretrained(repo_id).save_pretrained(out_dir)
     return os.path.abspath(out_dir)
 
 

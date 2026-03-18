@@ -30,7 +30,8 @@ from torch.utils.data import DataLoader, Sampler
 
 from models.bpe_tokenizer import ByteBPETokenizer
 from models.bridge import BridgeConfig, build_bridge
-from models.hf_vision import HFMobileViTSmallBackbone, HFDINOv2SmallBackbone, OpenCLIPBackbone, HFSigLIPBasePatch16Backbone
+from models.hf_vision import HFMobileViTSmallBackbone, HFDINOv2SmallBackbone, HFDINOv2BaseBackbone, OpenCLIPBackbone, HFSigLIPBasePatch16Backbone
+from models.vit_ssl import DINOCheckpointBackbone
 from models.lm import LMConfig, TransformerDecoderOnlyV1
 from models.vae import VAEConfig, VariationalAutoEncoder, VariationalAutoEncoderRes, ViTVAE, ViTVAE2
 from train.vqa_data import VQAv2Dataset, VQAv2Paths, build_image_transform, prepare_vqav2
@@ -351,6 +352,14 @@ def build_vision_model_from_args(args: argparse.Namespace, device: str, ckpt_pay
             raise SystemExit("--vision_checkpoint must point to a local DINOv2-small directory for --vision_model dinov2_small")
         model = HFDINOv2SmallBackbone(model_dir=model_dir, device=device)
         return model.to(device)
+    elif vision_model_name == "dinov2_base":
+        if int(getattr(args, "train_vision_last_n_blocks", 0)) > 0 or str(getattr(args, "freeze_mode", "")) == "full_finetune":
+            raise SystemExit("dinov2_base is currently frozen-vision only; VM finetuning is not wired for this path.")
+        model_dir = str(args.vision_checkpoint or meta.get("vision_checkpoint", ""))
+        if not model_dir:
+            raise SystemExit("--vision_checkpoint must point to a local DINOv2-base directory for --vision_model dinov2_base")
+        model = HFDINOv2BaseBackbone(model_dir=model_dir, device=device)
+        return model.to(device)
     elif vision_model_name == "mobileclip_s0":
         if int(getattr(args, "train_vision_last_n_blocks", 0)) > 0 or str(getattr(args, "freeze_mode", "")) == "full_finetune":
             raise SystemExit("mobileclip_s0 is currently frozen-vision only; VM finetuning is not wired for this path.")
@@ -369,6 +378,14 @@ def build_vision_model_from_args(args: argparse.Namespace, device: str, ckpt_pay
         if not model_dir:
             raise SystemExit("--vision_checkpoint must point to a local SigLIP directory for --vision_model siglip_base")
         model = HFSigLIPBasePatch16Backbone(model_dir=model_dir, device=device)
+        return model.to(device)
+    elif vision_model_name == "dinovit_ssl":
+        if int(getattr(args, "train_vision_last_n_blocks", 0)) > 0 or str(getattr(args, "freeze_mode", "")) == "full_finetune":
+            raise SystemExit("dinovit_ssl is currently frozen-vision only; VM finetuning is not wired for this path.")
+        ckpt_path = str(args.vision_checkpoint or meta.get("vision_checkpoint", ""))
+        if not ckpt_path:
+            raise SystemExit("--vision_checkpoint must point to a local DINO SSL checkpoint for --vision_model dinovit_ssl")
+        model = DINOCheckpointBackbone(checkpoint_path=ckpt_path, device=device)
         return model.to(device)
     else:
         raise ValueError(f"Unsupported --vision_model: {vision_model_name}")
@@ -2430,7 +2447,7 @@ def parse_args() -> argparse.Namespace:
         "--vision_model",
         type=str,
         default="vitvae2",
-        choices=["vae", "vaer", "vitvae", "vitvae2", "mobilevit_hf", "dinov2_small", "mobileclip_s0", "siglip_base"],
+        choices=["vae", "vaer", "vitvae", "vitvae2", "mobilevit_hf", "dinov2_small", "dinov2_base", "mobileclip_s0", "siglip_base", "dinovit_ssl"],
     )
     ap.add_argument("--vision_checkpoint", type=str, default=None)
     ap.add_argument("--vision_config", type=str, default=None)

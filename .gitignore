@@ -9,3 +9,4 @@ annotations/*
 docs/*.pdf
 data/*
 cmds.txt
+*.pdf

@@ -358,6 +358,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--pin_memory", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--images_root", type=str, default=None)
     ap.add_argument("--annotations_root", type=str, default=None)
+    ap.add_argument("--lm_checkpoint_override", type=str, default=None)
+    ap.add_argument("--vision_checkpoint_override", type=str, default=None)
+    ap.add_argument("--tokenizer_path_override", type=str, default=None)
     ap.add_argument("--limit_eval", type=int, default=0)
     ap.add_argument("--max_batches", type=int, default=200)
     ap.add_argument("--max_answer_length", type=int, default=None)
@@ -387,6 +390,9 @@ def main() -> None:
         "pin_memory": bool(args.pin_memory),
         "images_root": args.images_root,
         "annotations_root": args.annotations_root,
+        "lm_checkpoint": args.lm_checkpoint_override,
+        "vision_checkpoint": args.vision_checkpoint_override,
+        "tokenizer_path": args.tokenizer_path_override,
     }
     model, tokenizer, bridge_cfg, payload, run_args = load_runtime_from_checkpoint(
         checkpoint_path=args.checkpoint,

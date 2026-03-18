@@ -1,13 +1,18 @@
 # Datasetting Manifesto
 
 **Date:** 2026-03-15
-**Scope:** Design a training corpus for a ~270M parameter VLM targeting strong score/param and score/FLOP on VQAv2, GQA, TextVQA, ChartQA, Winoground, and POPE.
+**Scope:** Design the data plan for a param-efficient ~270M VLM, with separate tracks for strengthening the vision model and strengthening the language model while targeting strong score/param and score/FLOP on VQAv2, GQA, TextVQA, ChartQA, Winoground, and POPE.
 
 ---
 
 ## 1. Core Thesis
 
 Small models are *disproportionately sensitive* to data quality. Every wasted token costs more at 270M params than at 7B. The goal is not "more data" but "denser signal per token."
+
+The project is now more concretely aimed at a **param-efficient VLM** rather than an open-ended research program. The biggest lesson from `mm_bridge` is that the current self-trained VM is the weakest component. That shifts the center of gravity:
+
+- **Part 1:** vision-model dataset work, paired with stronger ViT-style vision backbones and more text-aligned vision training
+- **Part 2:** LM dataset work, using the best available VM as the fixed visual front-end
 
 But we do not *know* which data is densest for our model. The manifesto's job is not to prescribe a recipe — it is to define a **research methodology** for discovering the right dataset through controlled experimentation, semantic tracking of findings, and progressive refinement.
 
@@ -38,17 +43,39 @@ All data must be tagged with its tier. Training configs must record which tiers 
 
 ## 3. The Experiment Loop — Research Methodology
 
-### 3a. The Evaluation Instrument
+### 3a. Two Linked Parts, One Shared Methodology
 
-Every dataset experiment runs through the **same fixed model** to isolate data effects from architecture effects:
+The experiment loop stays the same, but the project now splits into two linked parts:
 
-- **Architecture:** lm_final + current best bridge (from mm_bridge frontier)
-- **Vision backbone:** MobileViT (frozen, from mm_bridge standard config)
-- **Training budget per experiment:** Fixed and small — enough to measure signal, not enough to fully converge. The exact budget is calibrated in the first experiment (see §3d).
+- **Part 1 — Vision Model Dataset Track**
+  We evaluate datasets for training a stronger VM. The LM side is held as fixed as possible, while the VM family can move toward more capable ViT-style architectures and more text-aligned vision training objectives.
+- **Part 2 — LM Dataset Track**
+  We evaluate datasets for training the LM side. The VM is held fixed to the best available vision stack, and only the LM corpus/mix changes.
 
-The evaluation instrument changes **only** when mm_bridge advances its frontier and we explicitly re-baseline.
+These are not two unrelated projects. The source inventory, filtering stack, synthetic pipelines, reporting structure, and experiment discipline are shared. What changes is **which component is being trained and which component is treated as fixed instrumentation**.
 
-### 3b. The Hypothesis Loop
+### 3b. The Evaluation Instrument
+
+Every dataset experiment still runs through a **fixed comparison instrument**, but the fixed component depends on which part is active.
+
+**Part 1 — Vision Model Dataset Track**
+
+- **Fixed pieces:** best available LM + bridge stack
+- **Variable piece:** VM training data and VM-family choices
+- **VM direction:** stronger ViT-style vision models and more text-aligned vision pretraining/alignment
+- **Starting baseline:** the basic VQA dataset/captions setup we already have now
+  - specifically: VQAv2-style supervision plus the current captioning baseline
+- **Training budget per experiment:** fixed and small, enough to rank data choices and VM training recipes, not enough to fully converge
+
+**Part 2 — LM Dataset Track**
+
+- **Fixed pieces:** best available VM + bridge stack from Part 1 / mm_bridge carry-forward
+- **Variable piece:** LM corpus, filtering, and multimodal-text mix
+- **Training budget per experiment:** fixed and small, again chosen to reveal relative dataset quality rather than absolute ceiling
+
+The evaluation instrument changes only when one track has clearly advanced enough that the other track should re-baseline on the improved component.
+
+### 3c. The Hypothesis Loop
 
 Each experiment follows this cycle:
 
@@ -84,7 +111,7 @@ Each experiment follows this cycle:
 - **Record cost.** Wall-clock time, GPU hours, storage used. An improvement that 3x's the data pipeline cost needs to justify itself.
 - **Defer speculation.** List ideas that emerge but don't pursue them in the same experiment. They become candidates for the next one.
 
-### 3c. Semantic Progression — The Axes
+### 3d. Semantic Progression — The Axes
 
 Experiments are organized into progressive **stages**. Each stage builds on settled findings from the prior stage. You don't optimize mix ratios until you know which sources are good. You don't optimize curriculum until you have a good mix.
 
@@ -118,17 +145,33 @@ Experiments are organized into progressive **stages**. Each stage builds on sett
 - Interleaving text-only and multimodal data vs separate phases?
 - Code inclusion: does structured code data help ChartQA/structured reasoning?
 
+For Part 1, these stages apply to **vision-training datasets** first: caption corpora, image-text alignment sources, VQA supervision, chart/doc visual corpora, and text-aligned synthetic vision data.
+
+For Part 2, the same stages apply to **LM-side corpora**: text pretraining sources, instruction/VQA text mixtures, multimodal-text supervision balance, and synthetic reasoning/grounding text.
+
 Each stage produces a **stage report** (numbered doc, like mm_bridge sweeps) and updates the frontier mix in DATASETTING_STATE.md.
 
-### 3d. Calibration Experiment (Experiment 0)
+### 3e. Calibration Experiments (Experiment 0)
 
-Before any dataset research, we need to calibrate the evaluation instrument:
+Before any dataset research, we need to calibrate both tracks.
 
-1. Train the fixed model on VQAv2-only (our existing data) at 3 different budgets: 500K samples, 1M samples, 2M samples
-2. Eval all 6 benchmarks at each budget
-3. Identify: at what budget does signal stabilize? (i.e., where do relative rankings stop changing)
-4. That budget becomes the **standard experiment budget** for all subsequent runs
-5. This also establishes the **baseline scores** — the floor that every dataset variant must beat
+**Experiment 0A — Part 1 VM Baseline Calibration**
+
+1. Train the VM-track baseline on the current basic VQA dataset/captions setup
+2. Run at 3 budgets: 500K samples, 1M samples, 2M samples
+3. Eval all 6 benchmarks at each budget
+4. Identify where ranking signal stabilizes
+5. That becomes the standard Part 1 experiment budget
+6. This establishes the Part 1 floor that stronger VM data/training recipes must beat
+
+**Experiment 0B — Part 2 LM Baseline Calibration**
+
+1. Hold the best available VM fixed
+2. Train the LM-track baseline corpus at 3 budgets
+3. Eval all 6 benchmarks at each budget
+4. Identify where ranking signal stabilizes
+5. That becomes the standard Part 2 experiment budget
+6. This establishes the Part 2 floor for LM-side corpus work
 
 This is analogous to mm_bridge establishing its eval policy and comparison standard before running sweeps.
 
@@ -310,23 +353,44 @@ This makes every experiment reproducible and every comparison explicit about wha
 
 This is not the final plan. This is the first few experiments derived from the methodology. The actual sequence will evolve based on findings.
 
-**Experiment 0 — Calibration**
-- Train fixed model on VQAv2-only at 500K / 1M / 2M samples
-- Establish baseline scores and standard experiment budget
-- Establish eval reliability (variance across seeds)
+### Part 1 — Vision Model Dataset Track
 
-**Experiment 1 — Source Floor/Ceiling (Stage 1)**
-- Compare: VQAv2-only vs VQAv2 + COCO captions vs VQAv2 + PixelProse subset
-- Core tier only
-- Measures: does richer captioning data lift non-VQAv2 benchmarks?
+**Experiment 0A — VM Calibration Baseline**
+- Train the VM track on the current basic VQA dataset/captions setup
+- Establish baseline scores and standard Part 1 budget
+- Establish eval reliability before architecture/data branching
 
-**Experiment 2 — Research Tier Delta (Stage 1)**
-- Compare: best Core-tier mix from Exp 1 vs same + LLaVA-Instruct-150K (research tier)
-- Measures: how large is the research-tier advantage? Calibrates how much synthetic effort is needed to close the gap.
+**Experiment 1A — Vision Source Floor/Ceiling**
+- Compare: basic VQA dataset/captions baseline vs richer image-caption / image-text sources
+- Core tier first
+- Measures: does stronger visual-text signal lift non-VQAv2 benchmarks when the VM is the part being improved?
 
-**Experiment 3 — Quality Filtering (Stage 2)**
-- Take best source mix, apply quality filtering at 3 thresholds
-- Measures: is aggressive filtering worth it, or does our source selection already handle quality?
+**Experiment 2A — Text-Aligned Vision Training Delta**
+- Compare: same VM family with plain visual supervision vs more text-aligned visual supervision/mixes
+- Measures: whether text alignment is the key missing ingredient rather than raw image diversity alone
+
+**Experiment 3A — Research Tier Delta for VM**
+- Compare: best Core-tier Part 1 mix vs same + research-tier visual instruction/alignment data
+- Measures: how much ceiling is unlocked by research-only visual-text supervision
+
+### Part 2 — LM Dataset Track
+
+**Experiment 0B — LM Calibration Baseline**
+- Hold the best available VM fixed
+- Establish baseline scores and standard Part 2 budget
+- Establish eval reliability for LM-side data changes
+
+**Experiment 1B — LM Source Floor/Ceiling**
+- Compare: current LM baseline corpus vs improved text/multimodal-text mixes
+- Measures: whether LM-side corpus quality still gives large gains once the VM is no longer the obvious bottleneck
+
+**Experiment 2B — LM Quality Filtering**
+- Take the best LM-source mix and apply quality filtering at multiple thresholds
+- Measures: whether aggressive filtering or soft-dedup improves the LM-side data regime
+
+**Experiment 3B — Research Tier Delta for LM**
+- Compare: best Core-tier LM mix vs same + research-tier instruction/synthetic text data
+- Measures: how large the LM-side research-tier gap remains after VM improvements
 
 Subsequent experiments designed based on findings.
 
