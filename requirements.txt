@@ -2,3 +2,9 @@ matplotlib
 scikit-image
 numpy
 PyYAML
+duckdb
+transformers
+huggingface_hub
+safetensors
+open_clip_torch
+timm

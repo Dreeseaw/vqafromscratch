@@ -1,0 +1,709 @@
+{
+  "wiki_audit": {
+    "totals": {
+      "docs": 32168,
+      "word_count": 71298393,
+      "cleaned_chars": 445821543,
+      "sampled_windows": 122064
+    },
+    "sports_conservative": {
+      "docs": 845,
+      "word_count": 2408022,
+      "cleaned_chars": 14479722,
+      "sampled_windows": 3236,
+      "season_docs": 249,
+      "season_windows": 961,
+      "season_chars": 3112015
+    },
+    "sports_broad": {
+      "docs": 2956,
+      "word_count": 6978684,
+      "cleaned_chars": 42001808,
+      "sampled_windows": 11253,
+      "season_docs": 400,
+      "season_windows": 1504,
+      "season_chars": 4525042
+    },
+    "keyword_docs": [
+      [
+        "nfl",
+        157
+      ],
+      [
+        "american_football",
+        151
+      ],
+      [
+        "uefa_fifa",
+        95
+      ],
+      [
+        "baseball",
+        77
+      ],
+      [
+        "super_bowl",
+        73
+      ],
+      [
+        "ski_snow",
+        53
+      ],
+      [
+        "olympics",
+        46
+      ],
+      [
+        "surf_skate",
+        36
+      ],
+      [
+        "tennis",
+        36
+      ],
+      [
+        "cricket",
+        26
+      ],
+      [
+        "hockey",
+        25
+      ],
+      [
+        "grand_prix",
+        23
+      ],
+      [
+        "formula_one",
+        17
+      ],
+      [
+        "basketball",
+        16
+      ],
+      [
+        "rugby",
+        16
+      ]
+    ],
+    "keyword_windows": [
+      [
+        "nfl",
+        606
+      ],
+      [
+        "american_football",
+        580
+      ],
+      [
+        "uefa_fifa",
+        370
+      ],
+      [
+        "baseball",
+        305
+      ],
+      [
+        "super_bowl",
+        289
+      ],
+      [
+        "ski_snow",
+        195
+      ],
+      [
+        "olympics",
+        169
+      ],
+      [
+        "tennis",
+        139
+      ],
+      [
+        "surf_skate",
+        128
+      ],
+      [
+        "cricket",
+        100
+      ],
+      [
+        "hockey",
+        91
+      ],
+      [
+        "grand_prix",
+        81
+      ],
+      [
+        "formula_one",
+        68
+      ],
+      [
+        "rugby",
+        60
+      ],
+      [
+        "basketball",
+        50
+      ]
+    ],
+    "top_examples": [
+      {
+        "title": "Glossary of baseball terms",
+        "labels": [
+          "baseball"
+        ],
+        "sampled_windows": 4,
+        "cleaned_chars": 361970,
+        "season_like": false
+      },
+      {
+        "title": "European Cup and UEFA Champions League records and statistics",
+        "labels": [
+          "uefa_fifa"
+        ],
+        "sampled_windows": 4,
+        "cleaned_chars": 162435,
+        "season_like": false
+      },
+      {
+        "title": "Comparison of baseball and cricket",
+        "labels": [
+          "baseball",
+          "cricket"
+        ],
+        "sampled_windows": 4,
+        "cleaned_chars": 117297,
+        "season_like": false
+      },
+      {
+        "title": "Boxing",
+        "labels": [
+          "boxing_mma"
+        ],
+        "sampled_windows": 4,
+        "cleaned_chars": 95516,
+        "season_like": false
+      },
+      {
+        "title": "College football",
+        "labels": [
+          "american_football"
+        ],
+        "sampled_windows": 4,
+        "cleaned_chars": 93558,
+        "season_like": false
+      },
+      {
+        "title": "Olympic Games",
+        "labels": [
+          "olympics"
+        ],
+        "sampled_windows": 4,
+        "cleaned_chars": 84682,
+        "season_like": false
+      },
+      {
+        "title": "Super Bowl commercials",
+        "labels": [
+          "super_bowl"
+        ],
+        "sampled_windows": 4,
+        "cleaned_chars": 75498,
+        "season_like": false
+      },
+      {
+        "title": "1998 Winter Olympics",
+        "labels": [
+          "olympics"
+        ],
+        "sampled_windows": 4,
+        "cleaned_chars": 71537,
+        "season_like": false
+      },
+      {
+        "title": "Rugby union",
+        "labels": [
+          "rugby"
+        ],
+        "sampled_windows": 4,
+        "cleaned_chars": 69656,
+        "season_like": false
+      },
+      {
+        "title": "2022 FIFA World Cup",
+        "labels": [
+          "uefa_fifa"
+        ],
+        "sampled_windows": 4,
+        "cleaned_chars": 69431,
+        "season_like": true
+      },
+      {
+        "title": "Tennis",
+        "labels": [
+          "tennis"
+        ],
+        "sampled_windows": 4,
+        "cleaned_chars": 68231,
+        "season_like": false
+      },
+      {
+        "title": "Baseball",
+        "labels": [
+          "baseball"
+        ],
+        "sampled_windows": 4,
+        "cleaned_chars": 67011,
+        "season_like": false
+      },
+      {
+        "title": "Super Bowl",
+        "labels": [
+          "super_bowl"
+        ],
+        "sampled_windows": 4,
+        "cleaned_chars": 66505,
+        "season_like": false
+      },
+      {
+        "title": "2020 Summer Olympics",
+        "labels": [
+          "olympics"
+        ],
+        "sampled_windows": 4,
+        "cleaned_chars": 65289,
+        "season_like": false
+      },
+      {
+        "title": "Football",
+        "labels": [
+          "american_football"
+        ],
+        "sampled_windows": 4,
+        "cleaned_chars": 65125,
+        "season_like": false
+      },
+      {
+        "title": "Georgia Tech Yellow Jackets football",
+        "labels": [
+          "american_football"
+        ],
+        "sampled_windows": 4,
+        "cleaned_chars": 62621,
+        "season_like": false
+      },
+      {
+        "title": "Glossary of tennis terms",
+        "labels": [
+          "tennis"
+        ],
+        "sampled_windows": 4,
+        "cleaned_chars": 62517,
+        "season_like": false
+      },
+      {
+        "title": "2022 NFL season",
+        "labels": [
+          "nfl"
+        ],
+        "sampled_windows": 4,
+        "cleaned_chars": 61035,
+        "season_like": true
+      },
+      {
+        "title": "Formula One",
+        "labels": [
+          "formula_one"
+        ],
+        "sampled_windows": 4,
+        "cleaned_chars": 61021,
+        "season_like": false
+      },
+      {
+        "title": "Field hockey",
+        "labels": [
+          "hockey"
+        ],
+        "sampled_windows": 4,
+        "cleaned_chars": 60999,
+        "season_like": false
+      }
+    ]
+  },
+  "distill_audit": {
+    "available": true,
+    "total_examples": 102544,
+    "sports_examples_conservative": 2794,
+    "season_examples_conservative": 867,
+    "sports_share_conservative": 0.02724684038071462,
+    "season_share_conservative": 0.008454907161803714,
+    "sports_examples_broad": 9820,
+    "season_examples_broad": 1351,
+    "sports_share_broad": 0.09576376969886098,
+    "season_share_broad": 0.013174832267124357
+  },
+  "corpus_summary": {
+    "sports_doc_share_conservative": 0.026268341208654563,
+    "sports_word_share_conservative": 0.03377386079374889,
+    "sports_cleaned_char_share_conservative": 0.0324787400415058,
+    "sports_window_share_conservative": 0.02651068292043518,
+    "sports_season_doc_share_conservative": 0.00774061178811241,
+    "sports_doc_share_broad": 0.09189256403879632,
+    "sports_word_share_broad": 0.09787996203504895,
+    "sports_cleaned_char_share_broad": 0.0942121543013905,
+    "sports_window_share_broad": 0.09218934329532048,
+    "sports_season_doc_share_broad": 0.012434717731907486
+  },
+  "vqa_qtype": {
+    "num_val_questions": 214354,
+    "support_top10": [
+      [
+        "how many",
+        20462
+      ],
+      [
+        "is the",
+        17265
+      ],
+      [
+        "what",
+        15897
+      ],
+      [
+        "what color is the",
+        14061
+      ],
+      [
+        "what is the",
+        11353
+      ],
+      [
+        "none of the above",
+        8550
+      ],
+      [
+        "is this",
+        7841
+      ],
+      [
+        "is this a",
+        7492
+      ],
+      [
+        "what is",
+        6328
+      ],
+      [
+        "what kind of",
+        5840
+      ]
+    ],
+    "profiles": {
+      "what sport is": {
+        "support": 1086,
+        "support_rank": 44,
+        "num_unique_answers": 52,
+        "top_answers": [
+          [
+            "tennis",
+            334
+          ],
+          [
+            "baseball",
+            251
+          ],
+          [
+            "frisbee",
+            76
+          ],
+          [
+            "skateboarding",
+            76
+          ],
+          [
+            "soccer",
+            67
+          ],
+          [
+            "skiing",
+            66
+          ],
+          [
+            "surfing",
+            58
+          ],
+          [
+            "snowboarding",
+            48
+          ]
+        ],
+        "majority_answer": "tennis",
+        "majority_answer_share": 0.30755064456721914,
+        "official_constant_baseline": 0.3125230202578269
+      },
+      "what room is": {
+        "support": 762,
+        "support_rank": 59,
+        "num_unique_answers": 28,
+        "top_answers": [
+          [
+            "bathroom",
+            270
+          ],
+          [
+            "kitchen",
+            214
+          ],
+          [
+            "living room",
+            132
+          ],
+          [
+            "bedroom",
+            79
+          ],
+          [
+            "office",
+            23
+          ],
+          [
+            "dining room",
+            14
+          ],
+          [
+            "library",
+            3
+          ],
+          [
+            "hospital",
+            3
+          ]
+        ],
+        "majority_answer": "bathroom",
+        "majority_answer_share": 0.3543307086614173,
+        "official_constant_baseline": 0.36404199475065624
+      },
+      "what animal is": {
+        "support": 833,
+        "support_rank": 54,
+        "num_unique_answers": 88,
+        "top_answers": [
+          [
+            "cat",
+            114
+          ],
+          [
+            "dog",
+            98
+          ],
+          [
+            "giraffe",
+            85
+          ],
+          [
+            "horse",
+            76
+          ],
+          [
+            "elephant",
+            74
+          ],
+          [
+            "cow",
+            55
+          ],
+          [
+            "zebra",
+            43
+          ],
+          [
+            "bear",
+            42
+          ]
+        ],
+        "majority_answer": "cat",
+        "majority_answer_share": 0.1368547418967587,
+        "official_constant_baseline": 0.14609843937575026
+      }
+    }
+  },
+  "run_audit": [
+    {
+      "label": "original_vm",
+      "desc": "Original frozen VM frontier (Nail)",
+      "available": true,
+      "overall_accuracy": 0.4653,
+      "qtypes": {
+        "what sport is": {
+          "accuracy": null,
+          "support": 1086,
+          "in_top10": false
+        },
+        "what room is": {
+          "accuracy": null,
+          "support": 762,
+          "in_top10": false
+        },
+        "what animal is": {
+          "accuracy": null,
+          "support": 833,
+          "in_top10": false
+        }
+      },
+      "top_qtypes": {
+        "could": 0.784,
+        "is it": 0.732,
+        "was": 0.709,
+        "is this an": 0.707,
+        "does the": 0.7,
+        "do": 0.699,
+        "has": 0.698,
+        "do you": 0.695,
+        "are these": 0.695,
+        "does this": 0.694
+      }
+    },
+    {
+      "label": "mobilevit",
+      "desc": "MobileViT stage-1 comparable run",
+      "available": true,
+      "overall_accuracy": 0.524,
+      "qtypes": {
+        "what sport is": {
+          "accuracy": 0.831,
+          "support": 1086,
+          "in_top10": true
+        },
+        "what room is": {
+          "accuracy": 0.849,
+          "support": 762,
+          "in_top10": true
+        },
+        "what animal is": {
+          "accuracy": null,
+          "support": 833,
+          "in_top10": false
+        }
+      },
+      "top_qtypes": {
+        "what room is": 0.849,
+        "what sport is": 0.831,
+        "could": 0.779,
+        "was": 0.734,
+        "is it": 0.725,
+        "is this a": 0.711,
+        "are these": 0.711,
+        "does this": 0.706,
+        "is that a": 0.704,
+        "do": 0.703
+      }
+    },
+    {
+      "label": "mobileclip",
+      "desc": "MobileCLIP comparable run",
+      "available": true,
+      "overall_accuracy": 0.5603,
+      "qtypes": {
+        "what sport is": {
+          "accuracy": 0.877,
+          "support": 1086,
+          "in_top10": true
+        },
+        "what room is": {
+          "accuracy": 0.903,
+          "support": 762,
+          "in_top10": true
+        },
+        "what animal is": {
+          "accuracy": null,
+          "support": 833,
+          "in_top10": false
+        }
+      },
+      "top_qtypes": {
+        "what room is": 0.903,
+        "what sport is": 0.877,
+        "is it": 0.793,
+        "could": 0.785,
+        "was": 0.757,
+        "what color is": 0.744,
+        "is the person": 0.733,
+        "is this a": 0.73,
+        "are there": 0.73,
+        "what is the color of the": 0.73
+      }
+    },
+    {
+      "label": "dinov2s_dyn",
+      "desc": "DINOv2-S comparable run",
+      "available": true,
+      "overall_accuracy": 0.5323,
+      "qtypes": {
+        "what sport is": {
+          "accuracy": 0.88,
+          "support": 1086,
+          "in_top10": true
+        },
+        "what room is": {
+          "accuracy": 0.922,
+          "support": 762,
+          "in_top10": true
+        },
+        "what animal is": {
+          "accuracy": null,
+          "support": 833,
+          "in_top10": false
+        }
+      },
+      "top_qtypes": {
+        "what room is": 0.922,
+        "what sport is": 0.88,
+        "could": 0.767,
+        "is it": 0.743,
+        "was": 0.733,
+        "is this an": 0.721,
+        "is this a": 0.713,
+        "is that a": 0.712,
+        "are these": 0.707,
+        "does this": 0.704
+      }
+    },
+    {
+      "label": "dinov2s_nodyn",
+      "desc": "DINOv2-S frontier run",
+      "available": true,
+      "overall_accuracy": 0.5762,
+      "qtypes": {
+        "what sport is": {
+          "accuracy": 0.921,
+          "support": 1086,
+          "in_top10": true
+        },
+        "what room is": {
+          "accuracy": 0.945,
+          "support": 762,
+          "in_top10": true
+        },
+        "what animal is": {
+          "accuracy": null,
+          "support": 833,
+          "in_top10": false
+        }
+      },
+      "top_qtypes": {
+        "what room is": 0.945,
+        "what sport is": 0.921,
+        "is it": 0.825,
+        "could": 0.774,
+        "are there any": 0.774,
+        "are there": 0.764,
+        "was": 0.753,
+        "is there": 0.738,
+        "is this a": 0.736,
+        "is he": 0.735
+      }
+    }
+  ]
+}
