@@ -90,6 +90,18 @@ export function listRunLogSegments(runDir: string): RunLogSegment[] {
 }
 
 function classifyLogLine(line: string, currentStep: number | null) {
+  const dinoStep = line.match(/\[dino\]\s+step=(\d+)(?:\/\d+)?\s+epoch=\d+\/\d+/);
+  if (dinoStep) {
+    const step = Number(dinoStep[1]);
+    return { nextStep: step, lineStep: step, progressLike: true };
+  }
+
+  const siglipAlignStep = line.match(/\[siglip_align\]\s+step=(\d+)\s+phase_step=\d+\/\d+\s+epoch=\d+/);
+  if (siglipAlignStep) {
+    const step = Number(siglipAlignStep[1]);
+    return { nextStep: step, lineStep: step, progressLike: true };
+  }
+
   const mmStep = line.match(/\[mm\]\s+step=(\d+)/);
   if (mmStep) {
     const step = Number(mmStep[1]);
@@ -231,11 +243,18 @@ export function parseRunLog(runDir: string, options: { introLineCount?: number; 
     const text = readText(segment.fullPath);
     if (!text) continue;
 
+    const dinoParamsMatch = text.match(/\[dino\]\s+student params trainable=([\d,]+)\s+total=([\d,]+)/i);
+    if (dinoParamsMatch) {
+      trainableParams = Number(dinoParamsMatch[1].replaceAll(",", ""));
+      numParams = Number(dinoParamsMatch[2].replaceAll(",", ""));
+    }
     const trainableParamsMatch = text.match(/\btrainable_params=([\d,]+)/i);
     if (trainableParamsMatch) trainableParams = Number(trainableParamsMatch[1].replaceAll(",", ""));
     const totalParamsMatch = text.match(/\btotal_params=([\d,]+)/i) ?? text.match(/\bTotal params:\s*([\d,]+)/i);
     if (totalParamsMatch) numParams = Number(totalParamsMatch[1].replaceAll(",", ""));
     if (/\[mm\]\s+final checkpoint:\s+/m.test(text)) hasFinalCheckpoint = true;
+  if (/\[dino\]\s+done\s+global_step=\d+\s+checkpoint=.+/m.test(text)) hasFinalCheckpoint = true;
+    if (/\[siglip_align\]\s+done\s+global_step=\d+\s+phase_completed=\d+\s+checkpoint=.+/m.test(text)) hasFinalCheckpoint = true;
     if (/\beval_only=1\b/i.test(text) || /\btag=eval_only(?:_|$)/i.test(text)) isEvalOnly = true;
 
     let lastStepSeen: number | null = segment.resumeStep > 0 ? segment.resumeStep : null;
@@ -252,6 +271,38 @@ export function parseRunLog(runDir: string, options: { introLineCount?: number; 
         const loss = line.match(/\bloss=([0-9]*\.?[0-9]+)/);
         const ce = Number((lossCe ?? loss)?.[1] ?? NaN);
         const stepsPerSec = Number(mmStepsPerSec[1]);
+        if (Number.isFinite(ce)) {
+          trainPoints.set(lastStepSeen, {
+            ce,
+            stepsPerSec: Number.isFinite(stepsPerSec) ? stepsPerSec : null,
+          });
+        }
+        continue;
+      }
+
+      const dinoStep = line.match(/\[dino\]\s+step=(\d+)(?:\/\d+)?\s+epoch=\d+\/\d+\s+loss=([0-9]*\.?[0-9]+).*\bsteps_per_s=([0-9]*\.?[0-9]+)/);
+      if (dinoStep) {
+        finalizeEvalBlock(pendingEval, valAccPoints, valRatePoints, canonicalEvals);
+        pendingEval = null;
+        lastStepSeen = Number(dinoStep[1]);
+        const ce = Number(dinoStep[2]);
+        const stepsPerSec = Number(dinoStep[3]);
+        if (Number.isFinite(ce)) {
+          trainPoints.set(lastStepSeen, {
+            ce,
+            stepsPerSec: Number.isFinite(stepsPerSec) ? stepsPerSec : null,
+          });
+        }
+        continue;
+      }
+
+      const siglipAlignStep = line.match(/\[siglip_align\]\s+step=(\d+)\s+phase_step=\d+\/\d+\s+epoch=\d+\s+loss=([0-9]*\.?[0-9]+).*\bsteps_per_s=([0-9]*\.?[0-9]+)/);
+      if (siglipAlignStep) {
+        finalizeEvalBlock(pendingEval, valAccPoints, valRatePoints, canonicalEvals);
+        pendingEval = null;
+        lastStepSeen = Number(siglipAlignStep[1]);
+        const ce = Number(siglipAlignStep[2]);
+        const stepsPerSec = Number(siglipAlignStep[3]);
         if (Number.isFinite(ce)) {
           trainPoints.set(lastStepSeen, {
             ce,

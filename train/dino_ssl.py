@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import io
+import json
 import math
 import os
 import random
+import tarfile
 import time
 from dataclasses import asdict
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -88,14 +91,24 @@ class EpochShuffleSampler(torch.utils.data.Sampler[int]):
         self.data_source = data_source
         self.seed = int(seed)
         self.epoch = 1
+        self._skip_first_n = 0
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = max(1, int(epoch))
 
+    def skip_first_n(self, n: int) -> None:
+        """Skip the first n indices on the next iteration (for mid-epoch resume)."""
+        self._skip_first_n = max(0, int(n))
+
     def __iter__(self):
         g = torch.Generator()
         g.manual_seed(int(self.seed) + int(self.epoch))
-        yield from torch.randperm(len(self.data_source), generator=g).tolist()
+        indices = torch.randperm(len(self.data_source), generator=g).tolist()
+        skip = self._skip_first_n
+        self._skip_first_n = 0
+        if skip > 0:
+            indices = indices[skip:]
+        yield from indices
 
     def __len__(self) -> int:
         return len(self.data_source)
@@ -121,6 +134,156 @@ class RecursiveImageDataset(Dataset):
             items = items[: int(max_images)]
         if not items:
             raise FileNotFoundError(f"No images found under {self.root}")
+        self.items = items
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> List[torch.Tensor]:
+        path = self.items[int(idx)]
+        image = Image.open(path).convert("RGB")
+        return self.transform(image)
+
+
+def _extract_tar_subset(
+    archive_path: str,
+    members_needed: set[str],
+    staging_dir: str,
+) -> Dict[str, str]:
+    """Extract a subset of members from a tar(.gz) archive to staging_dir.
+
+    Returns mapping from archive member name to extracted filesystem path.
+    Skips members already extracted (cached).
+    """
+    os.makedirs(staging_dir, exist_ok=True)
+    result: Dict[str, str] = {}
+    still_needed: set[str] = set()
+    for m in members_needed:
+        dest = os.path.join(staging_dir, m)
+        if os.path.isfile(dest):
+            result[m] = dest
+        else:
+            still_needed.add(m)
+    if not still_needed:
+        return result
+
+    mode = "r:gz" if archive_path.endswith(".gz") else "r:"
+    with tarfile.open(archive_path, mode) as tf:
+        for member in tf:
+            if member.name in still_needed and member.isfile():
+                dest = os.path.join(staging_dir, member.name)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with tf.extractfile(member) as src:
+                    with open(dest, "wb") as dst:
+                        dst.write(src.read())
+                result[member.name] = dest
+                still_needed.discard(member.name)
+                if not still_needed:
+                    break
+    return result
+
+
+class MixedImageDataset(Dataset):
+    """DuckDB-backed dataset that mixes sources by percentage.
+
+    Keys in `mix` are source_name values from the DuckDB images table,
+    optionally qualified with a split as "source_name:split" (e.g. "coco_local:train2014").
+    Values are the percentage (0-100) of each source to use.
+    Supports filesystem paths and tar.gz archive paths (auto-extracted to staging).
+    """
+
+    def __init__(
+        self,
+        db_path: str,
+        mix: Dict[str, float],
+        transform: transforms.Compose,
+        *,
+        seed: int = 0,
+        max_images: int = 0,
+        staging_dir: str = "data/vm_ssl/staged/extracted",
+    ) -> None:
+        import duckdb
+
+        self.transform = transform
+        items: List[str] = []
+        self.source_counts: Dict[str, tuple[int, int, int]] = {}  # (total, selected, skipped_archive)
+
+        con = duckdb.connect(str(db_path), read_only=True)
+        try:
+            for mix_key, pct in sorted(mix.items()):
+                pct = float(pct)
+                if pct <= 0:
+                    continue
+                if pct > 100:
+                    raise ValueError(f"Percentage for '{mix_key}' is {pct}, must be <= 100")
+
+                # Parse optional "source_name:split" syntax
+                if ":" in mix_key:
+                    source_name, source_split = mix_key.split(":", 1)
+                    rows = con.execute(
+                        "SELECT local_path FROM valid_images "
+                        "WHERE source_name = ? AND source_split = ? ORDER BY image_id",
+                        [source_name, source_split],
+                    ).fetchall()
+                else:
+                    source_name = mix_key
+                    rows = con.execute(
+                        "SELECT local_path FROM valid_images WHERE source_name = ? ORDER BY image_id",
+                        [source_name],
+                    ).fetchall()
+
+                if not rows:
+                    available = [
+                        f"{r[0]}:{r[1]}" for r in con.execute(
+                            "SELECT DISTINCT source_name, source_split FROM images "
+                            "ORDER BY source_name, source_split"
+                        ).fetchall()
+                    ]
+                    raise ValueError(
+                        f"No valid images for '{mix_key}' in {db_path}. "
+                        f"Available: {available}"
+                    )
+
+                all_paths = [r[0] for r in rows]
+                total = len(all_paths)
+
+                # Deterministic subsample (per-key seed so adding sources is stable)
+                rng = random.Random(f"{seed}_{mix_key}")
+                indices = list(range(total))
+                rng.shuffle(indices)
+                keep = max(1, int(total * pct / 100.0))
+                selected_paths = [all_paths[i] for i in indices[:keep]]
+
+                # Resolve paths: filesystem vs archive
+                fs_paths: List[str] = []
+                archive_members: Dict[str, List[str]] = {}  # archive_path -> [member_name, ...]
+                for p in selected_paths:
+                    if "::" in p:
+                        archive, member = p.split("::", 1)
+                        archive_members.setdefault(archive, []).append(member)
+                    else:
+                        fs_paths.append(p)
+
+                # Extract archive members to staging
+                skipped = 0
+                for archive, members in archive_members.items():
+                    src_staging = os.path.join(staging_dir, source_name)
+                    extracted = _extract_tar_subset(archive, set(members), src_staging)
+                    for m in members:
+                        if m in extracted:
+                            fs_paths.append(extracted[m])
+                        else:
+                            skipped += 1
+
+                self.source_counts[mix_key] = (total, len(fs_paths), skipped)
+                items.extend(fs_paths)
+        finally:
+            con.close()
+
+        if int(max_images) > 0:
+            items = items[: int(max_images)]
+        if not items:
+            raise FileNotFoundError(f"No usable images for dataset mix from {db_path}")
         self.items = items
 
     def __len__(self) -> int:
@@ -410,6 +573,14 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("checkpoint", nargs="?", type=int)
     ap.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
     ap.add_argument("--data_dir", type=str, default="images/train2014")
+    ap.add_argument(
+        "--dataset_mix",
+        type=str,
+        default="",
+        help='JSON dict mapping source_name (from DuckDB) to %% of each to use, '
+             'e.g. \'{"coco_local": 80, "textocr": 100, "inat2021": 10}\'',
+    )
+    ap.add_argument("--db_path", type=str, default="data/vm_ssl/db/vm_ssl.duckdb")
     ap.add_argument("--max_images", type=int, default=0)
     ap.add_argument("--seed", type=int, default=35)
 
@@ -490,6 +661,17 @@ def build_models(args: argparse.Namespace, device: str) -> tuple[DINOStudentTeac
     return student, teacher
 
 
+def parse_json_object_arg(name: str, raw: object) -> dict[str, object]:
+    text = str(raw or "").strip()
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{name} must be a single valid JSON object string; got {text!r}") from exc
+    if not isinstance(value, dict) or not value:
+        raise ValueError(f"{name} must be a non-empty JSON object, got: {text!r}")
+    return value
+
+
 def run_training(args: argparse.Namespace) -> None:
     device = resolve_device(str(args.device))
     set_seed(int(args.seed))
@@ -505,7 +687,26 @@ def run_training(args: argparse.Namespace) -> None:
         local_crops_scale=tuple(float(x) for x in args.local_crops_scale),
         local_crops_number=int(args.local_crops_number),
     )
-    dataset = RecursiveImageDataset(str(args.data_dir), transform, max_images=int(args.max_images))
+    if args.dataset_mix:
+        mix = parse_json_object_arg("--dataset_mix", args.dataset_mix)
+        dataset = MixedImageDataset(
+            str(args.db_path), mix, transform, seed=int(args.seed), max_images=int(args.max_images),
+        )
+        logger.log(f"[dino] === effective dataset: {len(dataset)} images ===")
+        for src, (total, kept, skipped) in sorted(dataset.source_counts.items()):
+            pct_of_source = 100 * kept / total if total else 0
+            pct_of_dataset = 100 * kept / len(dataset) if len(dataset) else 0
+            line = (
+                f"[dino]   {src:30s}  {kept:>7d} / {total:>7d} "
+                f"({pct_of_source:5.1f}% of source, {pct_of_dataset:5.1f}% of dataset)"
+            )
+            if skipped:
+                line += f"  skipped_archive={skipped}"
+            logger.log(line)
+        logger.log(f"[dino] {'':30s}  {len(dataset):>7d} total")
+    else:
+        dataset = RecursiveImageDataset(str(args.data_dir), transform, max_images=int(args.max_images))
+        logger.log(f"[dino] === effective dataset: {len(dataset)} images from {args.data_dir} ===")
     sampler = EpochShuffleSampler(dataset, seed=int(args.seed))
     loader = DataLoader(
         dataset,
@@ -597,13 +798,16 @@ def run_training(args: argparse.Namespace) -> None:
     student.train()
     for epoch in range(int(start_epoch), int(args.epochs) + 1):
         sampler.set_epoch(epoch)
-        skip_batches = int(batch_in_epoch) if epoch == int(start_epoch) else 0
+        bidx_offset = 0
+        if epoch == int(start_epoch) and int(batch_in_epoch) > 0:
+            skip = int(batch_in_epoch) * int(args.batch_size)
+            sampler.skip_first_n(skip)
+            bidx_offset = int(batch_in_epoch)
+            logger.log(f"[dino] resuming epoch={epoch} skipping {batch_in_epoch} batches via sampler")
         if epoch != int(start_epoch):
             batch_in_epoch = 0
 
         for bidx, crops in enumerate(loader):
-            if bidx < skip_batches:
-                continue
             if global_step >= total_steps:
                 break
 
@@ -645,7 +849,7 @@ def run_training(args: argparse.Namespace) -> None:
             update_teacher(student, teacher, momentum=float(momentum))
 
             global_step += 1
-            batch_in_epoch = bidx + 1
+            batch_in_epoch = bidx + bidx_offset + 1
 
             with torch.no_grad():
                 student_std = feature_std(torch.cat([x["pooled"] for x in student_outputs], dim=0))

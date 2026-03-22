@@ -5,7 +5,7 @@
   "docsDir": "tasks/datasetting/docs",
   "scriptsDir": "tasks/datasetting/scripts",
   "logsDir": "logs",
-  "logPrefixes": ["ds_"],
+  "logPrefixes": ["ds_", "vm_dinovit_", "mm_dinovit_", "vm_recipev1_", "mm_recipev1_"],
   "default": false,
   "qaPromptHint": "Focus on dataset composition, license compliance, quality filtering pipelines, synthetic data generation, token budgets, and benchmark coverage gaps."
 }

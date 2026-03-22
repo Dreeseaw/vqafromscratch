@@ -48,6 +48,38 @@ Do not treat this as canonical state. Promote distilled conclusions into `DATASE
   - good deferred candidate
   - probably not part of the earliest baseline mix
 
+## 2026-03-18
+
+### VM Run Economics
+
+- The VM benchmark runs are expensive enough that this task has to be run like a screening tournament.
+- Current working estimate:
+  - about `~6 hours` for the VM stage at the present budget
+  - roughly `3` experiment families/day max in realistic use
+- Important implication:
+  - early runs must be high-entropy and source-isolating
+  - broad combinatorial sweeps are too wasteful unless a winner is already emerging
+- Another important note:
+  - the VM loss curve is still not flattened when these runs stop
+  - the downstream bridge/MM side also appears underconverged in some settings
+  - so all early comparisons should be interpreted as constrained-budget rankings, not claims about final ceiling
+
+### GQA vs VM Source Gap
+
+- Current feeling: `GQA` matters more as:
+  - downstream eval
+  - later supervised multimodal signal
+  - diagnostic slice for compositional reasoning
+- But `GQA` probably does **not** solve the most urgent missing piece in the raw VM SSL corpus.
+- The more obvious early missing pieces are still:
+  - scene-centric / layout-heavy imagery
+  - cluttered relation-rich scenes
+  - broader OCR-in-context street/storefront imagery
+- So if a new dataset gets added *before* more systematic mixing/filtering work, it should probably be one that expands those pixel regimes directly rather than adding GQA first.
+- Current one-dataset instinct:
+  - prefer an `ADE20K` / `Places365`-class scene-and-layout source before `GQA` for raw VM SSL
+  - if forced to choose one on "visual reasoning adjacency," `ADE20K` feels closer to the missing gap than `GQA` does for the image-only stage
+
 ### Current Meta Rule
 
 - Raw ideas go here first.

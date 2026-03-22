@@ -14,6 +14,9 @@ type RunSummary = {
   hasFinalCheckpoint: boolean;
   isEvalOnly: boolean;
   logfile: string | null;
+  runStage: "vm" | "mm" | "other";
+  experimentFamily: string | null;
+  pairedRunId: string | null;
 };
 
 type SweepSummary = {
@@ -257,6 +260,7 @@ const fmtNum = (v: number | null) => (Number.isFinite(v ?? NaN) ? String(v) : "-
 const fmtRate = (v: number | null) => (Number.isFinite(v ?? NaN) ? (v as number).toFixed(4) : "-");
 const fmtStepsPerSec = (v: number | null) => (Number.isFinite(v ?? NaN) ? (v as number).toFixed(2) : "-");
 const fmtPct = (v: number | null) => (Number.isFinite(v ?? NaN) ? `${(v as number).toFixed(1)}%` : "-");
+const fmtRunStage = (stage: RunSummary["runStage"]) => (stage === "vm" ? "VM" : stage === "mm" ? "MM" : "Run");
 const SHORT_DATE_TIME = new Intl.DateTimeFormat(undefined, {
   month: "short",
   day: "numeric",
@@ -1306,8 +1310,15 @@ function renderRuns(data: Bootstrap) {
   for (const run of pageRows) {
     const tr = document.createElement("tr");
     tr.className = run.runId === selectedRunId ? "is-selected clickable-row" : "clickable-row";
+    const badges = [
+      run.runStage !== "other" ? `<span class="run-badge mono">${fmtRunStage(run.runStage)}</span>` : "",
+      run.isEvalOnly ? '<span class="run-badge mono">Eval-only</span>' : "",
+      run.pairedRunId ? '<span class="run-badge mono">Paired</span>' : "",
+    ]
+      .filter(Boolean)
+      .join("");
     tr.innerHTML = `
-      <td><div class="run-name-cell"><code>${run.runId}</code>${run.isEvalOnly ? '<span class="run-badge mono">Eval-only</span>' : ""}</div></td>
+      <td><div class="run-name-cell"><code>${run.runId}</code>${badges}</div></td>
       <td>${fmtAcc(run.finalAccuracy)}</td>
       <td>${fmtAcc(run.lastTrainCe)}</td>
       <td>${fmtNum(run.lastStep)}</td>
@@ -1557,6 +1568,9 @@ function renderRunDetail(detail: RunDetail) {
   summary.className = "detail-grid";
   const cards = [
     ["Status", detail.run.isActive ? "active" : detail.run.isEvalOnly ? "eval-only" : detail.run.hasFinalCheckpoint ? "finished" : "idle"],
+    ["Stage", fmtRunStage(detail.run.runStage)],
+    ["Family", detail.run.experimentFamily ?? "-"],
+    ["Paired Run", detail.run.pairedRunId ?? "-"],
     ["Updated", fmtDateTime(detail.updatedAt, "full")],
     ["Final Acc", fmtAcc(detail.run.finalAccuracy)],
     ["Best Acc", fmtAcc(detail.run.bestAccuracy)],

@@ -352,6 +352,89 @@ def image_rows_from_cocotext_parquet(
     scan.close()
 
 
+def existing_artifact_member_paths(
+    conn: duckdb.DuckDBPyConnection,
+    artifact_name: str,
+) -> set[str]:
+    rows = conn.execute(
+        """
+        select member_path
+        from image_artifact_members
+        where artifact_name = ?
+        """,
+        [artifact_name],
+    ).fetchall()
+    return {row[0] for row in rows}
+
+
+def image_rows_from_cocotext_parquet_materialized(
+    root_dir: Path,
+    output_dir: Path,
+    artifact_name: str,
+    source_name: str,
+    target_split: str,
+    indexed_member_paths: set[str] | None = None,
+) -> Iterable[RowPayload]:
+    parquet_glob = str(root_dir / "data" / "*.parquet")
+    scan = duckdb.connect()
+    cur = scan.execute(
+        f"""
+        select image, coco_file_name, image_id, caption, ocr_tokens, ocr_info, image_width, image_height
+        from read_parquet('{parquet_glob}')
+        """
+    )
+    split_dir = output_dir / target_split
+    split_dir.mkdir(parents=True, exist_ok=True)
+    while True:
+        batch = cur.fetchmany(256)
+        if not batch:
+            break
+        for image, coco_file_name, image_id, caption, ocr_tokens, ocr_info, image_width, image_height in batch:
+            source_split = "train" if "train" in (coco_file_name or "").lower() else "validation"
+            if source_split != target_split:
+                continue
+            member_path = f"{target_split}/{coco_file_name}"
+            if indexed_member_paths is not None and member_path in indexed_member_paths:
+                continue
+            raw = image["bytes"]
+            out_path = split_dir / str(coco_file_name)
+            if not out_path.exists():
+                out_path.write_bytes(raw)
+            digest = sha256_bytes(raw)
+            text_area = 0.0
+            for item in ocr_info or []:
+                bbox = item.get("bounding_box") or {}
+                text_area += float(bbox.get("width", 0.0)) * float(bbox.get("height", 0.0))
+            image_area = max(int(image_width or 0) * int(image_height or 0), 1)
+            yield RowPayload(
+                image_id=f"{source_name}:{source_split}:{image_id}",
+                source_name=source_name,
+                source_native_id=str(image_id),
+                source_split=source_split,
+                source_path_or_url=str(out_path),
+                local_path=str(out_path),
+                sha256=digest,
+                width=int(image_width or 0),
+                height=int(image_height or 0),
+                aspect_ratio=(float(image_width) / float(image_height)) if image_height else 0.0,
+                file_size_bytes=len(raw),
+                decode_ok=True,
+                drop_reason=None,
+                artifact_name=artifact_name,
+                member_path=member_path,
+                source_record_json=json.dumps(
+                    {
+                        "coco_file_name": coco_file_name,
+                        "caption": caption,
+                    },
+                    sort_keys=True,
+                ),
+                ocr_token_count=len(ocr_tokens or []),
+                ocr_area_fraction=min(text_area / image_area, 1.0) if image_area else None,
+            )
+    scan.close()
+
+
 def flush_rows(conn: duckdb.DuckDBPyConnection, rows: list[RowPayload]) -> None:
     if not rows:
         return
@@ -534,7 +617,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--artifacts",
         nargs="+",
-        choices=["inat2021_train_mini", "textocr_full", "textocr_trainval", "coco_text_full", "coco_local"],
+        choices=[
+            "inat2021_train_mini",
+            "textocr_full",
+            "textocr_trainval",
+            "coco_text_full",
+            "coco_text_train_materialized",
+            "coco_local",
+        ],
         default=["inat2021_train_mini", "textocr_full"],
         help="Artifacts to index.",
     )
@@ -634,6 +724,32 @@ def main() -> int:
                 starting_count=len(indexed),
             )
             print(f"coco_text_full: finished indexing {count} images", flush=True)
+        elif artifact == "coco_text_train_materialized":
+            root = Path("data/vm_ssl/raw/coco_text_hf")
+            output_dir = Path("data/vm_ssl/raw/coco_text_materialized")
+            indexed = existing_artifact_member_paths(conn, "coco_text_train_materialized")
+            if indexed:
+                print(
+                    f"coco_text_train_materialized: resuming with {len(indexed)} members already materialized",
+                    flush=True,
+                )
+            count = index_stream(
+                conn,
+                image_rows_from_cocotext_parquet_materialized(
+                    root_dir=root,
+                    output_dir=output_dir,
+                    artifact_name="coco_text_train_materialized",
+                    source_name="coco_text",
+                    target_split="train",
+                    indexed_member_paths=indexed,
+                ),
+                artifact_name="coco_text_train_materialized",
+                source_name="coco_text",
+                batch_size=args.batch_size,
+                progress_every=args.progress_every,
+                starting_count=len(indexed),
+            )
+            print(f"coco_text_train_materialized: finished indexing {count} images", flush=True)
         elif artifact == "coco_local":
             root = Path("images")
             indexed = existing_member_paths(conn, "coco_local_images", "coco_local", "train2014")

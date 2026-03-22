@@ -1,20 +1,20 @@
 # Datasetting Manifesto
 
 **Date:** 2026-03-15
-**Scope:** Design the data plan for a param-efficient ~270M VLM, with separate tracks for strengthening the vision model and strengthening the language model while targeting strong score/param and score/FLOP on VQAv2, GQA, TextVQA, ChartQA, Winoground, and POPE.
+**Scope:** Design the pretraining recipe plan for a param-efficient ~270M VLM, with separate tracks for strengthening the vision model and strengthening the language model while targeting strong score/param and score/FLOP on VQAv2, GQA, TextVQA, ChartQA, Winoground, and POPE.
 
 ---
 
 ## 1. Core Thesis
 
-Small models are *disproportionately sensitive* to data quality. Every wasted token costs more at 270M params than at 7B. The goal is not "more data" but "denser signal per token."
+Small models are *disproportionately sensitive* to pretraining recipe quality. Every wasted image, caption, and update step costs more at 270M params than at 7B. The goal is not "more data" or "more tricks" but "denser signal per unit compute."
 
 The project is now more concretely aimed at a **param-efficient VLM** rather than an open-ended research program. The biggest lesson from `mm_bridge` is that the current self-trained VM is the weakest component. That shifts the center of gravity:
 
-- **Part 1:** vision-model dataset work, paired with stronger ViT-style vision backbones and more text-aligned vision training
+- **Part 1:** vision-model pretraining recipe work, pairing stronger ViT-style backbones with better image corpora, image-text corpora, and objective schedules
 - **Part 2:** LM dataset work, using the best available VM as the fixed visual front-end
 
-But we do not *know* which data is densest for our model. The manifesto's job is not to prescribe a recipe — it is to define a **research methodology** for discovering the right dataset through controlled experimentation, semantic tracking of findings, and progressive refinement.
+But we do not *know* which recipe is densest for our model. The manifesto's job is not to prescribe a single recipe upfront — it is to define a **research methodology** for discovering the right one through controlled experimentation, semantic tracking of findings, and progressive refinement.
 
 ---
 
@@ -26,6 +26,8 @@ But we do not *know* which data is densest for our model. The manifesto's job is
 | Text pretraining tokens | 5–6B |
 | Total project storage | ~1 TB (shared across all tasks: datasetting, mm_bridge, models, logs) |
 | GPU | 16 GB RTX 5080 (shared with mm_bridge) |
+| VM experiment wall-clock | ~6 hours for the VM stage at the current benchmark budget |
+| Practical throughput | ~3 full experiment families/day max in real use, and usually fewer if the machine is wanted for anything else |
 | Distillation models | >= 1B params provides solid annotation value (FineWeb finding) — Qwen2.5-1.5B/3B via Ollama on-device |
 
 **Licensing model: Separable Tiers**
@@ -47,8 +49,8 @@ All data must be tagged with its tier. Training configs must record which tiers 
 
 The experiment loop stays the same, but the project now splits into two linked parts:
 
-- **Part 1 — Vision Model Dataset Track**
-  We evaluate datasets for training a stronger VM. The LM side is held as fixed as possible, while the VM family can move toward more capable ViT-style architectures and more text-aligned vision training objectives.
+- **Part 1 — Vision Model Pretraining Track**
+  We evaluate pretraining recipes for a stronger VM. The LM side is held as fixed as possible, while the VM family can move toward more capable ViT-style architectures, better image corpora, stronger image-text corpora, and more text-aligned vision objectives.
 - **Part 2 — LM Dataset Track**
   We evaluate datasets for training the LM side. The VM is held fixed to the best available vision stack, and only the LM corpus/mix changes.
 
@@ -58,14 +60,25 @@ These are not two unrelated projects. The source inventory, filtering stack, syn
 
 Every dataset experiment still runs through a **fixed comparison instrument**, but the fixed component depends on which part is active.
 
-**Part 1 — Vision Model Dataset Track**
+**Part 1 — Vision Model Pretraining Track**
 
 - **Fixed pieces:** best available LM + bridge stack
-- **Variable piece:** VM training data and VM-family choices
+- **Variable piece:** VM pretraining recipe
+  - image-only corpora
+  - image-text corpora
+  - objective family
+  - objective schedule / curriculum
+  - checkpoint selection policy
 - **VM direction:** stronger ViT-style vision models and more text-aligned vision pretraining/alignment
 - **Starting baseline:** the basic VQA dataset/captions setup we already have now
   - specifically: VQAv2-style supervision plus the current captioning baseline
 - **Training budget per experiment:** fixed and small, enough to rank data choices and VM training recipes, not enough to fully converge
+- **Operational reality:** these VM runs are expensive and still under-flattened at stop time; the early goal is not full convergence, but extracting the highest-entropy ranking signal possible from a small number of costly runs
+- **Immediate program expansion:** allow one additional controlled axis beyond dataset choice:
+  - three-stage objective schedules such as `SSL-only -> SSL+SigLIP-style cross-training -> SigLIP-only alignment`
+  - stage 1 always happens; stage 2 or stage 3 may be `0`, but not both
+  - stage 2 currently starts with auxiliary DINO weight `0.5`, and the schedule should remain configurable because this is likely to become a real sweep axis
+  - potentially other local image-text objectives later, if they can be evaluated under the same downstream instrument
 
 **Part 2 — LM Dataset Track**
 
@@ -105,11 +118,14 @@ Each experiment follows this cycle:
 ```
 
 **Discipline rules:**
-- **One axis per experiment.** Don't change source AND filtering AND mix ratio simultaneously.
+- **One primary axis per experiment.** Do not wander across multiple uncontrolled changes. If a sweep intentionally studies an interaction (for example data mix x objective schedule), that interaction must be the explicit experiment design, not accidental drift.
 - **Always carry forward control.** The prior-best mix runs alongside every new variant. No re-baselining without explicit justification.
 - **Break down by benchmark.** A +0.02 overall that comes entirely from VQAv2 (which we train on directly) means something different from +0.02 spread across GQA and ChartQA.
 - **Record cost.** Wall-clock time, GPU hours, storage used. An improvement that 3x's the data pipeline cost needs to justify itself.
 - **Defer speculation.** List ideas that emerge but don't pursue them in the same experiment. They become candidates for the next one.
+- **Maximize entropy per run.** Because the VM stage is roughly a 6-hour commitment and practical throughput is only a few families per day, early sweeps should behave like tournament brackets, not exhaustive grids. Prefer decisive source-isolation comparisons and staged gating over wide combinatorial sweeps.
+- **Treat undertraining consistently.** Current VM and bridge curves are still climbing when runs stop. That is acceptable only if the stop rule is held fixed across compared families and results are interpreted as relative ranking under a shared constrained budget, not as absolute ceilings.
+- **Expand scope only where the coupling is real.** Data and objective are allowed to be studied together in Part 1 because they are theoretically entangled. Architecture and optimizer churn are not; they stay mostly fixed unless promoted to their own sweep.
 
 ### 3d. Semantic Progression — The Axes
 
@@ -119,6 +135,13 @@ Experiments are organized into progressive **stages**. Each stage builds on sett
 - Which raw sources give the best signal per token? (PixelProse vs CC3M re-captioned vs raw alt-text)
 - What's the floor — how does the current data (VQAv2-only, COCO captions) perform?
 - What's the ceiling — what do the best available sources achieve?
+
+**Stage 1b: Objective / Curriculum Selection**
+- DINO-only vs three-stage recipes such as `SSL-only -> SSL+SigLIP-style cross-training -> SigLIP-only alignment`
+- Where should image-text alignment happen, and on what data?
+- What fraction of the budget should be spent in image-only structure learning, mixed-pressure cross-training, and pure alignment?
+- How much auxiliary DINO pressure should remain alive during stage 2?
+- Does the best checkpoint occur at a phase boundary, not the terminal step?
 
 **Stage 2: Quality Filtering**
 - Does FineWeb-style educational quality scoring help for multimodal data?
@@ -145,7 +168,7 @@ Experiments are organized into progressive **stages**. Each stage builds on sett
 - Interleaving text-only and multimodal data vs separate phases?
 - Code inclusion: does structured code data help ChartQA/structured reasoning?
 
-For Part 1, these stages apply to **vision-training datasets** first: caption corpora, image-text alignment sources, VQA supervision, chart/doc visual corpora, and text-aligned synthetic vision data.
+For Part 1, these stages apply to **vision pretraining recipes** first: image-only corpora, caption corpora, image-text alignment sources, VQA supervision, chart/doc visual corpora, and text-aligned synthetic vision data.
 
 For Part 2, the same stages apply to **LM-side corpora**: text pretraining sources, instruction/VQA text mixtures, multimodal-text supervision balance, and synthetic reasoning/grounding text.
 
@@ -162,7 +185,7 @@ Before any dataset research, we need to calibrate both tracks.
 3. Eval all 6 benchmarks at each budget
 4. Identify where ranking signal stabilizes
 5. That becomes the standard Part 1 experiment budget
-6. This establishes the Part 1 floor that stronger VM data/training recipes must beat
+6. This establishes the Part 1 floor that stronger VM pretraining recipes must beat
 
 **Experiment 0B — Part 2 LM Baseline Calibration**
 
@@ -175,6 +198,27 @@ Before any dataset research, we need to calibrate both tracks.
 
 This is analogous to mm_bridge establishing its eval policy and comparison standard before running sweeps.
 
+### 3f. Required Part 1 Engineering
+
+Part 1 now requires a small amount of deliberate engineering to make the research loop honest.
+
+Minimum required work:
+
+- **Image-text pair registry**
+  - the DuckDB layer must track not just images, but linked captions/narratives/other text pairs
+- **Recipe-aware data loading**
+  - the VM path must be able to serve image-only batches, image-text batches, and mixed cross-training batches from the same canonical corpus registry
+- **Three-stage VM pretraining**
+  - support a clean `SSL-only -> SSL+SigLIP-style cross-training -> SigLIP-only alignment` schedule rather than pretending image-only SSL is the only legal training mode
+  - use a small from-scratch bidirectional text encoder rather than borrowing a large pretrained text tower
+- **Phase-aware logging and checkpointing**
+  - the run metadata must say where stage 1 ends, where stage 2 begins/ends, where stage 3 begins, and which checkpoint was used downstream
+- **Recipe-level launchers**
+  - the launcher surface must represent a VM recipe family cleanly enough that the tracker can display it without ambiguity
+  - the current main entrypoint should stay one-family-at-a-time; a broad sweep launcher is not required yet
+
+This work is not a distraction from the data task. It is part of the minimal research instrument now.
+
 ---
 
 ## 4. The Source Inventory
@@ -184,15 +228,22 @@ This is analogous to mm_bridge establishing its eval policy and comparison stand
 | Source | License | Type | Size Available | Estimated Storage | Status |
 |--------|---------|------|----------------|-------------------|--------|
 | **PixelProse** | CC-BY-4.0 | Image-caption pairs (dense, Gemini-generated) | 16.9M pairs | ~80 GB subset | Need to download |
+| **Localized Narratives (COCO-first)** | CC-BY-4.0 | Dense spoken-image descriptions | COCO-scale | Moderate | High value as SigLIP-style alignment source once indexed |
+| **TextCaps** | Research / benchmark usage | OCR-heavy image-caption pairs | ~28K images | ~9 GB | High value for text-aligned VM experiments |
+| **Flickr30k** | Research / benchmark usage | Clean natural-image captions | ~31K images | ~4.5 GB | Good compact alignment/control source |
 | **FineWeb-Edu** | CC-BY-4.0 | High-quality web text (educational score >= 3) | 1.3T tokens | ~5 GB for 500M tokens | Accessible |
 | **VQAv2 annotations** | CC-BY-4.0 | VQA pairs on COCO images | ~440K | ~25 GB (existing) | Already have |
-| **GQA** | CC-BY-4.0 | Compositional VQA (scene graphs) | ~22M Q&A | ~20 GB | Need to download |
+| **GQA** | CC-BY-4.0 | Compositional VQA (scene graphs) | ~22M Q&A | ~20 GB | High priority as eval / later MM supervision; lower priority as an *initial* VM SSL pixel source because its value is more reasoning structure than novel image distribution |
 | **Docmatix** | MIT | Document/chart VQA from PDFs | 2.4M images, 9.5M Q&A | ~50 GB subset | Need to subsample |
 | **RLAIF-V** | CC-BY-4.0 | Preference pairs for anti-hallucination | ~83K | ~1 GB | Need to download |
 | **Self-generated synthetic** | Ours | Charts, hard-negatives, distilled QA | Variable | ~10–20 GB | To build |
 | **COCO images** | Flickr per-image | Natural images | ~330K | ~25 GB (existing) | Already have |
 
 **Nemotron-CC v2.1:** Access not yet approved. Would be primary text source (organic High/Medium-High tiers). Until approved, FineWeb-Edu is the text pretraining source.
+
+**Important note on GQA for Part 1:** GQA should be treated mainly as a downstream benchmark, diagnosis source, and later supervised signal for multimodal training. It is not the first dataset to add purely for VM SSL if the goal is to expand the image distribution, because the win from GQA is mostly in its reasoning structure rather than in providing a broad new pixel regime.
+
+**Important note on image-text alignment for Part 1:** the project is no longer pretending that "dataset choice" and "loss methodology" are separable. A `DINO-only` corpus, a `DINO + cross-training` corpus, and a `DINO + cross-training + alignment-tail` corpus are different recipes. The correct frontier object for Part 1 is therefore a **VM pretraining recipe**, not just a bag of images.
 
 ### 4b. Research Tier (Separable, Non-Commercial)
 

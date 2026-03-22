@@ -4,6 +4,8 @@ import os from "os";
 import path from "path";
 import { parseRunLog, type SeriesPoint } from "./logstitch";
 
+type RunStage = "vm" | "mm" | "other";
+
 type RunSummary = {
   runId: string;
   runDir: string;
@@ -19,6 +21,9 @@ type RunSummary = {
   isEvalOnly: boolean;
   logfile: string | null;
   logfileMtimeMs: number | null;
+  runStage: RunStage;
+  experimentFamily: string | null;
+  pairedRunId: string | null;
 };
 
 type SweepSummary = {
@@ -66,6 +71,7 @@ type TaskConfigFile = {
   scriptsDir?: string;
   logsDir?: string;
   logPrefixes?: string[];
+  excludeLogPrefixes?: string[];
   default?: boolean;
   qaPromptHint?: string;
 };
@@ -81,6 +87,7 @@ type TaskContext = {
   scriptsRoot: string;
   logsRoot: string;
   logPrefixes: string[];
+  excludeLogPrefixes: string[];
   isDefault: boolean;
   qaPromptHint: string | null;
   taskFile: string;
@@ -505,6 +512,7 @@ function loadTasks(): TaskContext[] {
     const scriptsDir = assertRelativeDir(String(raw.scriptsDir ?? "").trim(), "scriptsDir", taskFile);
     const logsDir = assertRelativeDir(String(raw.logsDir ?? "").trim(), "logsDir", taskFile);
     const logPrefixes = parseTaskLogPrefixes(raw.logPrefixes);
+    const excludeLogPrefixes = parseTaskLogPrefixes(raw.excludeLogPrefixes);
     if (!id || !title) throw new Error(`${taskFile}: missing id/title`);
     const docsRoot = path.resolve(repoRoot, docsDir);
     const scriptsRoot = path.resolve(repoRoot, scriptsDir);
@@ -520,6 +528,7 @@ function loadTasks(): TaskContext[] {
       scriptsRoot,
       logsRoot,
       logPrefixes,
+      excludeLogPrefixes,
       isDefault: Boolean(raw.default),
       qaPromptHint: String(raw.qaPromptHint ?? "").trim() || null,
       taskFile,
@@ -548,10 +557,34 @@ function resolveTaskContext(taskId: string | null | undefined): TaskContext | nu
 }
 
 function taskIncludesLogName(task: TaskContext, name: string): boolean {
+  if (task.excludeLogPrefixes.some((prefix) => name.startsWith(prefix))) return false;
   return task.logPrefixes.length === 0 || task.logPrefixes.some((prefix) => name.startsWith(prefix));
 }
 
+function detectRunStage(runId: string): RunStage {
+  if (runId.startsWith("vm_")) return "vm";
+  if (runId.startsWith("mm_")) return "mm";
+  return "other";
+}
+
+function getExperimentFamily(runId: string): string | null {
+  const match = runId.match(/^(?:vm|mm)_(.+)$/);
+  return match ? match[1] : null;
+}
+
+function getPairedRunId(task: TaskContext, runId: string): string | null {
+  const family = getExperimentFamily(runId);
+  const stage = detectRunStage(runId);
+  if (!family || stage === "other") return null;
+  const counterpart = `${stage === "vm" ? "mm" : "vm"}_${family}`;
+  const full = path.join(task.logsRoot, counterpart);
+  return fs.existsSync(full) && fs.statSync(full).isDirectory() ? counterpart : null;
+}
+
 function parseRunSummary(task: TaskContext, runId: string): RunSummary {
+  const runStage = detectRunStage(runId);
+  const experimentFamily = getExperimentFamily(runId);
+  const pairedRunId = getPairedRunId(task, runId);
   if (!taskIncludesLogName(task, runId)) {
     return {
       runId,
@@ -568,6 +601,9 @@ function parseRunSummary(task: TaskContext, runId: string): RunSummary {
       isEvalOnly: false,
       logfile: null,
       logfileMtimeMs: null,
+      runStage,
+      experimentFamily,
+      pairedRunId,
     };
   }
   const runDir = path.join(task.logsRoot, runId);
@@ -586,6 +622,9 @@ function parseRunSummary(task: TaskContext, runId: string): RunSummary {
     isEvalOnly: false,
     logfile: null,
     logfileMtimeMs: null,
+    runStage,
+    experimentFamily,
+    pairedRunId,
   };
   if (!fs.existsSync(runDir) || !fs.statSync(runDir).isDirectory()) return out;
   const parsed = parseRunLog(runDir);
@@ -673,6 +712,9 @@ function mergeRunState(base: RunSummary, other: RunSummary): RunSummary {
     isEvalOnly: preferred.isEvalOnly || base.isEvalOnly || other.isEvalOnly,
     trainableParams: preferred.trainableParams ?? base.trainableParams ?? other.trainableParams,
     numParams: preferred.numParams ?? base.numParams ?? other.numParams,
+    runStage: preferred.runStage !== "other" ? preferred.runStage : base.runStage !== "other" ? base.runStage : other.runStage,
+    experimentFamily: preferred.experimentFamily ?? base.experimentFamily ?? other.experimentFamily,
+    pairedRunId: preferred.pairedRunId ?? base.pairedRunId ?? other.pairedRunId,
   };
 }
 
@@ -1463,7 +1505,7 @@ function resolveRunId(task: TaskContext, runId: string | null): string | null {
 }
 
 function formatRunForQa(run: RunSummary): string {
-  return `${run.runId}: final_acc=${fmtAcc(run.finalAccuracy)} best_acc=${fmtAcc(run.bestAccuracy)} last_train_ce=${fmtAcc(run.lastTrainCe)} last_step=${fmtNum(run.lastStep)} active=${run.isActive ? "yes" : "no"} eval_only=${run.isEvalOnly ? "yes" : "no"} params=${fmtNum(run.numParams)}`;
+  return `${run.runId}: stage=${run.runStage} family=${run.experimentFamily ?? "-"} paired=${run.pairedRunId ?? "-"} final_acc=${fmtAcc(run.finalAccuracy)} best_acc=${fmtAcc(run.bestAccuracy)} last_train_ce=${fmtAcc(run.lastTrainCe)} last_step=${fmtNum(run.lastStep)} active=${run.isActive ? "yes" : "no"} eval_only=${run.isEvalOnly ? "yes" : "no"} params=${fmtNum(run.numParams)}`;
 }
 
 function formatSweepForQa(sweep: SweepSummary): string {
