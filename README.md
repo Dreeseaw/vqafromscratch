@@ -5,7 +5,7 @@ This repo is my attempt at cracking into the [VQAv2 benchmark leaderboards](http
 
 ### Currently (as of 3/23/2026),
 - My best "from-scratch" score is 46.99%
-- My best "frozen HF VM" score is 61.63% (utilizing [google_siglip_base_patch16_224's](https://huggingface.co/google/siglip-base-patch16-224] richer training))
+- My best "frozen HF VM" score is 61.63% utilizing [google_siglip_base_patch16_224's](https://huggingface.co/google/siglip-base-patch16-224) richer training
 
 ### Constraints
 - All VMs (and some LMs) were trained on a Macbook Pro (M4 Pro, 24gb)
