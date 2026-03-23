@@ -2,23 +2,27 @@
 
 ## Artifact
 
-Current best single bridge checkpoint:
+Completed full-eval reference bridge checkpoint:
 
-- run: `mmcement_v1_20260316_siglip_cement_questiononly_s53`
-- peak checkpoint: [step_8000.tar](/home/wdree/percy/vqafromscratch/logs/mmcement_v1_20260316_siglip_cement_questiononly_s53/step_8000.tar)
-- peak val accuracy: `0.6203`
-- same-run final full eval at step 9000: `0.6082`
+- run: `mmcement_v1_20260316_siglip_cement_questiononly_s42`
+- full-eval checkpoint: [step_9000.tar](/home/wdree/percy/vqafromscratch/logs/mmcement_v1_20260316_siglip_cement_questiononly_s42/step_9000.tar)
+- full-eval val accuracy: `0.6163`
+
+Important Cement caveat:
+
+- `mmcement_v1_20260316_siglip_cement_questiononly_s53` hit `0.6203` at [step_8000.tar](/home/wdree/percy/vqafromscratch/logs/mmcement_v1_20260316_siglip_cement_questiononly_s53/step_8000.tar)
+- that `0.6203` number came from a periodic mini-eval, not the completed final full eval
+- the same run finished at `0.6082` on the final full eval at step `9000`
 
 Primary source logs:
 
+- [logfile.txt](/home/wdree/percy/vqafromscratch/logs/mmcement_v1_20260316_siglip_cement_questiononly_s42/logfile.txt)
 - [logfile.txt](/home/wdree/percy/vqafromscratch/logs/mmcement_v1_20260316_siglip_cement_questiononly_s53/logfile.txt)
 - [43_cement_sweep_report_2026-03-17.md](/home/wdree/percy/vqafromscratch/tasks/mm_bridge/docs/43_cement_sweep_report_2026-03-17.md)
 
-This report treats `step_8000.tar` as the current champion because Cement established that the `s53` run peaked at step `8000`, not `9000`.
-
 ## System Summary
 
-This model is the Cement winner:
+This model family is the Cement winner:
 
 - frozen `SigLIP-B/16` vision tower
 - `perceiver_resampler` bridge with depth `3`
@@ -40,7 +44,7 @@ Relevant runtime lines from the winning run:
 
 ## Parameter Breakdown
 
-Counts below were taken from the actual champion checkpoint after applying its real freeze configuration.
+Counts below were taken from the completed full-eval reference configuration after applying its real freeze configuration.
 
 | Component | Total Params | Trainable | Frozen |
 |---|---:|---:|---:|
@@ -63,28 +67,21 @@ Interpretation:
 
 ## Performance Snapshot
 
-Peak checkpoint metrics at step `8000`:
+Full-eval reference metrics at step `9000` (`s42`):
 
 | Metric | Value |
 |---|---:|
-| Overall | `0.6203` |
-| Yes/No | `0.7693` |
-| Number | `0.4586` |
-| Other | `0.5534` |
+| Overall | `0.6163` |
+| Yes/No | `0.7589` |
+| Number | `0.4573` |
+| Other | `0.5499` |
 
-Training state at the peak checkpoint line:
+For context only, the best observed periodic mini-eval was:
 
-- step `8000`
-- loss `0.5441`
-- LR `3.58757e-05`
-- train throughput `3.28 steps/s`
+- `s53 step_8000 -> 0.6203`
+- this should be treated as an optimization diagnostic / peak snapshot, not the final benchmark anchor
 
-The same run drifted downward after the peak:
-
-- periodic eval at step `9000`: `0.6113`
-- final full eval at step `9000`: `0.6082`
-
-So for this model family, “best checkpoint” and “last checkpoint” are materially different. Future frontier comparisons should preserve the peak checkpoint, not just the terminal one.
+So for this model family, periodic mini-eval peaks and final full-eval checkpoints are materially different. Future benchmark comparisons should use the completed full-eval references, not the intermediate mini-eval peak.
 
 ## Why This Model Won
 
@@ -114,15 +111,16 @@ The key practical implication is that this champion is a real multimodal model, 
 
 ## Baseline Status
 
-This checkpoint should be treated as the current reference baseline for future VM and LM swaps when the goal is “beat the best bridge system we have right now.”
+This checkpoint should be treated as the current reference baseline for future VM and LM swaps when the goal is “beat the best completed bridge system we have right now.”
 
 Recommended reference artifact:
 
-- [step_8000.tar](/home/wdree/percy/vqafromscratch/logs/mmcement_v1_20260316_siglip_cement_questiononly_s53/step_8000.tar)
+- [step_9000.tar](/home/wdree/percy/vqafromscratch/logs/mmcement_v1_20260316_siglip_cement_questiononly_s42/step_9000.tar)
 
 Recommended comparison rule:
 
-- compare against the peak `0.6203`, not the terminal `0.6082`
+- compare against completed full-eval references first
+- if you mention `0.6203`, label it explicitly as the `s53 step_8000` mini-eval peak
 - keep the Cement bridge stack fixed unless the run is explicitly testing a bridge change
 
 ## Bottom Line
@@ -133,4 +131,4 @@ The current champion is a `160.5M`-parameter system with:
 - a `21.4M` fully trainable bridge stack
 - a `46.2M` LM side, of which `19.9M` is trainable
 
-Its best observed checkpoint reaches `0.6203` on VQAv2 val. The model wins by combining a strong frozen VM with a simple, stable, question-only attention-query bridge and modest LM-side multimodal adapters, not by aggressive token routing or deeper architectural novelty.
+Its best completed full-eval reference reaches `0.6163` on VQAv2 val, while the same family reached a higher `0.6203` mini-eval peak on a different seed/checkpoint. The model wins by combining a strong frozen VM with a simple, stable, question-only attention-query bridge and modest LM-side multimodal adapters, not by aggressive token routing or deeper architectural novelty.

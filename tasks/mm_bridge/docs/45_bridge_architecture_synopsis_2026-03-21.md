@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This note summarizes the bridge line from the late fixed-VM bridge sweeps through the current Cement champion, with emphasis on:
+This note summarizes the bridge line from the late fixed-VM bridge sweeps through the current Cement frontier, with emphasis on:
 
 - what changed architecturally
 - why those changes helped or failed
@@ -32,7 +32,7 @@ The current best system was not produced by one giant invention. It was produced
 | Nail | `lmmeanqquery_dynbudget_adapter_d3_cap64` | `0.4653` | query quality matters more than bigger bridge budget |
 | Plank | `mobilevit_attnqquery_dynbudget_adapter_d3_cap64` | `0.5240` | better VM lifts everything more than extra bridge cleverness |
 | Crane | `dinov2s_attnqquery_nodynbudget_adapter_d3` | `0.5762` | dense visual memory beats hard token pruning |
-| Cement | `siglip_cement_questiononly_s53` peak `step_8000` | `0.6203` | `question_only` beats `prompt_only` in the stabilized champion family |
+| Cement | `question_only` SigLIP full-eval reference | `0.6129` mean final / `0.6163` best completed single run | `question_only` beats `prompt_only` in the stabilized SigLIP family |
 
 The important point is that each frontier shift changed the interpretation of the bottleneck:
 
@@ -239,8 +239,10 @@ Cement stopped doing wide exploration and instead asked a narrow, high-value que
 Result:
 
 - `question_only` beat `prompt_only` at all 3 matched seeds
-- mean peak: `0.6174` vs `0.6119`
-- best single run: `0.6203` at `step_8000`
+- mean final full eval: `0.6129` vs `0.6099`
+- mean best-checkpoint peak: `0.6174` vs `0.6119`
+- best completed single run: `0.6163` at `s42 step_9000`
+- higher periodic mini-eval peak: `0.6203` at `s53 step_8000` (not the final benchmark anchor)
 
 Why `question_only` wins is straightforward:
 
@@ -272,7 +274,7 @@ Current champion:
 - perceiver bridge depth `3`
 - no dynbudget
 - LM adapters depth `3`
-- peak `0.6203`
+- full-eval reference `0.6129` mean, `0.6163` best completed single run
 
 This is a balanced system:
 
@@ -333,7 +335,7 @@ Better visual memory retention
 
 Cleaner question context in the best family
   Cement
-    -> 0.6203 peak / 0.6174 mean frontier
+    -> 0.6129 mean final full eval
 ```
 
 ## Bottom Line
