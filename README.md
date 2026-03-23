@@ -1,11 +1,11 @@
 VQA From Scratch
 ===================
 
-This repo is my attempt at cracking into the (VQAv2 benchmark leaderboards)[https://eval.ai/web/challenges/challenge-page/830/overview]i with merely a Macbook Pro* and a gaming PC halfway through the project. It comprises of a VAE, decoder-only LM (+ BPE tokenizer), and bridge module to project the VAE's spatial latent into visual tokens for the LM's usage. It also contains scripts for probing/evaluations, wikipedia scraping/cleaning/tokenization/distillation into QA-format, imagery pipelines (image, image-text, image-point), and web application for monitoring all these types of training runs + a few for visual learning of representations (see: gaus). 
+This repo is my attempt at cracking into the [VQAv2 benchmark leaderboards](https://eval.ai/web/challenges/challenge-page/830/overview) with merely a Macbook Pro and a gaming PC halfway through the project. It comprises of a VAE, decoder-only LM (+ BPE tokenizer), and bridge module to project the VAE's spatial latent into visual tokens for the LM's usage. It also contains scripts for probing/evaluations, wikipedia scraping/cleaning/tokenization/distillation into QA-format, imagery pipelines (image, image-text, image-point), and web application for monitoring all these types of training runs + a few for visual learning of representations (see: gaus). 
 
 ### Currently (as of 3/23/2026),
 - My best "from-scratch" score is 46.99%
-- My best "frozen HF VM" score is 61.63% (utilizing (google_siglip_base_patch16_224's)[https://huggingface.co/google/siglip-base-patch16-224] richer training)
+- My best "frozen HF VM" score is 61.63% (utilizing [google_siglip_base_patch16_224's](https://huggingface.co/google/siglip-base-patch16-224] richer training))
 
 ### Constraints
 - All VMs (and some LMs) were trained on a Macbook Pro (M4 Pro, 24gb)
@@ -16,6 +16,7 @@ This repo is my attempt at cracking into the (VQAv2 benchmark leaderboards)[http
 ## Visual Modeling (VAE -> ViTVAE -> DinoViT -> DinoLipVit)
 
 ### Grabbing MSCoCo (VAE training, VQA visual component)
+
 ```bash
 > mkdir Images && cd Images
 > curl -OJL images.cocodataset.org/zips/train2014.zip
@@ -44,6 +45,7 @@ This repo is my attempt at cracking into the (VQAv2 benchmark leaderboards)[http
 ```
 
 ### Running loss logging web app
+
 To visualize the training process a bit better, codex wrote a nice little
 bun web app for us to track experiments in both real time and reload old ones.
 
@@ -54,6 +56,7 @@ and navigate to `localhost:3000` in your browser. Multiple instances can be run 
 
 
 ### Probing
+
 Linear probes on mu are used to test downstream task efficiency. Multiple probes may be run in parallel and share the same batch, making them almost 2x as fast when running 3 in parallel, relative to 3 sequential runs.
 
 ```bash
@@ -61,8 +64,8 @@ Linear probes on mu are used to test downstream task efficiency. Multiple probes
 > python3 -m evals.probe --ckpts logs/model1/step_10001.tar logs/model2/step_10001.tar --use_mu --multi_mode=lockstep
 ```
 
-Create mp4 of step_nnn.png's 
-----------------------------
+### Create mp4 of step_nnn.png's 
+
 This was cooler when my goal was focused on pretty reconstructions.
 
 ```bash
