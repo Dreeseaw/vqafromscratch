@@ -202,6 +202,7 @@ def main() -> None:
                 continue
 
             sample_q = per_query[i]
+            attended_token_count = int(sample_q.shape[-1])
             combined = sample_q.mean(axis=0)
             combined_grid = _reshape_token_map(combined)
             per_query_grids = np.stack([_reshape_token_map(q) for q in sample_q], axis=0)
@@ -213,6 +214,7 @@ def main() -> None:
                 {
                     "per_query_maps": torch.from_numpy(per_query_grids),
                     "combined_map": torch.from_numpy(combined_grid),
+                    "attended_token_count": attended_token_count,
                     "visual_token_count": int(visual_tokens.shape[1]),
                 },
                 os.path.join(bucket_dir, f"{stem}.pt"),
@@ -225,6 +227,7 @@ def main() -> None:
                     "question": batch["questions"][i],
                     "prediction": pred_text,
                     "accuracy": accuracy,
+                    "attended_token_count": attended_token_count,
                     "visual_token_count": int(visual_tokens.shape[1]),
                     "overlay_path": os.path.join(bucket_dir, f"{stem}.png"),
                     "tensor_path": os.path.join(bucket_dir, f"{stem}.pt"),

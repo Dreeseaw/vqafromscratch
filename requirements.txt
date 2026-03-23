@@ -3,6 +3,11 @@ scikit-image
 numpy
 PyYAML
 duckdb
+ijson
+datasets
+decord
+pyarrow
+tqdm
 transformers
 huggingface_hub
 safetensors

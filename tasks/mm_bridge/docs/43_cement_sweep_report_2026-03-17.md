@@ -37,7 +37,7 @@ All 6 runs completed at 9k steps, b96a2, warmup=600, SigLIP-B/16. Only `bridge_q
 
 **question_only wins.** It beats prompt_only at all 3 matched seeds (peak), has lower seed variance (σ 0.0026 vs 0.0029), and lifts all three answer types uniformly. Per the decision rule from doc 41, tie goes to question_only for its engineering advantage (no autoregressive dependency in query generation) — but this isn't a tie, it's a clean win.
 
-**New frontier: 0.6174 (question_only, mean of 3 seeds). Best single run: 0.6203 (s53).**
+**Peak frontier: 0.6174 (question_only, mean of best-checkpoint-per-seed). Completed full-eval mean: 0.6129. Best completed single run: 0.6163 (s42 step 9000).**
 
 Note on peaks vs finals: s53 and s97 in both arms peak at step 8000, not 9000. The LR schedule is still declining usefully at 9k but some seeds slightly overfit or drift in the last 1k steps. For future sweeps, consider evaluating at both 8k and 9k.
 
@@ -45,7 +45,7 @@ Note on peaks vs finals: s53 and s97 in both arms peak at step 8000, not 9000. T
 
 ## Tier 2: Oracle Diagnostics
 
-All diagnostics run on the question_only s42 checkpoint (step 9000, acc 0.6174 on clean eval).
+All diagnostics run on the question_only s42 checkpoint (step 9000, final full eval `0.6163`).
 
 ### 2A: Visual Sufficiency
 

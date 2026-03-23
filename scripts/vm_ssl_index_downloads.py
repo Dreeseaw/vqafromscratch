@@ -624,6 +624,7 @@ def parse_args() -> argparse.Namespace:
             "coco_text_full",
             "coco_text_train_materialized",
             "coco_local",
+            "gqa_images",
         ],
         default=["inat2021_train_mini", "textocr_full"],
         help="Artifacts to index.",
@@ -772,6 +773,28 @@ def main() -> int:
                 starting_count=len(indexed),
             )
             print(f"coco_local: finished indexing {count} images", flush=True)
+        elif artifact == "gqa_images":
+            root = Path("data/gqa/raw_images")
+            indexed = existing_member_paths(conn, "gqa_images_zip", "gqa", "all")
+            if indexed:
+                print(f"gqa_images_zip: resuming with {len(indexed)} members already indexed", flush=True)
+            count = index_stream(
+                conn,
+                image_rows_from_directory(
+                    root_dir=root,
+                    artifact_name="gqa_images_zip",
+                    source_name="gqa",
+                    source_split="all",
+                    relative_glob="images/*",
+                    indexed_member_paths=indexed,
+                ),
+                artifact_name="gqa_images_zip",
+                source_name="gqa",
+                batch_size=args.batch_size,
+                progress_every=args.progress_every,
+                starting_count=len(indexed),
+            )
+            print(f"gqa_images: finished indexing {count} images", flush=True)
         else:
             raise ValueError(f"unsupported artifact: {artifact}")
     return 0

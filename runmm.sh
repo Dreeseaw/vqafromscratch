@@ -1,6 +1,8 @@
 #!/bin/bash
 set -e
 
+source "$(cd "$(dirname "$0")" && pwd)/scripts/runtime_exec.sh"
+
 RUN_ID="$1"
 if [[ -z "${RUN_ID}" ]]; then
   echo "Usage: $0 <run_id> [checkpoint_step] [extra mm args...]"
@@ -26,7 +28,7 @@ else
 fi
 
 CMD=(
-  python -m train.mm "$RUN_ID"
+  -m train.mm "$RUN_ID"
   --auto_download
   --no-download_images
   --images_root images
@@ -39,9 +41,7 @@ if [[ -n "${CKPT_STEP}" ]]; then
   CMD+=(--checkpoint "$CKPT_STEP")
 fi
 
-docker run --rm --gpus all --ipc=host \
-  -e PYTORCH_ENABLE_MPS_FALLBACK=1 \
-  -v "$(pwd)":/app -w /app myrepo:gpu \
+runtime_exec_python \
   "${CMD[@]}" \
   --vision_model=vae --vision_checkpoint=logs/vm_base2/step_15001.tar --lm_checkpoint=logs/lm_final/step_45000.tar \
   --batch_size=256 --epochs=10 --eval_every=0 --eval_batches=0 --limit_eval=0 --eval_scorer=official \

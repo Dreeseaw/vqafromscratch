@@ -1,8 +1,21 @@
 VQA From Scratch
 ===================
 
-Grabbing MSCoCo (VAE training, VQA visual component)
-----------------------------------------------------
+This repo is my attempt at cracking into the (VQAv2 benchmark leaderboards)[https://eval.ai/web/challenges/challenge-page/830/overview]i with merely a Macbook Pro* and a gaming PC halfway through the project. It comprises of a VAE, decoder-only LM (+ BPE tokenizer), and bridge module to project the VAE's spatial latent into visual tokens for the LM's usage. It also contains scripts for probing/evaluations, wikipedia scraping/cleaning/tokenization/distillation into QA-format, imagery pipelines (image, image-text, image-point), and web application for monitoring all these types of training runs + a few for visual learning of representations (see: gaus). 
+
+### Currently (as of 3/23/2026),
+- My best "from-scratch" score is 46.99%
+- My best "frozen HF VM" score is 61.63% (utilizing (google_siglip_base_patch16_224's)[https://huggingface.co/google/siglip-base-patch16-224] richer training)
+
+### Constraints
+- All VMs (and some LMs) were trained on a Macbook Pro (M4 Pro, 24gb)
+- The final set of LMs + all bridges were trained on a gaming PC (12 core, 32gb, RTX 5080 (16gb VRAM))
+- "from-scratch" = everything but the COCO datasets: fielding imagery data was too big of a ticket price for me
+
+
+## Visual Modeling (VAE -> ViTVAE -> DinoViT -> DinoLipVit)
+
+### Grabbing MSCoCo (VAE training, VQA visual component)
 ```bash
 > mkdir Images && cd Images
 > curl -OJL images.cocodataset.org/zips/train2014.zip
@@ -16,8 +29,7 @@ Grabbing MSCoCo (VAE training, VQA visual component)
 (repeat similar process with Annotations)
 ```
 
-Training
---------
+### VAE Training
 ```bash
 (one time)
 > pyenv virtualenv 3.10.14 vqa
@@ -31,8 +43,7 @@ Training
 > ./run.sh <run_id> (<checkpoint step to begin from>)
 ```
 
-Running loss logging web app
-----------------------------
+### Running loss logging web app
 To visualize the training process a bit better, codex wrote a nice little
 bun web app for us to track experiments in both real time and reload old ones.
 
@@ -41,106 +52,14 @@ bun web app for us to track experiments in both real time and reload old ones.
 ```
 and navigate to `localhost:3000` in your browser. Multiple instances can be run for tab-by-tab comparisons.
 
-Auto-Research Progress Tracker
-------------------------------
-Minimal Bun + HTML/TS/CSS dashboard that works off task configs under `tasks/*/task.json`.
-Each task can point at its own:
-- docs directory
-- task-owned scripts directory
-- logs directory
 
-Current MM bridge task assets live under:
-- `tasks/mm_bridge/docs/*.md`
-- `tasks/mm_bridge/scripts/*`
-
-```bash
-bun run tracker/research/researchtrackerapp.ts -p 4090 --task mm_bridge
-```
-
-Open `http://localhost:4090/?task=mm_bridge`.
-For markdown-only view in a separate tab:
-- `http://localhost:4090/doc?task=mm_bridge&file=<doc_name>.md`
-
-
-Probing
--------
+### Probing
 Linear probes on mu are used to test downstream task efficiency. Multiple probes may be run in parallel and share the same batch, making them almost 2x as fast when running 3 in parallel, relative to 3 sequential runs.
 
 ```bash
 > python3 -m evals.probe --ckpt logs/sl_d2_b01/step_10001.tar --use_mu
 > python3 -m evals.probe --ckpts logs/model1/step_10001.tar logs/model2/step_10001.tar --use_mu --multi_mode=lockstep
 ```
-
-Multimodal Bridge Diagnostics
------------------------------
-Docker-first checkpoint diagnostics for the frozen-bridge VQA setup:
-- image perturbation sensitivity (`clean`, `shuffle`, `zero`, `noise`, `fixed_image`)
-- accuracy deltas vs clean
-- prediction agreement vs clean
-- visual-prefix geometry stats
-
-```bash
-./tasks/mm_bridge/scripts/run_mm_diag.sh mmdiag_example \
-  --checkpoint logs/mmbr_basesweep_on_high/step_3466.tar \
-  --max_batches 80 \
-  --stats_batches 40 \
-  --batch_size 256 \
-  --modes clean,shuffle,zero,noise,fixed_image \
-  --noise_std 0.2
-```
-
-Outputs are written to:
-- `logs/<diag_run_id>/diag_report.json`
-- `logs/<diag_run_id>/diag_report.md`
-
-Prefix Calibration Sweep (MM Training)
---------------------------------------
-Shortened iterative training sweep for calibrated bridge interface:
-
-```bash
-./tasks/mm_bridge/scripts/launch_prefix_calib_sweep.sh
-```
-
-Key new MM flags:
-- `--prefix_calibration`
-- `--prefix_calib_layernorm`
-- `--prefix_calib_bias`
-- `--prefix_calib_gate_init`
-- `--prefix_norm_target_ratio`
-- `--prefix_norm_reg_weight`
-- `--prefix_batchvar_reg_weight`
-
-Next-Gen Bridge Sweep (Night Plan)
-----------------------------------
-Architecture-focused sequential sweep (Docker via `runmm.sh`) covering:
-- learned-query cross-attention reducer
-- spatial mixer before reduction
-- hybrid constant + image prefix
-- perceiver-style resampler
-- q-former-lite bridge
-
-Launch:
-```bash
-./tasks/mm_bridge/scripts/launch_night_bridge_sweep_v1.sh
-```
-
-Common bridge flags:
-- `--bridge_type {mlp,learned_tokens,learned_query,perceiver_resampler,qformer_lite,hybrid_const_image}`
-- `--bridge_num_heads`
-- `--bridge_query_depth`
-- `--bridge_refine_layers`
-- `--bridge_pre_mixer_type {none,self_attn,conv1d}`
-- `--bridge_pre_mixer_layers`
-- `--bridge_hybrid_alpha_mode {scalar,token}`
-- `--bridge_hybrid_alpha_init`
-- `--bridge_hybrid_image_bridge_type {mlp,learned_query,perceiver_resampler,qformer_lite}`
-
-Throughput knobs (night sweeps):
-- `--precision bf16` (recommended on modern NVIDIA GPUs)
-- `--batch_size`, `--grad_accum_steps`
-- `--num_workers`, `--prefetch_factor`
-- `--vision_device {auto,cpu,cuda,mps}` (CPU vision is supported but usually slower end-to-end)
-
 
 Create mp4 of step_nnn.png's 
 ----------------------------
@@ -153,8 +72,8 @@ ffmpeg -y -r 30 -f concat -safe 0 -i frames.txt \
   -c:v libx264 -pix_fmt yuv420p -crf 18 out.mp4
 ```
 
-Gaussian Visualizaton app
--------------------------
+### Gaussian Visualizaton app
+
 Go to Chrome and use 'file:///' in the search bar to pull up the 
 file search functionality, and navigate to <project>/gaus/index.html.
 
@@ -162,8 +81,10 @@ Super handy for getting simple 2d visualizations of how gaussians move
 under different pressures (loss functions).
 
 
-Language Modeling
------------------
+## Language Modeling
+
+### Pulling COCO-flavored wikipedia articles
+
 To run the coco-flavored wikipedia scraping script (remove --resume for the very first run):
 ```bash
 python3 scripts/scrape_wikipedia_coco.py \
@@ -192,6 +113,8 @@ with open("./data/wiki_coco/articles.jsonl","r",encoding="utf-8") as f:
 PY
 ```
 
+### Train a ~16k tokenizer
+
 Train a tokenizer with a subset of that corpus + MSCoCo image captions (to account for future fintuning):
 ```bash
 python3 -m train.train_tokenizer \
@@ -209,6 +132,8 @@ python3 -m train.train_tokenizer \
     --wiki_chunk_lines 2000
 ```
 
+### Pre-tokenize a dataset for more performant training
+
 Build pre-tokenized train/val/test shards (paragraph-aware, `max_seq_len=256`, `stride=64`):
 ```bash
 python3 scripts/pretokenize_corpus.py \
@@ -223,7 +148,76 @@ python3 scripts/pretokenize_corpus.py \
 ```
 This writes split datasets under `./data/wiki_tok_256/train`, `./data/wiki_tok_256/val`, and `./data/wiki_tok_256/test`, each with shard files + `manifest.jsonl` + `manifest.json`.
 
+### Train the LM!
+
 Train LM with periodic validation and final test:
 ```bash
 ./runlm_best.sh runid1
 ```
+
+## Bridge
+
+Train & eval a bridge with one of the two commands
+
+Best overall:
+```bash
+./runmm_v1.sh mm_siglip_best \
+    --vision_model siglip_base \
+    --vision_checkpoint logs/hf_vision/google_siglip_base_patch16_224 \
+    --lm_checkpoint logs/lm_final/step_45000.tar \
+    --max_steps 9000
+```
+
+With my homecooked VAE:
+```bash
+./runmm_v1.sh mm_hc_vae_best \
+    --vision_model vae \
+    --vision_checkpoint logs/vm_base2/step_15001.tar \
+    --vision_feature_source encoder \
+    --vision_feature_mode auto \
+    --lm_checkpoint logs/lm_final/step_45000.tar \
+    --max_steps 9000
+```
+
+### Research Progress Tracker
+
+Minimal Bun + HTML/TS/CSS dashboard that works off task configs under `tasks/*/task.json`.
+Each task can point at its own:
+- docs directory
+- task-owned scripts directory
+- logs directory
+
+Current MM bridge task assets live under:
+- `tasks/mm_bridge/docs/*.md`
+- `tasks/mm_bridge/scripts/*`
+
+```bash
+bun run tracker/research/researchtrackerapp.ts -p 4090 --task mm_bridge
+```
+
+Open `http://localhost:4090/?task=mm_bridge`.
+For markdown-only view in a separate tab:
+- `http://localhost:4090/doc?task=mm_bridge&file=<doc_name>.md`
+
+
+### Multimodal Bridge Diagnostics
+
+Docker-first checkpoint diagnostics for the frozen-bridge VQA setup:
+- image perturbation sensitivity (`clean`, `shuffle`, `zero`, `noise`, `fixed_image`)
+- accuracy deltas vs clean
+- prediction agreement vs clean
+- visual-prefix geometry stats
+
+```bash
+./tasks/mm_bridge/scripts/run_mm_diag.sh mmdiag_example \
+  --checkpoint logs/mmbr_basesweep_on_high/step_3466.tar \
+  --max_batches 80 \
+  --stats_batches 40 \
+  --batch_size 256 \
+  --modes clean,shuffle,zero,noise,fixed_image \
+  --noise_std 0.2
+```
+
+Outputs are written to:
+- `logs/<diag_run_id>/diag_report.json`
+- `logs/<diag_run_id>/diag_report.md`

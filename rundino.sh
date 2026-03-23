@@ -1,6 +1,8 @@
 #!/bin/bash
 set -e
 
+source "$(cd "$(dirname "$0")" && pwd)/scripts/runtime_exec.sh"
+
 RUN_ID="$1"
 if [[ -z "${RUN_ID}" ]]; then
   echo "Usage: $0 <run_id> [checkpoint_step] [extra dino args...]"
@@ -27,7 +29,7 @@ else
 fi
 
 CMD=(
-  python -m train.dino_ssl "$RUN_ID"
+  -m train.dino_ssl "$RUN_ID"
 )
 
 if [[ -n "${CKPT_STEP}" ]]; then
@@ -35,12 +37,11 @@ if [[ -n "${CKPT_STEP}" ]]; then
 fi
 
 echo "[$(date)] START run_id=${RUN_ID} checkpoint=${CKPT_STEP:-none}" >> "${LAUNCH_LOG}"
-echo "[$(date)] CMD docker run --rm --gpus all --ipc=host -e PYTORCH_ENABLE_MPS_FALLBACK=1 -v $(pwd):/app -w /app myrepo:gpu ${CMD[*]} --device cuda --batch_size 128 --num_workers 10 --prefetch_factor 1 --pin_memory --precision bf16 ${EXTRA_ARGS[*]}" >> "${LAUNCH_LOG}"
+echo "[$(date)] RUNTIME $(runtime_log_env_summary "$(runtime_resolve_mode)")" >> "${LAUNCH_LOG}"
+echo "[$(date)] CMD runtime_exec_python ${CMD[*]} --device cuda --batch_size 128 --num_workers 10 --prefetch_factor 1 --pin_memory --precision bf16 ${EXTRA_ARGS[*]}" >> "${LAUNCH_LOG}"
 
 status=0
-docker run --rm --gpus all --ipc=host \
-  -e PYTORCH_ENABLE_MPS_FALLBACK=1 \
-  -v "$(pwd)":/app -w /app myrepo:gpu \
+runtime_exec_python \
   "${CMD[@]}" \
   --device cuda \
   --batch_size 128 \

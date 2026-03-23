@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 cd "${REPO_ROOT}"
+source "${REPO_ROOT}/scripts/runtime_exec.sh"
 
 RUN_ID="${1:-}"
 if [[ -z "${RUN_ID}" ]]; then
@@ -21,13 +22,11 @@ mkdir -pv "logs/${RUN_ID}"
 cat "${SCRIPT_DIR}/mm_bridge_diagnostics.py" train/mm.py train/vqa_data.py evals/vqa.py > "logs/${RUN_ID}/code_mm_diag.py"
 
 CMD=(
-  python -m tasks.mm_bridge.scripts.mm_bridge_diagnostics
+  -m tasks.mm_bridge.scripts.mm_bridge_diagnostics
   --output_json "logs/${RUN_ID}/diag_report.json"
   --output_md "logs/${RUN_ID}/diag_report.md"
 )
 
-docker run --rm --gpus all --ipc=host \
-  -e PYTORCH_ENABLE_MPS_FALLBACK=1 \
-  -v "$(pwd)":/app -w /app myrepo:gpu \
+runtime_exec_python \
   "${CMD[@]}" \
   "${EXTRA_ARGS[@]}"

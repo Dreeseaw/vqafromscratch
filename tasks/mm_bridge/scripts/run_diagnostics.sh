@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 cd "${REPO_ROOT}"
+source "${REPO_ROOT}/scripts/runtime_exec.sh"
 
 RUN_ID="${1:-}"
 if [[ -z "${RUN_ID}" ]]; then
@@ -124,10 +125,8 @@ if [[ "${PIN_MEMORY}" == "1" ]]; then
   PIN_FLAG="--pin_memory"
 fi
 
-COMMON_DOCKER=(
-  docker run --rm --gpus all --ipc=host
-  -e PYTORCH_ENABLE_MPS_FALLBACK=1
-  -v "$(pwd)":/app -w /app myrepo:gpu
+COMMON_RUNTIME=(
+  runtime_exec_python
 )
 
 OVERRIDE_ARGS=()
@@ -143,8 +142,8 @@ fi
 
 ANSWERS_PATH="$(dirname "${CHECKPOINT}")/fixed_eval_val_answers.jsonl"
 
-"${COMMON_DOCKER[@]}" \
-  python -m tasks.mm_bridge.scripts.mm_bridge_diagnostics \
+"${COMMON_RUNTIME[@]}" \
+  -m tasks.mm_bridge.scripts.mm_bridge_diagnostics \
   --checkpoint "${CHECKPOINT}" \
   --images_root "${IMAGES_ROOT}" \
   --annotations_root "${ANNOTATIONS_ROOT}" \
@@ -160,8 +159,8 @@ ANSWERS_PATH="$(dirname "${CHECKPOINT}")/fixed_eval_val_answers.jsonl"
   --output_md "${DIAG_DIR}/visual_sufficiency.md"
 
 if [[ -f "${ANSWERS_PATH}" ]]; then
-  "${COMMON_DOCKER[@]}" \
-    python -m tasks.mm_bridge.scripts.mm_finegrained_breakdown \
+  "${COMMON_RUNTIME[@]}" \
+    -m tasks.mm_bridge.scripts.mm_finegrained_breakdown \
     --answers_jsonl "${ANSWERS_PATH}" \
     --annotations_root "${ANNOTATIONS_ROOT}" \
     --split val \
@@ -171,8 +170,8 @@ else
   echo "[run_diagnostics] skipping fine-grained breakdown; missing ${ANSWERS_PATH}"
 fi
 
-"${COMMON_DOCKER[@]}" \
-  python -m tasks.mm_bridge.scripts.mm_calibration_analysis \
+"${COMMON_RUNTIME[@]}" \
+  -m tasks.mm_bridge.scripts.mm_calibration_analysis \
   --checkpoint "${CHECKPOINT}" \
   --images_root "${IMAGES_ROOT}" \
   --annotations_root "${ANNOTATIONS_ROOT}" \
@@ -187,8 +186,8 @@ fi
   --output_md "${DIAG_DIR}/calibration.md" \
   --predictions_jsonl "${DIAG_DIR}/calibration_predictions.jsonl"
 
-"${COMMON_DOCKER[@]}" \
-  python -m tasks.mm_bridge.scripts.mm_grounding_inspection \
+"${COMMON_RUNTIME[@]}" \
+  -m tasks.mm_bridge.scripts.mm_grounding_inspection \
   --checkpoint "${CHECKPOINT}" \
   --images_root "${IMAGES_ROOT}" \
   --annotations_root "${ANNOTATIONS_ROOT}" \
@@ -203,7 +202,7 @@ fi
   --num_incorrect "${GROUND_NUM_INCORRECT}" \
   --output_dir "${DIAG_DIR}/grounding"
 
-"${COMMON_DOCKER[@]}" \
-  python -m tasks.mm_bridge.scripts.launch_cement_query_count_probes \
+"${COMMON_RUNTIME[@]}" \
+  -m tasks.mm_bridge.scripts.launch_cement_query_count_probes \
     --checkpoint "${CHECKPOINT}" \
     --run_prefix "${RUN_ID}_queryprobe"

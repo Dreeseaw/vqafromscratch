@@ -18,6 +18,7 @@ import re
 import sys
 import time
 import gc
+from collections import Counter, defaultdict
 from contextlib import nullcontext
 from dataclasses import asdict
 from types import SimpleNamespace
@@ -26,7 +27,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Sampler
+from torch.utils.data import ConcatDataset, DataLoader, Sampler
 
 from models.bpe_tokenizer import ByteBPETokenizer
 from models.bridge import BridgeConfig, build_bridge
@@ -34,7 +35,7 @@ from models.hf_vision import HFMobileViTSmallBackbone, HFDINOv2SmallBackbone, HF
 from models.vit_ssl import DINOCheckpointBackbone
 from models.lm import LMConfig, TransformerDecoderOnlyV1
 from models.vae import VAEConfig, VariationalAutoEncoder, VariationalAutoEncoderRes, ViTVAE, ViTVAE2
-from train.vqa_data import VQAv2Dataset, VQAv2Paths, build_image_transform, prepare_vqav2
+from train.vqa_data import GQADataset, GroundingMixBatchSampler, MixedVQAv2Dataset, PointingIndexDataset, VQAv2Dataset, VQAv2Paths, build_image_transform, prepare_vqav2
 
 
 LOGDIR = "logs"
@@ -168,6 +169,17 @@ def load_json_or_yaml(path: Optional[str]) -> Dict[str, Any]:
     return dict(data or {})
 
 
+def parse_json_object_arg(name: str, raw: object) -> dict[str, object]:
+    text = str(raw or "").strip()
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{name} must be a single valid JSON object string; got {text!r}") from exc
+    if not isinstance(value, dict) or not value:
+        raise ValueError(f"{name} must be a non-empty JSON object, got: {text!r}")
+    return value
+
+
 def _extract_state_dict(payload: Dict[str, Any]) -> Dict[str, Any]:
     if "model_state_dict" in payload and isinstance(payload["model_state_dict"], dict):
         return payload["model_state_dict"]
@@ -262,6 +274,29 @@ def _apply_runtime_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "bridge_token_select_k_min": 0,
         "bridge_num_roles": 4,
         "bridge_evidence_topk": 0,
+        "semantic_bottleneck": False,
+        "semantic_tokens": 16,
+        "semantic_latent_dim": 256,
+        "semantic_recon_loss_weight": 0.1,
+        "semantic_consistency_loss_weight": 0.1,
+        "semantic_token_schedule": "",
+        "semantic_teacher_checkpoint": "",
+        "init_from_mm_checkpoint": "",
+        "use_compression": False,
+        "compression_k": 16,
+        "compression_distill_weight": 0.1,
+        "use_grounding_loss": False,
+        "grounding_loss_weight": 0.05,
+        "grounding_sigma": 1.5,
+        "pointing_index_path": "",
+        "pointing_mix_ratio": 0.25,
+        "eval_bypass_compression": False,
+        "eval_tiny_head": False,
+        "eval_grounding": False,
+        "eval_grounding_index_path": "",
+        "tiny_head_epochs": 1,
+        "tiny_head_answer_top_k": 3000,
+        "tiny_head_feature_pool": "flatten",
         "visual_feature_adapter_type": "none",
         "visual_feature_adapter_hidden_dim": 0,
         "visual_feature_adapter_dropout": 0.0,
@@ -290,6 +325,8 @@ def _apply_runtime_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "cuda_empty_cache_after_eval": True,
         "images_root": "images",
         "annotations_root": "annotations",
+        "gqa_root": "data/gqa",
+        "dataset_mix": "",
         "max_question_length": 64,
         "max_answer_length": 16,
         "max_text_tokens": 256,
@@ -308,6 +345,17 @@ def _apply_runtime_defaults(args: argparse.Namespace) -> argparse.Namespace:
     for k, v in defaults.items():
         if not hasattr(args, k):
             setattr(args, k, v)
+    args = _normalize_semantic_aliases(args)
+    return args
+
+
+def _normalize_semantic_aliases(args: argparse.Namespace) -> argparse.Namespace:
+    if bool(getattr(args, "use_compression", False)):
+        args.semantic_bottleneck = True
+    if hasattr(args, "compression_k") and int(getattr(args, "compression_k", 0)) > 0:
+        args.semantic_tokens = int(getattr(args, "compression_k"))
+    if hasattr(args, "compression_distill_weight"):
+        args.semantic_recon_loss_weight = float(getattr(args, "compression_distill_weight"))
     return args
 
 
@@ -851,6 +899,8 @@ class MultimodalPrefixLM(nn.Module):
         question_context: Optional[torch.Tensor],
         question_tokens: Optional[torch.Tensor] = None,
         question_token_mask: Optional[torch.Tensor] = None,
+        semantic_target_latents: Optional[torch.Tensor] = None,
+        return_attn: bool = False,
     ) -> torch.Tensor:
         if bool(getattr(self.bridge, "supports_question_context", False)) or bool(
             getattr(self.bridge, "supports_question_tokens", False)
@@ -860,8 +910,44 @@ class MultimodalPrefixLM(nn.Module):
                 question_context=question_context,
                 question_tokens=question_tokens,
                 question_token_mask=question_token_mask,
+                semantic_target_latents=semantic_target_latents,
+                return_attn=return_attn,
             )
-        return self.bridge(bridge_input)
+        return self.bridge(bridge_input, return_attn=return_attn)
+
+    @torch.no_grad()
+    def compute_bridge_evidence(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        images: torch.Tensor,
+        text_pad_mask: torch.Tensor,
+        prompt_mask: Optional[torch.Tensor] = None,
+        question_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        text_emb = self.lm._embed_dropout(self.lm._embed(input_ids))
+        question_context, question_tokens, question_token_mask = self._compute_question_views(
+            text_emb=text_emb,
+            text_pad_mask=text_pad_mask,
+            prompt_mask=prompt_mask,
+            question_mask=question_mask,
+        )
+        visual_features = self.vision_adapter(images)
+        if self.visual_feature_adapter_type != "none":
+            visual_features = self.visual_feature_adapter(visual_features)
+        if hasattr(self.bridge, "forward_evidence"):
+            return self.bridge.forward_evidence(
+                visual_features,
+                question_context=question_context,
+                question_tokens=question_tokens,
+                question_token_mask=question_token_mask,
+            )
+        return self._bridge_forward(
+            visual_features,
+            question_context,
+            question_tokens=question_tokens,
+            question_token_mask=question_token_mask,
+        )
 
     def _compute_question_views(
         self,
@@ -906,6 +992,8 @@ class MultimodalPrefixLM(nn.Module):
         prompt_mask: Optional[torch.Tensor] = None,
         question_mask: Optional[torch.Tensor] = None,
         visual_features: Optional[torch.Tensor] = None,
+        semantic_target_latents: Optional[torch.Tensor] = None,
+        return_bridge_attn: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         question_context: Optional[torch.Tensor] = None
         question_tokens: Optional[torch.Tensor] = None
@@ -930,6 +1018,8 @@ class MultimodalPrefixLM(nn.Module):
                 question_context,
                 question_tokens=question_tokens,
                 question_token_mask=question_token_mask,
+                semantic_target_latents=semantic_target_latents,
+                return_attn=return_bridge_attn,
             )
         else:
             # Image-agnostic bridge baselines only need batch size/device from images.
@@ -938,7 +1028,11 @@ class MultimodalPrefixLM(nn.Module):
                 question_context,
                 question_tokens=question_tokens,
                 question_token_mask=question_token_mask,
+                semantic_target_latents=semantic_target_latents,
+                return_attn=return_bridge_attn,
             )
+        if bool(return_bridge_attn) and isinstance(visual_prefix, tuple):
+            visual_prefix = visual_prefix[0]
 
         visual_prefix = self.prefix_calibrator(visual_prefix)
         if self.prefix_dropout > 0.0 and self.training:
@@ -1342,6 +1436,8 @@ class MultimodalPrefixLM(nn.Module):
         *,
         debug_shapes: bool = False,
         return_aux: bool = False,
+        semantic_target_latents: Optional[torch.Tensor] = None,
+        return_bridge_attn: bool = False,
     ) -> Tuple[torch.Tensor, int] | Tuple[torch.Tensor, int, Dict[str, torch.Tensor]]:
         text_emb = self.lm._embed_dropout(self.lm._embed(input_ids))
         visual_prefix, visual_features = self._compute_visual_prefix(
@@ -1350,6 +1446,8 @@ class MultimodalPrefixLM(nn.Module):
             text_pad_mask=text_pad_mask,
             prompt_mask=prompt_mask,
             question_mask=question_mask,
+            semantic_target_latents=semantic_target_latents,
+            return_bridge_attn=return_bridge_attn,
         )
         logits, k = self._decode_with_visual_prefix(
             input_ids=input_ids,
@@ -1367,6 +1465,11 @@ class MultimodalPrefixLM(nn.Module):
             "text_norm_mean": text_emb.norm(dim=-1).mean(),
             "prefix_batch_variance_mean": visual_prefix.var(dim=0, unbiased=False).mean(),
         }
+        bridge_aux = getattr(self.bridge, "last_aux_info", None)
+        if isinstance(bridge_aux, dict):
+            for key, value in bridge_aux.items():
+                if isinstance(value, torch.Tensor):
+                    aux[key] = value
         return logits, k, aux
 
     def compute_loss(
@@ -1376,6 +1479,16 @@ class MultimodalPrefixLM(nn.Module):
         answer_only: bool = True,
         debug_shapes: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        semantic_target_latents = None
+        teacher_model = self.__dict__.get("semantic_teacher_model", None)
+        if teacher_model is not None and bool(getattr(self.bridge.cfg, "semantic_bottleneck", False)):
+            semantic_target_latents = teacher_model.compute_bridge_evidence(
+                input_ids=batch["input_ids"],
+                images=batch["images"],
+                text_pad_mask=batch["text_pad_mask"],
+                prompt_mask=batch.get("prompt_mask"),
+                question_mask=batch.get("question_mask"),
+            )
         logits, prefix_k, aux = self.forward_logits(
             input_ids=batch["input_ids"],
             images=batch["images"],
@@ -1384,6 +1497,8 @@ class MultimodalPrefixLM(nn.Module):
             question_mask=batch.get("question_mask"),
             debug_shapes=debug_shapes,
             return_aux=True,
+            semantic_target_latents=semantic_target_latents,
+            return_bridge_attn=bool(getattr(self, "use_grounding_loss", False)),
         )
         text_logits = logits[:, prefix_k:, :]
         if text_logits.shape[1] < 2:
@@ -1404,9 +1519,19 @@ class MultimodalPrefixLM(nn.Module):
         info: Dict[str, float] = {
             "loss_tokens": float(denom.item()),
             "loss_ce": float(ce_loss.item()),
+            "loss_vqa": float(ce_loss.item()),
             "prefix_norm_mean": float(aux["prefix_norm_mean"].item()),
             "text_norm_mean": float(aux["text_norm_mean"].item()),
             "prefix_batch_variance_mean": float(aux["prefix_batch_variance_mean"].item()),
+            "semantic_bottleneck_enabled": float(aux.get("semantic_bottleneck_enabled", ce_loss.new_tensor(0.0)).item()),
+            "semantic_token_count": float(aux.get("semantic_token_count", ce_loss.new_tensor(0.0)).item()),
+            "semantic_latent_dim": float(aux.get("semantic_latent_dim", ce_loss.new_tensor(0.0)).item()),
+            "semantic_target_token_count": float(aux.get("semantic_target_token_count", ce_loss.new_tensor(0.0)).item()),
+            "semantic_teacher_enabled": 1.0 if teacher_model is not None else 0.0,
+            "loss_grounding": 0.0,
+            "loss_distill": 0.0,
+            "grounding_mean_kl": 0.0,
+            "compression_mean_attn_entropy": float(aux.get("compression_mean_attn_entropy", ce_loss.new_tensor(0.0)).item()),
         }
 
         if self.prefix_norm_reg_weight > 0.0 and self.prefix_norm_target_ratio > 0.0:
@@ -1419,7 +1544,41 @@ class MultimodalPrefixLM(nn.Module):
             reg_var = aux["prefix_batch_variance_mean"]
             loss = loss + float(self.prefix_batchvar_reg_weight) * reg_var
             info["loss_prefix_batchvar_reg"] = float(reg_var.item())
+        semantic_recon = aux.get("semantic_recon_loss")
+        semantic_consistency = aux.get("semantic_consistency_loss")
+        semantic_recon_weight = float(getattr(self.bridge.cfg, "semantic_recon_loss_weight", 0.0))
+        semantic_consistency_weight = float(getattr(self.bridge.cfg, "semantic_consistency_loss_weight", 0.0))
+        if semantic_recon is not None and semantic_recon_weight > 0.0:
+            loss = loss + semantic_recon_weight * semantic_recon
+            info["loss_semantic_recon"] = float(semantic_recon.item())
+            info["loss_distill"] = float(semantic_recon.item())
+        if semantic_consistency is not None and semantic_consistency_weight > 0.0:
+            loss = loss + semantic_consistency_weight * semantic_consistency
+            info["loss_semantic_consistency"] = float(semantic_consistency.item())
+        if bool(getattr(self, "use_grounding_loss", False)):
+            perceiver_final_attn = aux.get("perceiver_final_attn")
+            has_grounding_target = batch.get("has_grounding_target")
+            grounding_soft_target = batch.get("grounding_soft_target")
+            if (
+                isinstance(perceiver_final_attn, torch.Tensor)
+                and isinstance(has_grounding_target, torch.Tensor)
+                and isinstance(grounding_soft_target, torch.Tensor)
+            ):
+                ground_mask = has_grounding_target.bool()
+                if bool(ground_mask.any().item()):
+                    attn = perceiver_final_attn[ground_mask].float()
+                    attn_dist = attn.mean(dim=1).mean(dim=1)
+                    attn_dist = attn_dist / attn_dist.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+                    target = grounding_soft_target[ground_mask].float()
+                    target = target / target.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+                    mean_kl = F.kl_div(attn_dist.clamp_min(1e-8).log(), target, reduction="batchmean")
+                    ground_weight = float(getattr(self, "grounding_loss_weight", 0.0))
+                    if ground_weight > 0.0:
+                        loss = loss + ground_weight * mean_kl
+                        info["loss_grounding"] = float(mean_kl.item())
+                        info["grounding_mean_kl"] = float(mean_kl.item())
 
+        info["loss_total"] = float(loss.item())
         return loss, info
 
     @torch.no_grad()
@@ -1587,12 +1746,20 @@ class QACollator:
         enc = [self._encode_sample(s) for s in samples]
         b = len(samples)
         max_len = max(len(x["input_ids"]) for x in enc) if enc else 1
+        grounding_dim = 196
+        for sample in samples:
+            soft_target = sample.get("grounding_soft_target")
+            if isinstance(soft_target, (list, tuple)) and soft_target:
+                grounding_dim = int(len(soft_target))
+                break
         input_ids = torch.full((b, max_len), int(self.tok.pad_id), dtype=torch.long)
         text_pad_mask = torch.ones((b, max_len), dtype=torch.bool)
         prompt_mask = torch.zeros((b, max_len), dtype=torch.bool)
         question_mask = torch.zeros((b, max_len), dtype=torch.bool)
         target_mask = torch.zeros((b, max_len - 1), dtype=torch.bool)
         answer_loss_mask = torch.zeros((b, max_len - 1), dtype=torch.bool)
+        grounding_soft_target = torch.zeros((b, grounding_dim), dtype=torch.float32)
+        has_grounding_target = torch.zeros((b,), dtype=torch.bool)
 
         for i, e in enumerate(enc):
             ids = e["input_ids"]
@@ -1610,6 +1777,10 @@ class QACollator:
                 if e["has_answer"]:
                     start = max(0, int(e["answer_start"]) - 1)
                     answer_loss_mask[i, start : L - 1] = True
+            soft_target = samples[i].get("grounding_soft_target")
+            if isinstance(soft_target, (list, tuple)) and len(soft_target) == grounding_dim:
+                grounding_soft_target[i] = torch.tensor(soft_target, dtype=torch.float32)
+                has_grounding_target[i] = bool(samples[i].get("has_grounding_target", False))
 
         return {
             "images": torch.stack([s["image"] for s in samples], dim=0),
@@ -1619,6 +1790,8 @@ class QACollator:
             "question_mask": question_mask,
             "target_mask": target_mask,
             "answer_loss_mask": answer_loss_mask,
+            "grounding_soft_target": grounding_soft_target,
+            "has_grounding_target": has_grounding_target,
             "prompt_ids": [e["prompt_ids"] for e in enc],
             "question_ids": [int(s["question_id"]) for s in samples],
             "image_ids": [int(s["image_id"]) for s in samples],
@@ -1626,6 +1799,9 @@ class QACollator:
             "answers": [s["answer"] for s in samples],
             "all_answers_raw": [s.get("all_answers_raw", []) for s in samples],
             "all_answers": [s["all_answers"] for s in samples],
+            "bbox_xyxy": [s.get("bbox_xyxy") for s in samples],
+            "image_widths": [s.get("image_width") for s in samples],
+            "image_heights": [s.get("image_height") for s in samples],
             "metadata": [s["metadata"] for s in samples],
         }
 
@@ -1639,24 +1815,83 @@ def build_loader(
     limit: int = 0,
 ) -> DataLoader:
     transform = build_image_transform(train_mode=train_mode)
-    ds = VQAv2Dataset(
-        images_root=args.images_root,
-        annotations_root=args.annotations_root,
-        split=split,
-        transform=transform,
-        limit=limit,
-        skip_missing_images=True,
-    )
+    dataset_mix_raw = str(getattr(args, "dataset_mix", "") or "").strip()
+    base_train_dataset: Any = None
+    if bool(train_mode) and split == "train" and dataset_mix_raw:
+        mix = parse_json_object_arg("--dataset_mix", dataset_mix_raw)
+        base_train_dataset = MixedVQAv2Dataset(
+            images_root=args.images_root,
+            annotations_root=args.annotations_root,
+            gqa_root=args.gqa_root,
+            mix=mix,
+            transform=transform,
+            seed=int(args.seed),
+            limit=limit,
+            skip_missing_images=True,
+        )
+    elif bool(train_mode) and split == "train" and str(getattr(args, "gqa_root", "") or "").strip() and str(getattr(args, "images_root", "") or "").strip() == "__gqa_only__":
+        base_train_dataset = GQADataset(
+            gqa_root=args.gqa_root,
+            split="train",
+            transform=transform,
+            limit=limit,
+            skip_missing_images=True,
+            question_group="",
+        )
+    elif split in ("gqa_train", "gqa_val"):
+        gqa_split = "train" if split == "gqa_train" else "val"
+        base_train_dataset = GQADataset(
+            gqa_root=args.gqa_root,
+            split=gqa_split,
+            transform=transform,
+            limit=limit,
+            skip_missing_images=True,
+            question_group=str(getattr(args, "gqa_eval_group", "") or "").strip().lower(),
+        )
+    else:
+        base_train_dataset = VQAv2Dataset(
+            images_root=args.images_root,
+            annotations_root=args.annotations_root,
+            split=split,
+            transform=transform,
+            limit=limit,
+            skip_missing_images=True,
+        )
+    ds = base_train_dataset
+    batch_sampler = None
+    if bool(train_mode) and split == "train" and bool(getattr(args, "use_grounding_loss", False)):
+        index_path = str(getattr(args, "pointing_index_path", "") or "").strip()
+        if not index_path:
+            raise SystemExit("--use_grounding_loss requires --pointing_index_path")
+        pointing_ds = PointingIndexDataset(
+            index_path=index_path,
+            images_root=str(getattr(args, "images_root", "")),
+            transform=transform,
+            limit=0,
+            skip_missing_images=True,
+            target_len=196,
+        )
+        ds = ConcatDataset([pointing_ds, base_train_dataset])
+        batch_sampler = GroundingMixBatchSampler(
+            base_dataset=base_train_dataset,
+            pointing_dataset=pointing_ds,
+            batch_size=int(args.batch_size),
+            pointing_mix_ratio=float(getattr(args, "pointing_mix_ratio", 0.25)),
+            seed=int(args.seed),
+            drop_last=True,
+        )
     if (not train_mode) and int(limit) <= 0:
         eval_fraction = float(getattr(args, "eval_fraction", 1.0))
         if 0.0 < eval_fraction < 1.0:
             keep = max(1, int(math.ceil(float(len(ds)) * eval_fraction)))
-            ds.items = ds.items[:keep]
+            if hasattr(ds, "items"):
+                ds.items = ds.items[:keep]
     if not train_mode:
-        ds.set_image_corruption(
-            str(getattr(args, "eval_image_corruption", "none")),
-            seed=int(getattr(args, "eval_image_corruption_seed", 123)),
-        )
+        if hasattr(ds, "set_image_corruption"):
+            ds.set_image_corruption(
+                str(getattr(args, "eval_image_corruption", "none")),
+                seed=int(getattr(args, "eval_image_corruption_seed", 123)),
+            )
     collator = QACollator(
         tokenizer=tokenizer,
         max_q=args.max_question_length,
@@ -1666,20 +1901,23 @@ def build_loader(
     loader_gen = torch.Generator()
     loader_gen.manual_seed(int(args.seed) + (11 if bool(train_mode) else 29))
     kwargs: Dict[str, Any] = {
-        "batch_size": (
-            int(args.batch_size)
-            if bool(train_mode) or int(getattr(args, "eval_batch_size", 0)) <= 0
-            else int(args.eval_batch_size)
-        ),
-        "drop_last": bool(train_mode),
         "num_workers": int(args.num_workers),
         "collate_fn": collator,
         "generator": loader_gen,
     }
-    if train_mode:
-        kwargs["sampler"] = EpochShuffleSampler(ds, seed=int(args.seed))
+    if train_mode and batch_sampler is not None:
+        kwargs["batch_sampler"] = batch_sampler
     else:
-        kwargs["shuffle"] = False
+        kwargs["batch_size"] = (
+            int(args.batch_size)
+            if bool(train_mode) or int(getattr(args, "eval_batch_size", 0)) <= 0
+            else int(args.eval_batch_size)
+        )
+        kwargs["drop_last"] = bool(train_mode)
+        if train_mode:
+            kwargs["sampler"] = EpochShuffleSampler(ds, seed=int(args.seed))
+        else:
+            kwargs["shuffle"] = False
     if args.num_workers > 0:
         kwargs["persistent_workers"] = True
         kwargs["prefetch_factor"] = max(1, int(args.prefetch_factor))
@@ -1700,6 +1938,17 @@ def _trainable_param_count(model: nn.Module) -> Tuple[int, int]:
     return n_tr, n_all
 
 
+def _module_param_summary(module: nn.Module) -> Tuple[int, int]:
+    total = 0
+    trainable = 0
+    for p in module.parameters():
+        n = int(p.numel())
+        total += n
+        if p.requires_grad:
+            trainable += n
+    return total, trainable
+
+
 def _vision_tail_modules(vision_model: nn.Module) -> List[nn.Module]:
     enc = getattr(vision_model, "_encoder", None)
     if enc is None:
@@ -1717,14 +1966,24 @@ def _vision_tail_modules(vision_model: nn.Module) -> List[nn.Module]:
 def configure_freezing(model: MultimodalPrefixLM, args: argparse.Namespace) -> None:
     for p in model.parameters():
         p.requires_grad_(False)
-    for p in model.bridge.parameters():
-        p.requires_grad_(True)
-    for p in model.prefix_calibrator.parameters():
-        p.requires_grad_(True)
-    for p in model.visual_feature_adapter.parameters():
-        p.requires_grad_(True)
-    for p in model.visual_adapters.parameters():
-        p.requires_grad_(True)
+    mode = str(args.freeze_mode)
+
+    if mode == "semantic_adapter_only":
+        semantic_mod = getattr(model.bridge, "semantic_bottleneck", None)
+        if semantic_mod is not None:
+            for p in semantic_mod.parameters():
+                p.requires_grad_(True)
+        for p in model.visual_adapters.parameters():
+            p.requires_grad_(True)
+    else:
+        for p in model.bridge.parameters():
+            p.requires_grad_(True)
+        for p in model.prefix_calibrator.parameters():
+            p.requires_grad_(True)
+        for p in model.visual_feature_adapter.parameters():
+            p.requires_grad_(True)
+        for p in model.visual_adapters.parameters():
+            p.requires_grad_(True)
     vision_tail_n = max(0, int(getattr(args, "train_vision_last_n_blocks", 0)))
     if vision_tail_n > 0:
         tail_modules = _vision_tail_modules(model.vision_adapter.vision_model)
@@ -1732,7 +1991,6 @@ def configure_freezing(model: MultimodalPrefixLM, args: argparse.Namespace) -> N
             for p in mod.parameters():
                 p.requires_grad_(True)
 
-    mode = str(args.freeze_mode)
     if mode == "bridge_only":
         return
     if mode == "bridge_plus_top_lm":
@@ -1745,6 +2003,8 @@ def configure_freezing(model: MultimodalPrefixLM, args: argparse.Namespace) -> N
         for p in model.lm._unembed.parameters():
             p.requires_grad_(True)
         return
+    if mode == "semantic_adapter_only":
+        return
     if mode == "full_finetune":
         for p in model.parameters():
             p.requires_grad_(True)
@@ -1754,19 +2014,30 @@ def configure_freezing(model: MultimodalPrefixLM, args: argparse.Namespace) -> N
 
 def _set_module_modes(model: MultimodalPrefixLM, freeze_mode: str) -> None:
     model.train()
-    if freeze_mode in ("bridge_only", "bridge_plus_top_lm"):
+    if freeze_mode in ("bridge_only", "bridge_plus_top_lm", "semantic_adapter_only"):
         model.vision_adapter.vision_model.eval()
         if int(getattr(model, "train_vision_last_n_blocks", 0)) > 0:
             for mod in _vision_tail_modules(model.vision_adapter.vision_model)[-int(model.train_vision_last_n_blocks):]:
                 mod.train()
-    if freeze_mode == "bridge_only":
+    if freeze_mode in ("bridge_only", "semantic_adapter_only"):
         model.lm.eval()
 
 
 def _to_device(batch: Dict[str, Any], device: str) -> Dict[str, Any]:
     out = dict(batch)
-    for k in ("images", "input_ids", "text_pad_mask", "prompt_mask", "question_mask", "target_mask", "answer_loss_mask"):
-        out[k] = batch[k].to(device)
+    for k in (
+        "images",
+        "input_ids",
+        "text_pad_mask",
+        "prompt_mask",
+        "question_mask",
+        "target_mask",
+        "answer_loss_mask",
+        "grounding_soft_target",
+        "has_grounding_target",
+    ):
+        if k in batch:
+            out[k] = batch[k].to(device)
     return out
 
 
@@ -1813,6 +2084,48 @@ def _maybe_initialize_bridge_from_state_dict(model: MultimodalPrefixLM, state_di
     if (has_tok and has_glb) and hasattr(bridge, "_ensure_built"):
         # Older checkpoints may contain both branches; ensure both are present.
         bridge._ensure_built(int(w_tok.shape[1]), device=ref.device, dtype=ref.dtype)
+
+
+def load_model_weights_from_mm_checkpoint(
+    model: MultimodalPrefixLM,
+    checkpoint_path: str,
+    *,
+    logger: Optional[Logger] = None,
+) -> Dict[str, Any]:
+    payload = _load_checkpoint(checkpoint_path, map_location="cpu")
+    state_dict = payload["model_state_dict"]
+    _maybe_initialize_bridge_from_state_dict(model, state_dict)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if logger is not None:
+        logger.log(f"[mm] initialized model weights from {checkpoint_path}")
+        if unexpected:
+            logger.log(f"[mm] WARNING: unexpected init keys: {unexpected}")
+        if missing:
+            logger.log(
+                f"[mm] note: {len(missing)} init keys missing (newly initialized): "
+                f"{missing[:5]}{'...' if len(missing) > 5 else ''}"
+            )
+    return payload
+
+
+def attach_semantic_teacher(
+    model: MultimodalPrefixLM,
+    *,
+    checkpoint_path: str,
+    device: str,
+    logger: Optional[Logger] = None,
+) -> None:
+    teacher_model, _teacher_tok, _teacher_bridge_cfg, _teacher_payload, _teacher_args = load_runtime_from_checkpoint(
+        checkpoint_path=checkpoint_path,
+        device=device,
+    )
+    teacher_model.eval()
+    for p in teacher_model.parameters():
+        p.requires_grad_(False)
+    # Avoid registering the teacher as a trainable submodule in the student state_dict.
+    model.__dict__["semantic_teacher_model"] = teacher_model
+    if logger is not None:
+        logger.log(f"[mm] semantic teacher attached from {checkpoint_path}")
 
 
 def save_mm_checkpoint(
@@ -1918,10 +2231,28 @@ def build_runtime_from_args(
         "bridge_token_select_k_min": int(args.bridge_token_select_k_min),
         "bridge_num_roles": int(args.bridge_num_roles),
         "bridge_evidence_topk": int(args.bridge_evidence_topk),
+        "semantic_bottleneck": bool(getattr(args, "use_compression", False) or args.semantic_bottleneck),
+        "semantic_tokens": int(getattr(args, "compression_k", args.semantic_tokens)),
+        "semantic_latent_dim": int(args.semantic_latent_dim),
+        "semantic_recon_loss_weight": float(getattr(args, "compression_distill_weight", args.semantic_recon_loss_weight)),
+        "semantic_consistency_loss_weight": float(args.semantic_consistency_loss_weight),
+        "semantic_token_schedule": str(args.semantic_token_schedule),
     }
     if checkpoint_payload is not None and isinstance(checkpoint_payload.get("bridge_config"), dict):
         bcfg_data.update(dict(checkpoint_payload["bridge_config"]))
         bcfg_data["lm_hidden_size"] = int(lm._config.embed_size)
+    else:
+        # Only apply legacy compression aliases when we are not reconstructing
+        # the bridge directly from a checkpoint payload. Otherwise the parser
+        # defaults (for example compression_k=16) can silently clobber the true
+        # checkpoint bottleneck width during eval/diagnostic reload.
+        bcfg_data["semantic_bottleneck"] = bool(
+            getattr(args, "use_compression", False) or bcfg_data.get("semantic_bottleneck", False)
+        )
+        bcfg_data["semantic_tokens"] = int(getattr(args, "compression_k", bcfg_data.get("semantic_tokens", 16)))
+        bcfg_data["semantic_recon_loss_weight"] = float(
+            getattr(args, "compression_distill_weight", bcfg_data.get("semantic_recon_loss_weight", 0.0))
+        )
     bridge_cfg = BridgeConfig(**bcfg_data)
     bridge = build_bridge(bridge_cfg).to(device)
     model = MultimodalPrefixLM(
@@ -1954,6 +2285,10 @@ def build_runtime_from_args(
         lm_visual_adapter_gate_init=float(getattr(args, "lm_visual_adapter_gate_init", 0.5)),
     ).to(device)
     model.train_vision_last_n_blocks = max(0, int(getattr(args, "train_vision_last_n_blocks", 0)))
+    model.use_grounding_loss = bool(getattr(args, "use_grounding_loss", False))
+    model.grounding_loss_weight = float(getattr(args, "grounding_loss_weight", 0.0))
+    if hasattr(model.bridge, "eval_bypass_compression"):
+        model.bridge.eval_bypass_compression = bool(getattr(args, "eval_bypass_compression", False))
     if str(vision_device) != str(device):
         model.vision_adapter.vision_model.to(vision_device)
     return model, tokenizer, bridge_cfg
@@ -2168,6 +2503,270 @@ def run_predictions_from_checkpoint(
     )
 
 
+def _probe_answer_vocab(dataset: Any, top_k: int) -> Dict[str, int]:
+    counts: Counter[str] = Counter()
+    for item in getattr(dataset, "items", []):
+        ans = str(item.get("answer", "")).strip()
+        if ans:
+            counts[ans] += 1
+    return {ans: idx for idx, (ans, _n) in enumerate(counts.most_common(max(1, int(top_k))))}
+
+
+@torch.no_grad()
+def _extract_probe_features(
+    model: MultimodalPrefixLM,
+    loader: DataLoader,
+    *,
+    device: str,
+    answer_to_idx: Dict[str, int],
+    feature_pool: str,
+) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
+    model.eval()
+    feats: List[torch.Tensor] = []
+    labels: List[torch.Tensor] = []
+    answer_types: List[str] = []
+    for raw_batch in loader:
+        batch = _to_device(raw_batch, device)
+        text_emb = model.lm._embed_dropout(model.lm._embed(batch["input_ids"]))
+        prefix, _ = model._compute_visual_prefix(
+            images=batch["images"],
+            text_emb=text_emb,
+            text_pad_mask=batch["text_pad_mask"],
+            prompt_mask=batch.get("prompt_mask"),
+            question_mask=batch.get("question_mask"),
+        )
+        if str(feature_pool) == "mean":
+            x = prefix.mean(dim=1)
+        else:
+            x = prefix.reshape(int(prefix.shape[0]), -1)
+        for i in range(int(x.shape[0])):
+            answer = str(batch["answers"][i]).strip()
+            idx = answer_to_idx.get(answer)
+            if idx is None:
+                continue
+            feats.append(x[i].detach().cpu().to(dtype=torch.float16))
+            labels.append(torch.tensor(idx, dtype=torch.long))
+            answer_types.append(str(batch["metadata"][i].get("answer_type", "other")))
+    if not feats:
+        raise RuntimeError("No usable tiny-head samples after answer-vocab filtering.")
+    return torch.stack(feats, dim=0), torch.stack(labels, dim=0), answer_types
+
+
+def _eval_probe_classifier(
+    probe: nn.Module,
+    loader: DataLoader,
+    *,
+    device: str,
+    answer_types: List[str],
+) -> Dict[str, Any]:
+    probe.eval()
+    total = 0
+    correct = 0
+    by_type_total: Dict[str, int] = defaultdict(int)
+    by_type_correct: Dict[str, int] = defaultdict(int)
+    offset = 0
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(device=device, dtype=torch.float32)
+            yb = yb.to(device=device)
+            pred = torch.argmax(probe(xb), dim=-1)
+            match = (pred == yb).detach().cpu()
+            for i in range(int(match.shape[0])):
+                atype = str(answer_types[offset + i])
+                by_type_total[atype] += 1
+                if bool(match[i].item()):
+                    by_type_correct[atype] += 1
+            correct += int(match.sum().item())
+            total += int(match.numel())
+            offset += int(match.shape[0])
+    out = {
+        "accuracy": (float(correct) / float(total)) if total else 0.0,
+        "count": int(total),
+        "by_answer_type": {},
+    }
+    for key in sorted(by_type_total):
+        denom = max(1, int(by_type_total[key]))
+        out["by_answer_type"][key] = float(by_type_correct[key]) / float(denom)
+    return out
+
+
+def run_tiny_head_probe_eval(
+    *,
+    model: MultimodalPrefixLM,
+    tokenizer: ByteBPETokenizer,
+    args: argparse.Namespace,
+    device: str,
+    logger: Logger,
+) -> None:
+    probe_args = argparse.Namespace(**vars(args))
+    probe_args.eval_batch_size = int(args.eval_batch_size) if int(args.eval_batch_size) > 0 else int(args.batch_size)
+    train_loader = build_loader(
+        probe_args,
+        tokenizer=tokenizer,
+        split="train",
+        train_mode=False,
+        limit=max(0, int(args.limit_train)),
+    )
+    val_loader = build_loader(
+        probe_args,
+        tokenizer=tokenizer,
+        split="val",
+        train_mode=False,
+        limit=max(0, int(args.limit_eval) if int(args.limit_eval) > 0 else int(args.limit_val)),
+    )
+    counts: Counter[str] = Counter()
+    for ds in (train_loader.dataset, val_loader.dataset):
+        for item in getattr(ds, "items", []):
+            ans = str(item.get("answer", "")).strip()
+            if ans:
+                counts[ans] += 1
+    answer_to_idx = {ans: idx for idx, (ans, _n) in enumerate(counts.most_common(max(1, int(args.tiny_head_answer_top_k))))}
+    if not answer_to_idx:
+        raise RuntimeError("Tiny-head probe answer vocabulary is empty.")
+    train_x, train_y, _ = _extract_probe_features(
+        model,
+        train_loader,
+        device=device,
+        answer_to_idx=answer_to_idx,
+        feature_pool=str(args.tiny_head_feature_pool),
+    )
+    val_x, val_y, val_types = _extract_probe_features(
+        model,
+        val_loader,
+        device=device,
+        answer_to_idx=answer_to_idx,
+        feature_pool=str(args.tiny_head_feature_pool),
+    )
+    probe = nn.Linear(int(train_x.shape[1]), len(answer_to_idx)).to(device)
+    opt = torch.optim.AdamW(probe.parameters(), lr=1e-3, weight_decay=1e-4)
+    loss_fn = nn.CrossEntropyLoss()
+    train_probe_loader = DataLoader(torch.utils.data.TensorDataset(train_x, train_y), batch_size=256, shuffle=True)
+    val_probe_loader = DataLoader(torch.utils.data.TensorDataset(val_x, val_y), batch_size=256, shuffle=False)
+    best_summary: Optional[Dict[str, Any]] = None
+    for epoch in range(1, max(1, int(args.tiny_head_epochs)) + 1):
+        probe.train()
+        for xb, yb in train_probe_loader:
+            xb = xb.to(device=device, dtype=torch.float32)
+            yb = yb.to(device=device)
+            loss = loss_fn(probe(xb), yb)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+        summary = _eval_probe_classifier(probe, val_probe_loader, device=device, answer_types=val_types)
+        summary["epoch"] = int(epoch)
+        best_summary = summary
+        logger.log(f"[tiny-head] epoch={epoch} accuracy={float(summary['accuracy']):.4f} count={int(summary['count'])}")
+    if best_summary is not None:
+        logger.log(f"[tiny-head] best_accuracy={float(best_summary['accuracy']):.4f} by_answer_type={json.dumps(best_summary['by_answer_type'], sort_keys=True)}")
+
+
+def _bbox_to_grid_mask(
+    bbox_xyxy: Sequence[float],
+    *,
+    image_width: float,
+    image_height: float,
+    grid_side: int = 14,
+) -> torch.Tensor:
+    x1, y1, x2, y2 = [float(v) for v in bbox_xyxy]
+    x1 = max(0.0, min(float(image_width), x1))
+    x2 = max(0.0, min(float(image_width), x2))
+    y1 = max(0.0, min(float(image_height), y1))
+    y2 = max(0.0, min(float(image_height), y2))
+    if x2 <= x1 or y2 <= y1:
+        return torch.zeros((grid_side * grid_side,), dtype=torch.float32)
+    cell_w = float(image_width) / float(grid_side)
+    cell_h = float(image_height) / float(grid_side)
+    mask = torch.zeros((grid_side, grid_side), dtype=torch.float32)
+    for gy in range(grid_side):
+        cy = (float(gy) + 0.5) * cell_h
+        if cy < y1 or cy > y2:
+            continue
+        for gx in range(grid_side):
+            cx = (float(gx) + 0.5) * cell_w
+            if x1 <= cx <= x2:
+                mask[gy, gx] = 1.0
+    return mask.reshape(-1)
+
+
+@torch.no_grad()
+def run_grounding_eval(
+    *,
+    model: MultimodalPrefixLM,
+    tokenizer: ByteBPETokenizer,
+    args: argparse.Namespace,
+    device: str,
+    logger: Logger,
+) -> None:
+    index_path = str(getattr(args, "eval_grounding_index_path", "") or getattr(args, "pointing_index_path", "") or "").strip()
+    if not index_path:
+        raise SystemExit("--eval_grounding requires --eval_grounding_index_path or --pointing_index_path")
+    dataset = PointingIndexDataset(
+        index_path=index_path,
+        images_root=str(args.images_root),
+        transform=build_image_transform(train_mode=False),
+        limit=max(0, int(args.limit_eval)),
+        skip_missing_images=True,
+        target_len=196,
+    )
+    collator = QACollator(
+        tokenizer=tokenizer,
+        max_q=args.max_question_length,
+        max_a=args.max_answer_length,
+        max_text_tokens=args.max_text_tokens,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=int(args.eval_batch_size) if int(args.eval_batch_size) > 0 else int(args.batch_size),
+        shuffle=False,
+        num_workers=int(args.num_workers),
+        collate_fn=collator,
+        pin_memory=bool(args.pin_memory),
+    )
+    model.eval()
+    total = 0
+    mass_sum = 0.0
+    entropy_sum = 0.0
+    entropy_count = 0
+    for bidx, raw_batch in enumerate(loader):
+        batch = _to_device(raw_batch, device)
+        _ = model.forward_logits(
+            input_ids=batch["input_ids"],
+            images=batch["images"],
+            text_pad_mask=batch["text_pad_mask"],
+            prompt_mask=batch.get("prompt_mask"),
+            question_mask=batch.get("question_mask"),
+            return_aux=True,
+            return_bridge_attn=True,
+        )
+        aux = getattr(model.bridge, "last_aux_info", {})
+        perceiver_attn = aux.get("perceiver_final_attn")
+        if not isinstance(perceiver_attn, torch.Tensor):
+            raise RuntimeError("Grounding eval requires perceiver_final_attn in bridge aux.")
+        attn_dist = perceiver_attn.float().mean(dim=1).mean(dim=1)
+        attn_dist = attn_dist / attn_dist.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        for i in range(int(attn_dist.shape[0])):
+            bbox = raw_batch["bbox_xyxy"][i]
+            width = raw_batch["image_widths"][i]
+            height = raw_batch["image_heights"][i]
+            if bbox is None or width in (None, 0) or height in (None, 0):
+                continue
+            mask = _bbox_to_grid_mask(bbox, image_width=float(width), image_height=float(height), grid_side=14).to(attn_dist.device)
+            if float(mask.sum().item()) <= 0.0:
+                continue
+            mass_sum += float((attn_dist[i] * mask).sum().item())
+            total += 1
+        bottleneck_entropy = aux.get("compression_mean_attn_entropy")
+        if isinstance(bottleneck_entropy, torch.Tensor):
+            entropy_sum += float(bottleneck_entropy.item())
+            entropy_count += 1
+        if int(args.eval_batches) > 0 and (bidx + 1) >= int(args.eval_batches):
+            break
+    logger.log(
+        f"[grounding-eval] samples={total} mean_mass_in_box={(mass_sum / max(1, total)):.4f} "
+        f"compression_attn_entropy={(entropy_sum / max(1, entropy_count)):.4f}"
+    )
+
+
 def evaluate_records(
     records: Sequence[Dict[str, Any]], *, qualitative_samples: int, confusion_top_k: int, scorer: str = "official"
 ) -> Dict[str, Any]:
@@ -2363,7 +2962,13 @@ def log_startup_config(
         f"iter_qquery_resid={float(getattr(bridge_cfg, 'bridge_iterative_qquery_residual_scale', 1.0)):.6g} "
         f"token_selector={bridge_cfg.bridge_token_selector_type} token_select_k={bridge_cfg.bridge_token_select_k} "
         f"token_select_k_min={bridge_cfg.bridge_token_select_k_min} "
-        f"num_roles={bridge_cfg.bridge_num_roles} evidence_topk={bridge_cfg.bridge_evidence_topk}"
+        f"num_roles={bridge_cfg.bridge_num_roles} evidence_topk={bridge_cfg.bridge_evidence_topk} "
+        f"semantic_bottleneck={int(bool(getattr(bridge_cfg, 'semantic_bottleneck', False)))} "
+        f"semantic_tokens={int(getattr(bridge_cfg, 'semantic_tokens', 16))} "
+        f"semantic_latent_dim={int(getattr(bridge_cfg, 'semantic_latent_dim', 256))} "
+        f"semantic_recon_w={float(getattr(bridge_cfg, 'semantic_recon_loss_weight', 0.0)):.6g} "
+        f"semantic_consistency_w={float(getattr(bridge_cfg, 'semantic_consistency_loss_weight', 0.0)):.6g} "
+        f"semantic_token_schedule={str(getattr(bridge_cfg, 'semantic_token_schedule', ''))}"
     )
     logger.log(
         f"[mm] visual_feature_adapter_type={str(getattr(args, 'visual_feature_adapter_type', 'none'))} "
@@ -2400,6 +3005,13 @@ def log_startup_config(
         f"loss_on_answer_only={int(bool(args.loss_on_answer_only))}"
     )
     logger.log(
+        f"[mm] init_from_mm_checkpoint={str(getattr(args, 'init_from_mm_checkpoint', '') or '')} "
+        f"semantic_teacher_checkpoint={str(getattr(args, 'semantic_teacher_checkpoint', '') or '')} "
+        f"use_compression={int(bool(getattr(args, 'use_compression', False)))} "
+        f"compression_k={int(getattr(args, 'compression_k', getattr(args, 'semantic_tokens', 16)))} "
+        f"compression_distill_weight={float(getattr(args, 'compression_distill_weight', getattr(args, 'semantic_recon_loss_weight', 0.0))):.6g}"
+    )
+    logger.log(
         f"[mm] seq_lens q={args.max_question_length} a={args.max_answer_length} text={args.max_text_tokens}"
     )
     logger.log(
@@ -2410,7 +3022,12 @@ def log_startup_config(
         f"grad_accum_steps={args.grad_accum_steps} effective_batch_size={int(args.batch_size) * max(1, int(args.grad_accum_steps))}"
     )
     logger.log(
-        f"[mm] data images_root={args.images_root} annotations_root={args.annotations_root} "
+        f"[mm] data images_root={args.images_root} annotations_root={args.annotations_root} gqa_root={getattr(args, 'gqa_root', '')} "
+        f"dataset_mix={str(getattr(args, 'dataset_mix', '') or '')} "
+        f"pointing_index_path={str(getattr(args, 'pointing_index_path', '') or '')} "
+        f"pointing_mix_ratio={float(getattr(args, 'pointing_mix_ratio', 0.0)):.6g} "
+        f"use_grounding_loss={int(bool(getattr(args, 'use_grounding_loss', False)))} "
+        f"grounding_loss_weight={float(getattr(args, 'grounding_loss_weight', 0.0)):.6g} "
         f"limit_train={args.limit_train} limit_val={args.limit_val} limit_eval={args.limit_eval} "
         f"eval_fraction={float(args.eval_fraction):.4g}"
     )
@@ -2663,6 +3280,82 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--bridge_num_roles", type=int, default=4)
     ap.add_argument("--bridge_evidence_topk", type=int, default=0)
     ap.add_argument(
+        "--semantic_bottleneck",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable a late semantic bottleneck after dense evidence retrieval and before LM prefix export.",
+    )
+    ap.add_argument(
+        "--semantic_tokens",
+        type=int,
+        default=16,
+        help="Exported semantic token count M for the post-perceiver bottleneck.",
+    )
+    ap.add_argument(
+        "--semantic_latent_dim",
+        type=int,
+        default=256,
+        help="Internal semantic latent width Z before decoding back to LM width.",
+    )
+    ap.add_argument(
+        "--semantic_recon_loss_weight",
+        type=float,
+        default=0.1,
+        help="Weight for MSE between decoded semantic tokens and an adaptive-pooled target from pre-bottleneck evidence latents.",
+    )
+    ap.add_argument(
+        "--semantic_consistency_loss_weight",
+        type=float,
+        default=0.1,
+        help="Weight for cosine consistency between decoded semantic tokens and the same pooled evidence target.",
+    )
+    ap.add_argument(
+        "--semantic_token_schedule",
+        type=str,
+        default="",
+        help="Reserved schedule string for future semantic token-count curricula; currently logged only.",
+    )
+    ap.add_argument(
+        "--semantic_teacher_checkpoint",
+        type=str,
+        default="",
+        help="Optional frozen MM checkpoint used as a teacher for semantic-token distillation targets.",
+    )
+    ap.add_argument(
+        "--init_from_mm_checkpoint",
+        type=str,
+        default="",
+        help="Optional MM checkpoint to load model weights from before starting a new run.",
+    )
+    ap.add_argument(
+        "--use_compression",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Alias for --semantic_bottleneck for compression-tuning experiments.",
+    )
+    ap.add_argument(
+        "--compression_k",
+        type=int,
+        default=16,
+        help="Alias for --semantic_tokens for compression-tuning experiments.",
+    )
+    ap.add_argument(
+        "--compression_distill_weight",
+        type=float,
+        default=0.1,
+        help="Alias for --semantic_recon_loss_weight for compression-tuning experiments.",
+    )
+    ap.add_argument(
+        "--use_grounding_loss",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable grounding KL supervision over perceiver cross-attention using pointing annotations.",
+    )
+    ap.add_argument("--grounding_loss_weight", type=float, default=0.05)
+    ap.add_argument("--grounding_sigma", type=float, default=1.5)
+    ap.add_argument("--pointing_index_path", type=str, default="")
+    ap.add_argument("--pointing_mix_ratio", type=float, default=0.25)
+    ap.add_argument(
         "--prefix_calibration",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -2727,7 +3420,7 @@ def parse_args() -> argparse.Namespace:
         "--freeze_mode",
         type=str,
         default="bridge_only",
-        choices=["bridge_only", "bridge_plus_top_lm", "full_finetune"],
+        choices=["bridge_only", "bridge_plus_top_lm", "semantic_adapter_only", "full_finetune"],
     )
     ap.add_argument("--train_top_lm_layers", type=int, default=1)
     ap.add_argument(
@@ -2760,6 +3453,14 @@ def parse_args() -> argparse.Namespace:
 
     ap.add_argument("--images_root", type=str, default="images")
     ap.add_argument("--annotations_root", type=str, default="annotations")
+    ap.add_argument("--gqa_root", type=str, default="data/gqa")
+    ap.add_argument("--gqa_eval_group", type=str, default="", choices=["", "spatial", "attribute", "count", "exist"])
+    ap.add_argument(
+        "--dataset_mix",
+        type=str,
+        default="",
+        help='JSON dict mapping supervised source keys to percentages, e.g. \'{"vqav2_train": 100, "vqav2_val": 10}\' or \'{"gqa_train": 100}\'.',
+    )
     ap.add_argument("--auto_download", action="store_true")
     ap.add_argument("--download_images", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--download_test", action=argparse.BooleanOptionalAction, default=False)
@@ -2789,6 +3490,33 @@ def parse_args() -> argparse.Namespace:
         default=123,
         help="Seed for eval image corruption modes that require a randomized image remap.",
     )
+    ap.add_argument(
+        "--eval_bypass_compression",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="At eval time, bypass the semantic bottleneck and feed raw perceiver evidence tokens to the LM.",
+    )
+    ap.add_argument(
+        "--eval_tiny_head",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run a 1-epoch linear probe over exported visual tokens instead of standard generation eval.",
+    )
+    ap.add_argument(
+        "--eval_grounding",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run grounding evaluation over an annotated pointing/GQA-style index instead of standard generation eval.",
+    )
+    ap.add_argument(
+        "--eval_grounding_index_path",
+        type=str,
+        default="",
+        help="Annotated JSONL index used by --eval_grounding. Falls back to --pointing_index_path when omitted.",
+    )
+    ap.add_argument("--tiny_head_epochs", type=int, default=1)
+    ap.add_argument("--tiny_head_answer_top_k", type=int, default=3000)
+    ap.add_argument("--tiny_head_feature_pool", type=str, default="flatten", choices=["flatten", "mean"])
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--max_steps", type=int, default=0)
     ap.add_argument(
@@ -3004,6 +3732,18 @@ def main() -> None:
             limit=(int(args.limit_train) if int(args.limit_train) > 0 else 0),
         )
         logger.log(f"[mm] train samples={len(train_loader.dataset)}")
+        if hasattr(train_loader.dataset, "source_counts"):
+            logger.log(f"[mm] === effective train dataset mix: {len(train_loader.dataset)} samples ===")
+            for src, (total, kept, skipped) in sorted(train_loader.dataset.source_counts.items()):
+                pct_of_source = 100.0 * float(kept) / float(total) if total else 0.0
+                pct_of_dataset = 100.0 * float(kept) / float(len(train_loader.dataset)) if len(train_loader.dataset) else 0.0
+                line = (
+                    f"[mm]   {src:20s} {kept:>7d} / {total:>7d} "
+                    f"({pct_of_source:5.1f}% of source, {pct_of_dataset:5.1f}% of dataset)"
+                )
+                if skipped:
+                    line += f" skipped={skipped}"
+                logger.log(line)
     val_loader = build_loader(
         args,
         tokenizer=tokenizer,
@@ -3035,11 +3775,50 @@ def main() -> None:
         if warmup_batch is None:
             raise SystemExit("No data available to initialize multimodal modules.")
         _materialize_lazy_params(model, warmup_batch, device)
+        init_from_mm_checkpoint = str(getattr(args, "init_from_mm_checkpoint", "") or "").strip()
+        if init_from_mm_checkpoint:
+            load_model_weights_from_mm_checkpoint(
+                model,
+                init_from_mm_checkpoint,
+                logger=logger,
+            )
+    elif str(getattr(args, "init_from_mm_checkpoint", "") or "").strip():
+        logger.log("[mm] note: --init_from_mm_checkpoint ignored because --checkpoint resume is active")
+
+    semantic_teacher_checkpoint = str(getattr(args, "semantic_teacher_checkpoint", "") or "").strip()
+    if semantic_teacher_checkpoint:
+        attach_semantic_teacher(
+            model,
+            checkpoint_path=semantic_teacher_checkpoint,
+            device=device,
+            logger=logger,
+        )
 
     configure_freezing(model, args)
     _set_module_modes(model, args.freeze_mode)
     tr_params, all_params = _trainable_param_count(model)
     logger.log(f"[mm] trainable_params={tr_params:,} / total_params={all_params:,}")
+    module_rows = [
+        ("vision", model.vision_adapter.vision_model),
+        ("bridge", model.bridge),
+        ("semantic_bottleneck", getattr(model.bridge, "semantic_bottleneck", None)),
+        ("prefix_calibrator", model.prefix_calibrator),
+        ("lm", model.lm),
+        ("lm_visual_adapters", model.visual_adapters),
+    ]
+    for name, module in module_rows:
+        if module is None:
+            continue
+        total_n, train_n = _module_param_summary(module)
+        logger.log(
+            f"[mm] module={name} total_params={total_n:,} trainable_params={train_n:,} "
+            f"frozen_params={max(0, total_n - train_n):,}"
+        )
+    if hasattr(model.bridge, "core"):
+        core_total, core_train = _module_param_summary(model.bridge.core)
+        logger.log(
+            f"[mm] perceiver_core_frozen={int(core_train == 0)} total_params={core_total:,} trainable_params={core_train:,}"
+        )
 
     optim_params = [p for p in model.parameters() if p.requires_grad]
     if not optim_params:
@@ -3074,6 +3853,24 @@ def main() -> None:
         restore_rng_state(resume_payload.get("rng_state"))
 
     if args.eval_only:
+        if bool(getattr(args, "eval_tiny_head", False)):
+            run_tiny_head_probe_eval(
+                model=model,
+                tokenizer=tokenizer,
+                args=args,
+                device=device,
+                logger=logger,
+            )
+            return
+        if bool(getattr(args, "eval_grounding", False)):
+            run_grounding_eval(
+                model=model,
+                tokenizer=tokenizer,
+                args=args,
+                device=device,
+                logger=logger,
+            )
+            return
         maybe_cuda_empty_cache(
             logger,
             enabled=bool(args.cuda_empty_cache_after_eval),
@@ -3223,16 +4020,31 @@ def main() -> None:
             ratio = info_dict.get("prefix_text_norm_ratio", None)
             reg_norm = info_dict.get("loss_prefix_norm_reg", None)
             reg_var = info_dict.get("loss_prefix_batchvar_reg", None)
+            sem_recon = info_dict.get("loss_semantic_recon", None)
+            sem_consistency = info_dict.get("loss_semantic_consistency", None)
+            loss_ground = info_dict.get("loss_grounding", None)
+            mean_kl = info_dict.get("grounding_mean_kl", None)
+            attn_entropy = info_dict.get("compression_mean_attn_entropy", None)
             ratio_txt = "" if ratio is None else f" pfx_txt_norm_ratio={float(ratio):.4f}"
             reg_txt = ""
             if reg_norm is not None:
                 reg_txt += f" reg_norm={float(reg_norm):.6f}"
             if reg_var is not None:
                 reg_txt += f" reg_var={float(reg_var):.6f}"
+            if sem_recon is not None:
+                reg_txt += f" distill={float(sem_recon):.6f}"
+            if sem_consistency is not None:
+                reg_txt += f" sem_consistency={float(sem_consistency):.6f}"
+            if loss_ground is not None and float(loss_ground) > 0.0:
+                reg_txt += f" grounding={float(loss_ground):.6f}"
+            if mean_kl is not None and float(mean_kl) > 0.0:
+                reg_txt += f" ground_kl={float(mean_kl):.6f}"
+            if attn_entropy is not None and float(attn_entropy) > 0.0:
+                reg_txt += f" comp_attn_ent={float(attn_entropy):.4f}"
             steps_per_s = float(train_log_steps) / max(1e-6, float(train_log_time_sec))
             logger.log(
                 f"[mm] step={global_step} epoch={epoch} loss={float(loss_value):.4f} "
-                f"loss_ce={loss_ce:.4f} loss_tokens={tok_count}{ratio_txt}{reg_txt} "
+                f"loss_vqa={loss_ce:.4f} loss_tokens={tok_count}{ratio_txt}{reg_txt} "
                 f"lr={current_lr:.6g} steps_per_s={steps_per_s:.2f}"
             )
             min_train_sps = float(getattr(args, "min_train_steps_per_s", 0.0))
@@ -3339,6 +4151,9 @@ def main() -> None:
             sampler = getattr(train_loader, "sampler", None)
             if isinstance(sampler, EpochShuffleSampler):
                 sampler.set_epoch(epoch)
+            batch_sampler = getattr(train_loader, "batch_sampler", None)
+            if isinstance(batch_sampler, GroundingMixBatchSampler):
+                batch_sampler.set_epoch(epoch)
             iter_obj = train_loader
 
         for batch_in_epoch, batch in enumerate(iter_obj, start=1):
