@@ -268,6 +268,10 @@ def _record_accuracy(record: Dict[str, Any], scorer: str) -> float:
     pred = str(record.get("prediction", ""))
     if scorer == "official":
         return vqa_official_accuracy(pred, answers)
+    if scorer == "exact":
+        pred_norm = normalize_vqa_answer(pred)
+        gt_norm = [normalize_vqa_answer(a) for a in answers if str(a).strip()]
+        return 1.0 if pred_norm and pred_norm in gt_norm else 0.0
     return vqa_soft_accuracy(pred, answers)
 
 
@@ -460,7 +464,7 @@ def parse_args() -> argparse.Namespace:
 
     ap.add_argument("--qualitative_samples", type=int, default=8)
     ap.add_argument("--confusion_top_k", type=int, default=20)
-    ap.add_argument("--scorer", type=str, default="official", choices=["official", "proxy"])
+    ap.add_argument("--scorer", type=str, default="official", choices=["official", "proxy", "exact"])
     ap.add_argument("--seed", type=int, default=35)
 
     ap.add_argument("--save_predictions_jsonl", type=str, default=None)

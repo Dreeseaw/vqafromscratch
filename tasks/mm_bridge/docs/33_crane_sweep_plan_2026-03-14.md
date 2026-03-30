@@ -7,7 +7,7 @@ This plan accounts for:
 - Report 32a (coworker's Plank sweep report)
 - Report 32b (my Plank sweep report)
 - The full codebase, including `train/mm.py`, `models/bridge.py`, `models/hf_vision.py`
-- All prior sweep history and AUTORESEARCH_STATE
+- All prior sweep history and RESEARCH_STATE
 - The project's deferred ideas list
 
 The Plank sweep established a new frontier at `0.5240` from `mobilevit_attnqquery_dynbudget_adapter_d3_cap64`. Both reports agree on all material findings. Crane builds on that consensus.
@@ -290,7 +290,7 @@ CaptionAlign gives the bridge a warm start: before seeing any VQA examples, it h
 
 **Why this is high-entropy / high-upside:**
 
-Bridge pre-training has been deferred since the project's first sweep. The AUTORESEARCH_STATE journal (2026-03-13) called it "a phase-change investment, not the next cheap high-information move." That was correct when the bridge was still being debugged and the VM was the old vitvae2.
+Bridge pre-training has been deferred since the project's first sweep. The RESEARCH_STATE journal (2026-03-13) called it "a phase-change investment, not the next cheap high-information move." That was correct when the bridge was still being debugged and the VM was the old vitvae2.
 
 Now the situation is different:
 - The bridge architecture is stable (perceiver resampler with qquery + dynbudget + adapters)

@@ -1,8 +1,13 @@
 import { serve } from "bun";
+import { DuckDBInstance } from "@duckdb/node-api";
 import fs from "fs";
 import os from "os";
 import path from "path";
 import { parseRunLog, type SeriesPoint } from "./logstitch";
+import {
+  loadTasks as loadIndexedTasks,
+  resolveTaskContext as resolveIndexedTaskContext,
+} from "./experimentindex";
 
 type RunStage = "vm" | "mm" | "other";
 
@@ -249,6 +254,7 @@ type IdeaGraphDebug = {
 };
 
 const ACTIVE_WINDOW_MS = 45 * 60 * 1000;
+const EXPERIMENT_DB_REL_PATH = path.join("logs", "experiments.duckdb");
 const QA_TIMEOUT_MS = 2 * 60 * 1000;
 const QA_MAX_TURNS = 8;
 const IDEA_TREE_TIMEOUT_MS = 90 * 1000;
@@ -268,6 +274,37 @@ const preferredUserHome =
   process.env.HOME ||
   os.homedir();
 const ideaTreeProgressByTask = new Map<string, IdeaTreeProgressStatus>();
+const dbSnapshotCache = new Map<string, { dbMtimeMs: number; payload: DbTaskSnapshot }>();
+
+type DbTaskSnapshot = {
+  generatedAt: string;
+  repoRoot: string;
+  minSteps: number;
+  experiments: Array<{
+    taskId: string;
+    taskTitle: string;
+    experimentId: string;
+    experimentDir: string;
+    timelinePath: string;
+    status: "running" | "completed";
+    startedAt: string | null;
+    endedAt: string | null;
+    runCount: number;
+    activeRuns: number;
+    bestAccuracy: number | null;
+    lastTrainCe: number | null;
+    maxLastStep: number | null;
+    minLastStep: number | null;
+    runs: RunSummary[];
+  }>;
+  runs: RunSummary[];
+  summary: {
+    experimentsCount: number;
+    runsCount: number;
+    runsWithAccuracy: number;
+    bestRun: { runId: string; finalAccuracy: number | null; bestAccuracy: number | null } | null;
+  };
+};
 
 const IDEA_GRAPH_HARVEST_OUTPUT_SCHEMA = {
   type: "object",
@@ -456,6 +493,176 @@ function readText(file: string): string {
   }
 }
 
+function getExperimentDbPath(): string {
+  return path.join(repoRoot, EXPERIMENT_DB_REL_PATH);
+}
+
+function normalizeDbRun(task: TaskContext, run: RunSummary): RunSummary {
+  return {
+    ...run,
+    runDir: path.isAbsolute(run.runDir) ? run.runDir : path.join(repoRoot, run.runDir),
+  };
+}
+
+function toMaybeNumber(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  const num = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(num) ? num : null;
+}
+
+function toBool(value: unknown): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") return value.toLowerCase() === "true" || value === "1";
+  return false;
+}
+
+async function loadDbTaskSnapshot(task: TaskContext): Promise<DbTaskSnapshot> {
+  const dbPath = getExperimentDbPath();
+  if (!fs.existsSync(dbPath) || !fs.statSync(dbPath).isFile()) {
+    throw new Error(`Missing experiment DB at ${EXPERIMENT_DB_REL_PATH}. Run: python3 scripts/build_experiment_db.py`);
+  }
+  const dbMtimeMs = fs.statSync(dbPath).mtimeMs;
+  const cached = dbSnapshotCache.get(task.id);
+  if (cached && cached.dbMtimeMs === dbMtimeMs) return cached.payload;
+
+  const safeTaskId = task.id.replaceAll("'", "''");
+  const instance = await DuckDBInstance.create(dbPath, { access_mode: "READ_ONLY" });
+  const connection = await instance.connect();
+  const queryJson = async (sql: string): Promise<Record<string, unknown>[]> => {
+    const result = await connection.run(sql);
+    return await result.getRowObjectsJson();
+  };
+
+  try {
+    const metaRows = await queryJson("select generated_at, repo_root, min_steps from metadata limit 1");
+    if (metaRows.length === 0) throw new Error(`metadata missing in ${EXPERIMENT_DB_REL_PATH}`);
+    const experimentRows = await queryJson(`
+    select
+      task_id,
+      task_title,
+      experiment_id,
+      experiment_dir,
+      timeline_path,
+      status,
+      started_at,
+      ended_at,
+      run_count,
+      active_runs,
+      best_accuracy,
+      last_train_ce,
+      max_last_step,
+      min_last_step
+    from experiments
+    where task_id = '${safeTaskId}'
+    order by coalesce(max_last_step, -1) desc, experiment_id
+  `);
+    const runRows = await queryJson(`
+    select
+      task_id,
+      experiment_id,
+      run_id,
+      run_dir,
+      run_stage,
+      experiment_family,
+      paired_run_id,
+      final_accuracy,
+      best_accuracy,
+      last_train_ce,
+      last_step,
+      last_steps_per_sec,
+      num_params,
+      trainable_params,
+      is_active,
+      has_final_checkpoint,
+      is_eval_only,
+      logfile,
+      logfile_path,
+      logfile_mtime_ms
+    from runs
+    where task_id = '${safeTaskId}'
+    order by experiment_id, run_id
+  `);
+
+    const runsWithExperimentId = runRows.map((row) => ({
+      experimentId: String(row.experiment_id),
+      run: normalizeDbRun(task, {
+        runId: String(row.run_id),
+        runDir: String(row.run_dir),
+        finalAccuracy: toMaybeNumber(row.final_accuracy),
+        bestAccuracy: toMaybeNumber(row.best_accuracy),
+        lastTrainCe: toMaybeNumber(row.last_train_ce),
+        lastStep: toMaybeNumber(row.last_step),
+        lastStepsPerSec: toMaybeNumber(row.last_steps_per_sec),
+        numParams: toMaybeNumber(row.num_params),
+        trainableParams: toMaybeNumber(row.trainable_params),
+        isActive: toBool(row.is_active),
+        hasFinalCheckpoint: toBool(row.has_final_checkpoint),
+        isEvalOnly: toBool(row.is_eval_only),
+        logfile: row.logfile === null ? null : String(row.logfile),
+        logfileMtimeMs: toMaybeNumber(row.logfile_mtime_ms),
+        runStage: String(row.run_stage) as RunStage,
+        experimentFamily: row.experiment_family === null ? null : String(row.experiment_family),
+        pairedRunId: row.paired_run_id === null ? null : String(row.paired_run_id),
+      }),
+    }));
+    const runs: RunSummary[] = runsWithExperimentId.map((entry) => entry.run);
+    const runsByExperiment = new Map<string, RunSummary[]>();
+    for (const entry of runsWithExperimentId) {
+      const group = runsByExperiment.get(entry.experimentId);
+      if (group) group.push(entry.run);
+      else runsByExperiment.set(entry.experimentId, [entry.run]);
+    }
+    const experiments = experimentRows.map((row) => ({
+      taskId: String(row.task_id),
+      taskTitle: String(row.task_title),
+      experimentId: String(row.experiment_id),
+      experimentDir: path.isAbsolute(String(row.experiment_dir))
+        ? String(row.experiment_dir)
+        : path.join(repoRoot, String(row.experiment_dir)),
+      timelinePath: path.isAbsolute(String(row.timeline_path))
+        ? String(row.timeline_path)
+        : path.join(repoRoot, String(row.timeline_path)),
+      status: String(row.status) as "running" | "completed",
+      startedAt: row.started_at === null ? null : String(row.started_at),
+      endedAt: row.ended_at === null ? null : String(row.ended_at),
+      runCount: toMaybeNumber(row.run_count) ?? 0,
+      activeRuns: toMaybeNumber(row.active_runs) ?? 0,
+      bestAccuracy: toMaybeNumber(row.best_accuracy),
+      lastTrainCe: toMaybeNumber(row.last_train_ce),
+      maxLastStep: toMaybeNumber(row.max_last_step),
+      minLastStep: toMaybeNumber(row.min_last_step),
+      runs: runsByExperiment.get(String(row.experiment_id)) ?? [],
+    }));
+    const accRuns = runs.filter((run) => Number.isFinite(run.finalAccuracy ?? NaN));
+    const bestRun = accRuns.slice().sort((a, b) => (b.finalAccuracy ?? -1) - (a.finalAccuracy ?? -1))[0] ?? null;
+    const parsed: DbTaskSnapshot = {
+      generatedAt: String(metaRows[0].generated_at),
+      repoRoot: String(metaRows[0].repo_root),
+      minSteps: toMaybeNumber(metaRows[0].min_steps) ?? 0,
+      experiments,
+      runs,
+      summary: {
+        experimentsCount: experiments.length,
+        runsCount: runs.length,
+        runsWithAccuracy: accRuns.length,
+        bestRun: bestRun
+          ? {
+              runId: bestRun.runId,
+              finalAccuracy: bestRun.finalAccuracy,
+              bestAccuracy: bestRun.bestAccuracy,
+            }
+          : null,
+      },
+    };
+    dbSnapshotCache.set(task.id, { dbMtimeMs, payload: parsed });
+    return parsed;
+  } finally {
+    connection.closeSync();
+    instance.closeSync();
+  }
+}
+
 function findExecutable(name: string): string | null {
   const candidates = (process.env.PATH ?? "")
     .split(path.delimiter)
@@ -540,7 +747,7 @@ function loadTasks(): TaskContext[] {
   return tasks;
 }
 
-const allTasks = loadTasks();
+const allTasks = loadIndexedTasks(repoRoot, tasksRoot);
 const tasksById = new Map(allTasks.map((task) => [task.id, task] as const));
 const defaultTask = (cliTaskId && tasksById.get(cliTaskId)) || allTasks.find((task) => task.isDefault) || allTasks[0];
 const codexExecutable = findExecutable("codex");
@@ -552,8 +759,7 @@ const codexPathEntries = uniq(
 );
 
 function resolveTaskContext(taskId: string | null | undefined): TaskContext | null {
-  const requested = String(taskId ?? cliTaskId ?? defaultTask.id).trim();
-  return tasksById.get(requested) ?? null;
+  return resolveIndexedTaskContext(tasksById, taskId ?? cliTaskId ?? defaultTask.id, defaultTask.id);
 }
 
 function taskIncludesLogName(task: TaskContext, name: string): boolean {
@@ -642,9 +848,9 @@ function parseRunSummary(task: TaskContext, runId: string): RunSummary {
   return out;
 }
 
-function parseRunDetail(task: TaskContext, runId: string): RunDetail | null {
+async function parseRunDetail(task: TaskContext, runId: string): Promise<RunDetail | null> {
   const parsed = parseRunLog(path.join(task.logsRoot, runId));
-  const run = parseRunSummary(task, runId);
+  const run = (await loadDbTaskSnapshot(task)).runs.find((entry) => entry.runId === runId) ?? parseRunSummary(task, runId);
   if (!run.logfile) return null;
 
   return {
@@ -851,7 +1057,15 @@ function listSweeps(task: TaskContext): SweepSummary[] {
         mtimeMs: Math.max(...group.map((sweep) => sweep.mtimeMs)),
       };
     })
-    .filter((sweep) => sweep.runs.length > 1 || sweep.activeRuns > 0)
+    .filter((sweep) => {
+      if (sweep.runs.length > 1 || sweep.activeRuns > 0) return true;
+      return sweep.runs.some(
+        (run) =>
+          (typeof run.lastStep === "number" && run.lastStep > 100) ||
+          typeof run.finalAccuracy === "number" ||
+          typeof run.bestAccuracy === "number"
+      );
+    })
     .sort((a, b) => b.mtimeMs - a.mtimeMs)
     .map(({ mtimeMs: _mtimeMs, ...sweep }) => sweep);
 }
@@ -903,31 +1117,12 @@ function listStandaloneRuns(task: TaskContext): RunSummary[] {
     .filter(shouldIncludeRun);
 }
 
-function getBootstrap(task: TaskContext) {
-  const sweeps = listSweeps(task);
+async function getBootstrap(task: TaskContext) {
+  const bootstrap = await loadDbTaskSnapshot(task);
   const docs = listDocs(task);
-  const runMap = new Map<string, RunSummary>();
-  for (const sweep of sweeps) {
-    for (const run of sweep.runs) runMap.set(run.runId, run);
-  }
-  for (const run of listStandaloneRuns(task)) {
-    if (!runMap.has(run.runId)) runMap.set(run.runId, run);
-  }
-  for (const doc of docs) {
-    for (const runId of doc.runRefs) {
-      if (!taskIncludesLogName(task, runId)) continue;
-      if (runMap.has(runId)) continue;
-      const run = parseRunSummary(task, runId);
-      if (shouldIncludeRun(run)) runMap.set(runId, run);
-    }
-  }
-  const allRuns = [...runMap.values()];
-  const accRuns = allRuns.filter((run) => Number.isFinite(run.finalAccuracy ?? NaN));
-  const bestRun = accRuns.slice().sort((a, b) => (b.finalAccuracy ?? -1) - (a.finalAccuracy ?? -1))[0] ?? null;
-
   return {
-    generatedAt: new Date().toISOString(),
-    repoRoot,
+    generatedAt: bootstrap.generatedAt,
+    repoRoot: bootstrap.repoRoot,
     tasks: allTasks.map((entry) => ({ id: entry.id, title: entry.title, description: entry.description })),
     selectedTask: {
       id: task.id,
@@ -941,14 +1136,24 @@ function getBootstrap(task: TaskContext) {
     logsRoot: task.logsDir,
     scriptsRoot: task.scriptsDir,
     docs,
-    sweeps,
-    runs: allRuns,
+    sweeps: bootstrap.experiments.map((experiment) => ({
+      sweepId: experiment.experimentId,
+      sweepDir: experiment.experimentDir,
+      status: experiment.status,
+      startedAt: experiment.startedAt,
+      endedAt: experiment.endedAt,
+      runs: experiment.runs,
+      bestAccuracy: experiment.bestAccuracy,
+      lastTrainCe: experiment.lastTrainCe,
+      activeRuns: experiment.activeRuns,
+    })),
+    runs: bootstrap.runs,
     summary: {
       docsCount: docs.length,
-      sweepsCount: sweeps.length,
-      runsCount: allRuns.length,
-      runsWithAccuracy: accRuns.length,
-      bestRun: bestRun ? { runId: bestRun.runId, finalAccuracy: bestRun.finalAccuracy, bestAccuracy: bestRun.bestAccuracy } : null,
+      sweepsCount: bootstrap.summary.experimentsCount,
+      runsCount: bootstrap.summary.runsCount,
+      runsWithAccuracy: bootstrap.summary.runsWithAccuracy,
+      bestRun: bootstrap.summary.bestRun,
     },
   };
 }
@@ -1495,13 +1700,10 @@ function resolveDocPath(task: TaskContext, fileName: string | null): string | nu
   return full;
 }
 
-function resolveRunId(task: TaskContext, runId: string | null): string | null {
+async function resolveRunId(task: TaskContext, runId: string | null): Promise<string | null> {
   const name = String(runId ?? "").trim();
   if (!name || !/^[A-Za-z0-9._-]+$/.test(name)) return null;
-  if (!taskIncludesLogName(task, name)) return null;
-  const full = path.join(task.logsRoot, name);
-  if (!fs.existsSync(full) || !fs.statSync(full).isDirectory()) return null;
-  return name;
+  return (await loadDbTaskSnapshot(task)).runs.some((run) => run.runId === name) ? name : null;
 }
 
 function formatRunForQa(run: RunSummary): string {
@@ -1512,12 +1714,12 @@ function formatSweepForQa(sweep: SweepSummary): string {
   return `${sweep.sweepId}: status=${sweep.status} active_runs=${sweep.activeRuns} runs=${sweep.runs.length} best_acc=${fmtAcc(sweep.bestAccuracy)} last_train_ce=${fmtAcc(sweep.lastTrainCe)} started=${sweep.startedAt ?? "-"} ended=${sweep.endedAt ?? "-"}`;
 }
 
-function buildTaskQaPrompt(
+async function buildTaskQaPrompt(
   task: TaskContext,
   question: string,
   conversation: ChatTurn[]
 ): string {
-  const bootstrap = getBootstrap(task);
+  const bootstrap = await getBootstrap(task);
   const activeSweeps = bootstrap.sweeps.filter((sweep) => sweep.activeRuns > 0).slice(0, 6);
   const recentSweeps = bootstrap.sweeps.slice(0, 8);
   const activeRuns = bootstrap.runs.filter((run) => run.isActive).slice(0, 8);
@@ -1538,14 +1740,14 @@ function buildTaskQaPrompt(
     .join("\n");
 
   return [
-    "You are helping with a local autoresearch tracker.",
+    "You are helping with a local research tracker.",
     `Task: ${task.title} (${task.id})`,
     task.description ? `Task description: ${task.description}` : null,
     task.qaPromptHint ? `Task-specific hint: ${task.qaPromptHint}` : null,
     "",
     "Answer the user's question about the task as a whole, not a single run unless the evidence points there.",
     "You may inspect local files if needed, but stay within this repo and prioritize the task's docs, scripts, and logs.",
-    "Prefer current local evidence over generic ML advice. Compare against peer runs/sweeps when relevant.",
+    "Prefer current local evidence over generic ML advice. Compare against peer runs/experiments when relevant.",
     "If the evidence is weak or the task is too early to judge, say that explicitly.",
     "",
     "Output format:",
@@ -1565,15 +1767,15 @@ function buildTaskQaPrompt(
     "Tracker snapshot:",
     `- generated_at: ${bootstrap.generatedAt}`,
     `- docs_count: ${bootstrap.summary.docsCount}`,
-    `- sweeps_count: ${bootstrap.summary.sweepsCount}`,
+    `- experiments_count: ${bootstrap.summary.sweepsCount}`,
     `- runs_count: ${bootstrap.summary.runsCount}`,
     `- runs_with_accuracy: ${bootstrap.summary.runsWithAccuracy}`,
     `- best_run: ${bootstrap.summary.bestRun ? `${bootstrap.summary.bestRun.runId} final_acc=${fmtAcc(bootstrap.summary.bestRun.finalAccuracy)} best_acc=${fmtAcc(bootstrap.summary.bestRun.bestAccuracy)}` : "-"}`,
     "",
-    "Active sweeps:",
+    "Active experiments:",
     ...(activeSweeps.length > 0 ? activeSweeps.map((sweep) => `- ${formatSweepForQa(sweep)}`) : ["- none"]),
     "",
-    "Recent sweeps:",
+    "Recent experiments:",
     ...(recentSweeps.length > 0 ? recentSweeps.map((sweep) => `- ${formatSweepForQa(sweep)}`) : ["- none"]),
     "",
     "Active runs:",
@@ -2011,7 +2213,7 @@ async function handleTaskQa(req: Request): Promise<Response> {
     : [];
 
   try {
-    const answer = await runCodexTaskQa(buildTaskQaPrompt(task, question, conversation));
+    const answer = await runCodexTaskQa(await buildTaskQaPrompt(task, question, conversation));
     const evidence = parseEvidenceFromAnswer(answer);
     const response: TaskQaResponse = {
       taskId: task.id,
@@ -2061,7 +2263,7 @@ async function handleIdeaTree(req: Request, fallbackTask: TaskContext | null): P
       startedAt: new Date().toISOString(),
     });
     const totalStart = Date.now();
-    const bootstrap = getBootstrap(task);
+    const bootstrap = await getBootstrap(task);
 
     const evidenceStart = Date.now();
     const evidence = buildIdeaGraphEvidencePack(task, bootstrap);
@@ -2182,7 +2384,7 @@ serve({
     }
     if (url.pathname === "/api/bootstrap") {
       if (!task) return new Response("Unknown task", { status: 404 });
-      return new Response(JSON.stringify(getBootstrap(task)), {
+      return new Response(JSON.stringify(await getBootstrap(task)), {
         headers: { "Content-Type": "application/json; charset=utf-8" },
       });
     }
@@ -2196,9 +2398,9 @@ serve({
     }
     if (url.pathname === "/api/run") {
       if (!task) return new Response("Unknown task", { status: 404 });
-      const runId = resolveRunId(task, url.searchParams.get("runId"));
+      const runId = await resolveRunId(task, url.searchParams.get("runId"));
       if (!runId) return new Response("Not found", { status: 404 });
-      const detail = parseRunDetail(task, runId);
+      const detail = await parseRunDetail(task, runId);
       if (!detail) return new Response("Not found", { status: 404 });
       return new Response(JSON.stringify(detail), {
         headers: { "Content-Type": "application/json; charset=utf-8" },

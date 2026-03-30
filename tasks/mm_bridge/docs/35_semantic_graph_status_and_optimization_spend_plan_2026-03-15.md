@@ -86,7 +86,7 @@ The point is human readability. The graph should communicate "how ideas develope
 
 The important resource is not only run-side GPU time.
 
-The deeper goal is to measure optimization-loop spend from the auto-research process itself:
+The deeper goal is to measure optimization-loop spend from the research process itself:
 
 - Codex tokens spent over time
 - prompts and threads used to resolve a research bottleneck

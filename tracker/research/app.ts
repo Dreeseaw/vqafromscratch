@@ -323,7 +323,7 @@ let bootstrapLoadInFlight = false;
 let runDetailLoadInFlight = false;
 let taskQaLoadInFlight = false;
 let ideaTreeLoadInFlight = false;
-let sweepsSort: SortState<SweepSortKey> = { key: null, direction: "asc" };
+let sweepsSort: SortState<SweepSortKey> = { key: "startedAt", direction: "desc" };
 let runsSort: SortState<RunSortKey> = { key: "finalAccuracy", direction: "desc" };
 let docsSort: SortState<DocSortKey> = { key: null, direction: "asc" };
 let ideaTree: IdeaTreeResponse | null = null;
@@ -650,7 +650,7 @@ function renderKpis(data: Bootstrap) {
   const best = data.summary.bestRun;
   const items = [
     { label: "Docs", value: String(data.summary.docsCount) },
-    { label: "Sweeps", value: String(data.summary.sweepsCount) },
+    { label: "Experiments", value: String(data.summary.sweepsCount) },
     { label: "Runs", value: String(data.summary.runsCount) },
     { label: "Runs w/ Acc", value: String(data.summary.runsWithAccuracy) },
     {
@@ -1406,7 +1406,7 @@ function renderTaskQa(data: Bootstrap) {
 
   threadWrap.innerHTML = "";
   if (thread.length === 0) {
-    threadWrap.innerHTML = `<div class="qa-empty muted">Ask about the whole task. The answer is grounded in current sweeps, runs, docs, and task scripts.</div>`;
+    threadWrap.innerHTML = `<div class="qa-empty muted">Ask about the whole task. The answer is grounded in current experiments, runs, docs, and task scripts.</div>`;
   } else {
     for (const message of thread) {
       const bubble = document.createElement("div");

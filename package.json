@@ -1,0 +1,8 @@
+{
+  "name": "vqafromscratch",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@duckdb/node-api": "^1.5.1-r.1"
+  }
+}

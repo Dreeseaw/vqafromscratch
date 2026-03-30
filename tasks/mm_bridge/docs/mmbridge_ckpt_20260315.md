@@ -5964,7 +5964,7 @@ This plan accounts for:
 - Report 32a (coworker's Plank sweep report)
 - Report 32b (my Plank sweep report)
 - The full codebase, including `train/mm.py`, `models/bridge.py`, `models/hf_vision.py`
-- All prior sweep history and AUTORESEARCH_STATE
+- All prior sweep history and RESEARCH_STATE
 - The project's deferred ideas list
 
 The Plank sweep established a new frontier at `0.5240` from `mobilevit_attnqquery_dynbudget_adapter_d3_cap64`. Both reports agree on all material findings. Crane builds on that consensus.
@@ -6247,7 +6247,7 @@ CaptionAlign gives the bridge a warm start: before seeing any VQA examples, it h
 
 **Why this is high-entropy / high-upside:**
 
-Bridge pre-training has been deferred since the project's first sweep. The AUTORESEARCH_STATE journal (2026-03-13) called it "a phase-change investment, not the next cheap high-information move." That was correct when the bridge was still being debugged and the VM was the old vitvae2.
+Bridge pre-training has been deferred since the project's first sweep. The RESEARCH_STATE journal (2026-03-13) called it "a phase-change investment, not the next cheap high-information move." That was correct when the bridge was still being debugged and the VM was the old vitvae2.
 
 Now the situation is different:
 - The bridge architecture is stable (perceiver resampler with qquery + dynbudget + adapters)
@@ -7695,7 +7695,7 @@ The point is human readability. The graph should communicate "how ideas develope
 
 The important resource is not only run-side GPU time.
 
-The deeper goal is to measure optimization-loop spend from the auto-research process itself:
+The deeper goal is to measure optimization-loop spend from the research process itself:
 
 - Codex tokens spent over time
 - prompts and threads used to resolve a research bottleneck
@@ -9670,9 +9670,9 @@ My best read is:
 
 ---
 
-# Source: tasks/mm_bridge/docs/AUTORESEARCH_STATE.md
+# Source: tasks/mm_bridge/docs/RESEARCH_STATE.md
 
-# AUTORESEARCH_STATE
+# RESEARCH_STATE
 
 ## 2026-03-11
 
@@ -10261,9 +10261,9 @@ Those are the architectures that most directly move project understanding, not j
 
 ---
 
-# Source: tasks/mm_bridge/docs/Bridge_AutoResearch_2026-03-10.md
+# Source: tasks/mm_bridge/docs/Bridge_Research_2026-03-10.md
 
-# Bridge_AutoResearch (Handoff) - 2026-03-10
+# Bridge_Research (Handoff) - 2026-03-10
 
 ## Purpose
 
@@ -10693,7 +10693,7 @@ Prioritize **bridge/interface redesign and calibration** before retraining VM fr
 
 # MM Bridge Global Task Context
 
-This document is the standing context and comparison policy for the ongoing multimodal bridge auto-research task.
+This document is the standing context and comparison policy for the ongoing multimodal bridge research task.
 
 It is intended to prevent apples-to-oranges comparisons across bridge runs and to preserve stable operating assumptions across future work.
 
@@ -10723,7 +10723,7 @@ Those exception runs should be labeled clearly as non-comparable.
 
 ## Comparison Standard
 
-For the remainder of this bridge auto-research task, the comparison-standard training setup is:
+For the remainder of this bridge research task, the comparison-standard training setup is:
 
 - effective batch size: `192`
 - progress eval cadence: every `1000` steps
@@ -11203,4 +11203,3 @@ That is a much better triage order than:
 - blaming Docker
 - blaming log cadence
 - blaming CUDA cache first
-

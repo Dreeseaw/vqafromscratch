@@ -379,6 +379,7 @@ class VQAv2Dataset(Dataset):
                     "split": split,
                     "question_type": question_type,
                     "answer_type": answer_type,
+                    "source_dataset": "vqav2",
                     "official_question_type": question_type_official,
                     "official_answer_type": answer_type_official,
                     "heuristic_question_type": heuristic_question_category(question),
@@ -464,6 +465,8 @@ class GQADataset(Dataset):
         limit: int = 0,
         skip_missing_images: bool = True,
         question_group: str = "",
+        train_fraction: float = 1.0,
+        seed: int = 0,
     ) -> None:
         super().__init__()
         if split not in ("train", "val"):
@@ -490,6 +493,13 @@ class GQADataset(Dataset):
                     for n in zf.namelist()
                     if n.startswith("train_all_questions/") and n.lower().endswith(".json")
                 )
+                train_fraction = float(train_fraction)
+                if 0.0 < train_fraction < 1.0 and member_names:
+                    keep_count = max(1, int(round(len(member_names) * train_fraction)))
+                    shard_names = list(member_names)
+                    rng = random.Random(int(seed))
+                    rng.shuffle(shard_names)
+                    member_names = sorted(shard_names[:keep_count])
             else:
                 member_names = ["val_all_questions.json"]
             for member_name in member_names:
@@ -1082,4 +1092,163 @@ class GroundingMixBatchSampler(BatchSampler):
             batch.extend(offset + int(idx) for idx in base_indices[base_pos : base_pos + self.base_batch])
             base_pos += self.base_batch
             point_rng.shuffle(batch)
+            yield batch
+
+
+class VQAGQAMixBatchSampler(BatchSampler):
+    def __init__(
+        self,
+        *,
+        vqa_dataset: Dataset,
+        gqa_dataset: Dataset,
+        batch_size: int,
+        gqa_mix_ratio: float,
+        seed: int,
+        drop_last: bool = True,
+    ) -> None:
+        self.vqa_dataset = vqa_dataset
+        self.gqa_dataset = gqa_dataset
+        self.batch_size = max(1, int(batch_size))
+        self.gqa_mix_ratio = max(0.0, min(1.0, float(gqa_mix_ratio)))
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.epoch = 1
+
+        self.gqa_batch = max(1, int(round(float(self.batch_size) * self.gqa_mix_ratio)))
+        self.vqa_batch = max(0, self.batch_size - self.gqa_batch)
+        if self.vqa_batch <= 0:
+            raise ValueError("gqa_mix_ratio leaves no room for VQAv2 samples in the batch.")
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = max(1, int(epoch))
+
+    def __len__(self) -> int:
+        n_vqa = len(self.vqa_dataset)
+        if self.drop_last:
+            return max(1, n_vqa // self.vqa_batch)
+        return max(1, int(math.ceil(float(n_vqa) / float(self.vqa_batch))))
+
+    def _make_cycle(self, length: int, *, seed_key: str) -> deque[int]:
+        idxs = list(range(length))
+        rng = random.Random(f"{self.seed}_{self.epoch}_{seed_key}")
+        rng.shuffle(idxs)
+        return deque(idxs)
+
+    def __iter__(self) -> Iterable[List[int]]:
+        vqa_cycle = self._make_cycle(len(self.vqa_dataset), seed_key="vqa")
+        gqa_cycle = self._make_cycle(len(self.gqa_dataset), seed_key="gqa")
+        rng = random.Random(f"{self.seed}_{self.epoch}_vqagqa_batch")
+        gqa_offset = len(self.vqa_dataset)
+
+        def next_from_cycle(cycle: deque[int], length: int, seed_key: str) -> int:
+            if not cycle:
+                cycle.extend(self._make_cycle(length, seed_key=seed_key))
+            return int(cycle.popleft())
+
+        for _ in range(len(self)):
+            batch: List[int] = []
+            for _ in range(self.vqa_batch):
+                batch.append(next_from_cycle(vqa_cycle, len(self.vqa_dataset), "vqa"))
+            for _ in range(self.gqa_batch):
+                batch.append(gqa_offset + next_from_cycle(gqa_cycle, len(self.gqa_dataset), "gqa"))
+            rng.shuffle(batch)
+            yield batch
+
+
+class GroundingGQAMixBatchSampler(BatchSampler):
+    def __init__(
+        self,
+        *,
+        vqa_dataset: Dataset,
+        gqa_dataset: Dataset,
+        pointing_dataset: PointingIndexDataset,
+        batch_size: int,
+        gqa_mix_ratio: float,
+        pointing_mix_ratio: float,
+        seed: int,
+        drop_last: bool = True,
+    ) -> None:
+        self.vqa_dataset = vqa_dataset
+        self.gqa_dataset = gqa_dataset
+        self.pointing_dataset = pointing_dataset
+        self.batch_size = max(1, int(batch_size))
+        self.gqa_mix_ratio = max(0.0, min(1.0, float(gqa_mix_ratio)))
+        self.pointing_mix_ratio = max(0.0, min(1.0, float(pointing_mix_ratio)))
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.epoch = 1
+
+        self.pointing_batch = max(1, int(round(float(self.batch_size) * self.pointing_mix_ratio)))
+        self.gqa_batch = max(1, int(round(float(self.batch_size) * self.gqa_mix_ratio)))
+        self.vqa_batch = max(0, self.batch_size - self.pointing_batch - self.gqa_batch)
+        if self.vqa_batch <= 0:
+            raise ValueError("gqa_mix_ratio + pointing_mix_ratio leaves no room for VQAv2 samples in the batch.")
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = max(1, int(epoch))
+
+    def __len__(self) -> int:
+        n_vqa = len(self.vqa_dataset)
+        if self.drop_last:
+            return max(1, n_vqa // self.vqa_batch)
+        return max(1, int(math.ceil(float(n_vqa) / float(self.vqa_batch))))
+
+    def _make_cycle(self, length: int, *, seed_key: str) -> deque[int]:
+        idxs = list(range(length))
+        rng = random.Random(f"{self.seed}_{self.epoch}_{seed_key}")
+        rng.shuffle(idxs)
+        return deque(idxs)
+
+    def _make_pointing_source_cycles(self) -> Tuple[List[str], List[float], Dict[str, deque[int]]]:
+        rng = random.Random(f"{self.seed}_{self.epoch}_pointing")
+        source_cycles: Dict[str, deque[int]] = {}
+        for source, idxs in self.pointing_dataset.source_to_indices.items():
+            shuffled = list(idxs)
+            rng.shuffle(shuffled)
+            source_cycles[source] = deque(shuffled)
+        weights = []
+        sources = []
+        for source in sorted(source_cycles.keys()):
+            w = float(self.pointing_dataset.recommended_sampling_weights.get(source, 1.0))
+            if w <= 0.0:
+                continue
+            sources.append(source)
+            weights.append(w)
+        if not sources:
+            sources = sorted(source_cycles.keys())
+            weights = [1.0 for _ in sources]
+        return sources, weights, source_cycles
+
+    def __iter__(self) -> Iterable[List[int]]:
+        vqa_cycle = self._make_cycle(len(self.vqa_dataset), seed_key="vqa")
+        gqa_cycle = self._make_cycle(len(self.gqa_dataset), seed_key="gqa")
+        point_sources, point_weights, source_cycles = self._make_pointing_source_cycles()
+        rng = random.Random(f"{self.seed}_{self.epoch}_multi_batch")
+
+        gqa_offset = len(self.vqa_dataset)
+        pointing_offset = len(self.vqa_dataset) + len(self.gqa_dataset)
+
+        def next_from_cycle(cycle: deque[int], length: int, seed_key: str) -> int:
+            if not cycle:
+                cycle.extend(self._make_cycle(length, seed_key=seed_key))
+            return int(cycle.popleft())
+
+        def next_point_index() -> int:
+            source = rng.choices(point_sources, weights=point_weights, k=1)[0]
+            bucket = source_cycles[source]
+            if not bucket:
+                refill = list(self.pointing_dataset.source_to_indices[source])
+                rng.shuffle(refill)
+                bucket.extend(refill)
+            return int(bucket.popleft())
+
+        for _ in range(len(self)):
+            batch: List[int] = []
+            for _ in range(self.vqa_batch):
+                batch.append(next_from_cycle(vqa_cycle, len(self.vqa_dataset), "vqa"))
+            for _ in range(self.gqa_batch):
+                batch.append(gqa_offset + next_from_cycle(gqa_cycle, len(self.gqa_dataset), "gqa"))
+            for _ in range(self.pointing_batch):
+                batch.append(pointing_offset + next_point_index())
+            rng.shuffle(batch)
             yield batch

@@ -35,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--max_answer_length", type=int, default=None)
     ap.add_argument("--keep_counts", type=str, default="3,2,1,0")
     ap.add_argument("--scorer", type=str, default="official", choices=["official", "proxy"])
+    ap.add_argument("--disable_lm_visual_adapters", action=argparse.BooleanOptionalAction, default=None)
     ap.add_argument("--seed", type=int, default=35)
     ap.add_argument("--output_json", type=str, required=True)
     return ap.parse_args()
@@ -86,6 +87,7 @@ def main() -> None:
         "annotations_root": args.annotations_root,
         "gqa_root": args.gqa_root,
         "gqa_eval_group": str(args.gqa_eval_group or ""),
+        "disable_lm_visual_adapters": args.disable_lm_visual_adapters,
     }
     model, tokenizer, _bridge_cfg, _payload, run_args = load_runtime_from_checkpoint(
         checkpoint_path=args.checkpoint,

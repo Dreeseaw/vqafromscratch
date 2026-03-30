@@ -1,0 +1,9 @@
+import { DuckDBPreparedStatement } from './DuckDBPreparedStatement';
+import { DuckDBPreparedStatementCollection } from './DuckDBPreparedStatementCollection';
+export declare class DuckDBPreparedStatementWeakRefCollection implements DuckDBPreparedStatementCollection {
+    preparedStatements: WeakRef<DuckDBPreparedStatement>[];
+    lastPruneTime: number;
+    add(prepared: DuckDBPreparedStatement): void;
+    destroySync(): void;
+    private prune;
+}

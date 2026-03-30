@@ -1,6 +1,6 @@
 # MM Bridge Global Task Context
 
-This document is the standing context and comparison policy for the ongoing multimodal bridge auto-research task.
+This document is the standing context and comparison policy for the ongoing multimodal bridge research task.
 
 It is intended to prevent apples-to-oranges comparisons across bridge runs and to preserve stable operating assumptions across future work.
 
@@ -30,7 +30,7 @@ Those exception runs should be labeled clearly as non-comparable.
 
 ## Comparison Standard
 
-For the remainder of this bridge auto-research task, the comparison-standard training setup is:
+For the remainder of this bridge research task, the comparison-standard training setup is:
 
 - effective batch size: `192`
 - progress eval cadence: every `1000` steps

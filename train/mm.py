@@ -31,11 +31,18 @@ from torch.utils.data import ConcatDataset, DataLoader, Sampler
 
 from models.bpe_tokenizer import ByteBPETokenizer
 from models.bridge import BridgeConfig, build_bridge
-from models.hf_vision import HFMobileViTSmallBackbone, HFDINOv2SmallBackbone, HFDINOv2BaseBackbone, OpenCLIPBackbone, HFSigLIPBasePatch16Backbone
+from models.hf_vision import (
+    DualSigLIPViTSTRTinyBackbone,
+    HFDINOv2BaseBackbone,
+    HFDINOv2SmallBackbone,
+    HFMobileViTSmallBackbone,
+    HFSigLIPBasePatch16Backbone,
+    OpenCLIPBackbone,
+)
 from models.vit_ssl import DINOCheckpointBackbone
 from models.lm import LMConfig, TransformerDecoderOnlyV1
 from models.vae import VAEConfig, VariationalAutoEncoder, VariationalAutoEncoderRes, ViTVAE, ViTVAE2
-from train.vqa_data import GQADataset, GroundingMixBatchSampler, MixedVQAv2Dataset, PointingIndexDataset, VQAv2Dataset, VQAv2Paths, build_image_transform, prepare_vqav2
+from train.vqa_data import GQADataset, GroundingGQAMixBatchSampler, GroundingMixBatchSampler, MixedVQAv2Dataset, PointingIndexDataset, VQAGQAMixBatchSampler, VQAv2Dataset, VQAv2Paths, build_image_transform, prepare_vqav2
 
 
 LOGDIR = "logs"
@@ -290,6 +297,7 @@ def _apply_runtime_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "grounding_sigma": 1.5,
         "pointing_index_path": "",
         "pointing_mix_ratio": 0.25,
+        "gqa_train_mix_ratio": 0.0,
         "eval_bypass_compression": False,
         "eval_tiny_head": False,
         "eval_grounding": False,
@@ -307,6 +315,18 @@ def _apply_runtime_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "lm_visual_adapter_num_heads": 8,
         "lm_visual_adapter_dropout": 0.0,
         "lm_visual_adapter_gate_init": 0.5,
+        "use_prefix_remap": False,
+        "prefix_remap_present": False,
+        "apply_prefix_remap_in_forward": False,
+        "prefix_remap_checkpoint": "",
+        "disable_lm_visual_adapters": False,
+        "answer_kd_labels_path": "",
+        "answer_kd_weight": 0.0,
+        "answer_kd_temp": 4.0,
+        "semantic_format_loss_weight": 0.0,
+        "semantic_format_loss_final_weight": 0.0,
+        "semantic_format_anneal_start_step": 0,
+        "semantic_format_anneal_end_step": 0,
         "prefix_calibration": False,
         "prefix_calib_layernorm": True,
         "prefix_calib_bias": True,
@@ -352,10 +372,10 @@ def _apply_runtime_defaults(args: argparse.Namespace) -> argparse.Namespace:
 def _normalize_semantic_aliases(args: argparse.Namespace) -> argparse.Namespace:
     if bool(getattr(args, "use_compression", False)):
         args.semantic_bottleneck = True
-    if hasattr(args, "compression_k") and int(getattr(args, "compression_k", 0)) > 0:
-        args.semantic_tokens = int(getattr(args, "compression_k"))
-    if hasattr(args, "compression_distill_weight"):
-        args.semantic_recon_loss_weight = float(getattr(args, "compression_distill_weight"))
+        if hasattr(args, "compression_k") and int(getattr(args, "compression_k", 0)) > 0:
+            args.semantic_tokens = int(getattr(args, "compression_k"))
+        if hasattr(args, "compression_distill_weight"):
+            args.semantic_recon_loss_weight = float(getattr(args, "compression_distill_weight"))
     return args
 
 
@@ -419,6 +439,34 @@ def build_vision_model_from_args(args: argparse.Namespace, device: str, ckpt_pay
             raise SystemExit(f"Expected checkpoint at {ckpt_path}. Run the download script first.")
         model = OpenCLIPBackbone("MobileCLIP2-S0", checkpoint_path=ckpt_path, device=device)
         return model.to(device)
+    elif vision_model_name == "siglip2_b16":
+        model_dir = str(args.vision_checkpoint or meta.get("vision_checkpoint", ""))
+        if not model_dir:
+            raise SystemExit("--vision_checkpoint must point to a local SigLIP2 directory for --vision_model siglip2_b16")
+        ckpt_path = os.path.join(model_dir, "open_clip_model.pt")
+        if not os.path.isfile(ckpt_path):
+            raise SystemExit(f"Expected checkpoint at {ckpt_path}. Run the Tier 0 backbone download script first.")
+        model = OpenCLIPBackbone(
+            "ViT-B-16-SigLIP2",
+            checkpoint_path=ckpt_path,
+            device=device,
+            strip_cls_token=False,
+        )
+        return model.to(device)
+    elif vision_model_name == "pe_core_b16":
+        model_dir = str(args.vision_checkpoint or meta.get("vision_checkpoint", ""))
+        if not model_dir:
+            raise SystemExit("--vision_checkpoint must point to a local PE-Core directory for --vision_model pe_core_b16")
+        ckpt_path = os.path.join(model_dir, "open_clip_model.pt")
+        if not os.path.isfile(ckpt_path):
+            raise SystemExit(f"Expected checkpoint at {ckpt_path}. Run the Tier 0 backbone download script first.")
+        model = OpenCLIPBackbone(
+            "PE-Core-B-16",
+            checkpoint_path=ckpt_path,
+            device=device,
+            strip_cls_token=True,
+        )
+        return model.to(device)
     elif vision_model_name == "siglip_base":
         if int(getattr(args, "train_vision_last_n_blocks", 0)) > 0 or str(getattr(args, "freeze_mode", "")) == "full_finetune":
             raise SystemExit("siglip_base is currently frozen-vision only; VM finetuning is not wired for this path.")
@@ -426,6 +474,21 @@ def build_vision_model_from_args(args: argparse.Namespace, device: str, ckpt_pay
         if not model_dir:
             raise SystemExit("--vision_checkpoint must point to a local SigLIP directory for --vision_model siglip_base")
         model = HFSigLIPBasePatch16Backbone(model_dir=model_dir, device=device)
+        return model.to(device)
+    elif vision_model_name == "siglip_vitstr_tiny_dual":
+        if int(getattr(args, "train_vision_last_n_blocks", 0)) > 0 or str(getattr(args, "freeze_mode", "")) == "full_finetune":
+            raise SystemExit("siglip_vitstr_tiny_dual is currently frozen-vision only; VM finetuning is not wired for this path.")
+        siglip_dir = str(args.vision_checkpoint or meta.get("vision_checkpoint", ""))
+        vitstr_ckpt = str(getattr(args, "vision_aux_checkpoint", "") or meta.get("vision_aux_checkpoint", ""))
+        if not siglip_dir:
+            raise SystemExit("--vision_checkpoint must point to a local SigLIP directory for --vision_model siglip_vitstr_tiny_dual")
+        if not vitstr_ckpt:
+            raise SystemExit("--vision_aux_checkpoint must point to a local ViTSTR checkpoint for --vision_model siglip_vitstr_tiny_dual")
+        model = DualSigLIPViTSTRTinyBackbone(
+            siglip_model_dir=siglip_dir,
+            vitstr_checkpoint_path=vitstr_ckpt,
+            device=device,
+        )
         return model.to(device)
     elif vision_model_name == "dinovit_ssl":
         if int(getattr(args, "train_vision_last_n_blocks", 0)) > 0 or str(getattr(args, "freeze_mode", "")) == "full_finetune":
@@ -782,6 +845,17 @@ class ResidualVisualAdapter(nn.Module):
         return x
 
 
+class PrefixRemap(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        d = int(dim)
+        self.proj = nn.Linear(d, d)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch, prefix_tokens, d_model]
+        return self.proj(x)
+
+
 class MultimodalPrefixLM(nn.Module):
     def __init__(
         self,
@@ -813,6 +887,10 @@ class MultimodalPrefixLM(nn.Module):
         lm_visual_adapter_num_heads: int = 8,
         lm_visual_adapter_dropout: float = 0.0,
         lm_visual_adapter_gate_init: float = 0.5,
+        use_prefix_remap: bool = False,
+        prefix_remap_present: bool = False,
+        apply_prefix_remap_in_forward: bool | None = None,
+        disable_lm_visual_adapters: bool = False,
     ):
         super().__init__()
         self.vision_adapter = vision_adapter
@@ -830,6 +908,14 @@ class MultimodalPrefixLM(nn.Module):
             geom_token_mixer_layers=int(prefix_geom_token_mixer_layers),
         )
         self.prefix_calibration = bool(prefix_calibration)
+        self.use_prefix_remap = bool(use_prefix_remap)
+        self.prefix_remap_present = bool(prefix_remap_present) or self.use_prefix_remap
+        self.apply_prefix_remap_in_forward = (
+            self.use_prefix_remap
+            if apply_prefix_remap_in_forward is None
+            else bool(apply_prefix_remap_in_forward)
+        )
+        self.prefix_remap = PrefixRemap(d_model) if self.prefix_remap_present else nn.Identity()
         self.prefix_norm_target_ratio = float(prefix_norm_target_ratio)
         self.prefix_norm_reg_weight = float(prefix_norm_reg_weight)
         self.prefix_batchvar_reg_weight = float(prefix_batchvar_reg_weight)
@@ -874,6 +960,11 @@ class MultimodalPrefixLM(nn.Module):
                     gate_init=float(lm_visual_adapter_gate_init),
                 )
         self.uses_visual_adapters = len(self.visual_adapter_layer_ids) > 0
+        self.disable_lm_visual_adapters = bool(disable_lm_visual_adapters)
+        self.track_dual_source_attn = bool(getattr(self.bridge.cfg, "dual_visual_inputs", False))
+
+    def _active_visual_adapters_enabled(self) -> bool:
+        return bool(self.uses_visual_adapters) and not bool(self.disable_lm_visual_adapters)
 
     def _lm_autocast_dtype(self) -> Optional[torch.dtype]:
         if not self.lm_autocast:
@@ -1035,6 +1126,8 @@ class MultimodalPrefixLM(nn.Module):
             visual_prefix = visual_prefix[0]
 
         visual_prefix = self.prefix_calibrator(visual_prefix)
+        if self.apply_prefix_remap_in_forward:
+            visual_prefix = self.prefix_remap(visual_prefix)
         if self.prefix_dropout > 0.0 and self.training:
             visual_prefix = F.dropout(visual_prefix, p=self.prefix_dropout, training=True)
         return visual_prefix, used_visual_features
@@ -1051,7 +1144,7 @@ class MultimodalPrefixLM(nn.Module):
         k = int(visual_prefix.shape[1])
         prefix_pad = torch.zeros((b, k), dtype=torch.bool, device=text_emb.device)
         full_pad = torch.cat([prefix_pad, text_pad_mask], dim=1)
-        if not self.uses_visual_adapters:
+        if not self._active_visual_adapters_enabled():
             hidden = self.lm._decode_only(
                 x,
                 pad_mask=full_pad,
@@ -1141,7 +1234,7 @@ class MultimodalPrefixLM(nn.Module):
         text_pad_mask: torch.Tensor,
         visual_prefix: torch.Tensor,
     ) -> Tuple[torch.Tensor, int, Any]:
-        if self.uses_visual_adapters:
+        if self._active_visual_adapters_enabled():
             raise RuntimeError("KV-cache prefill is unsupported when lm_visual_adapter_type is enabled.")
         x = torch.cat([visual_prefix, text_emb], dim=1)
         b = int(text_emb.shape[0])
@@ -1478,6 +1571,7 @@ class MultimodalPrefixLM(nn.Module):
         *,
         answer_only: bool = True,
         debug_shapes: bool = False,
+        train_step: int | None = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         semantic_target_latents = None
         teacher_model = self.__dict__.get("semantic_teacher_model", None)
@@ -1489,6 +1583,12 @@ class MultimodalPrefixLM(nn.Module):
                 prompt_mask=batch.get("prompt_mask"),
                 question_mask=batch.get("question_mask"),
             )
+        need_bridge_attn = bool(
+            getattr(self, "use_grounding_loss", False)
+            or self.track_dual_source_attn
+            or bool(getattr(self.bridge.cfg, "semantic_grid_access", False))
+            or bool(getattr(self.bridge.cfg, "semantic_query_derivation", False))
+        )
         logits, prefix_k, aux = self.forward_logits(
             input_ids=batch["input_ids"],
             images=batch["images"],
@@ -1498,7 +1598,7 @@ class MultimodalPrefixLM(nn.Module):
             debug_shapes=debug_shapes,
             return_aux=True,
             semantic_target_latents=semantic_target_latents,
-            return_bridge_attn=bool(getattr(self, "use_grounding_loss", False)),
+            return_bridge_attn=need_bridge_attn,
         )
         text_logits = logits[:, prefix_k:, :]
         if text_logits.shape[1] < 2:
@@ -1520,6 +1620,8 @@ class MultimodalPrefixLM(nn.Module):
             "loss_tokens": float(denom.item()),
             "loss_ce": float(ce_loss.item()),
             "loss_vqa": float(ce_loss.item()),
+            "loss_answer_kd": 0.0,
+            "answer_kd_coverage": 0.0,
             "prefix_norm_mean": float(aux["prefix_norm_mean"].item()),
             "text_norm_mean": float(aux["text_norm_mean"].item()),
             "prefix_batch_variance_mean": float(aux["prefix_batch_variance_mean"].item()),
@@ -1528,11 +1630,55 @@ class MultimodalPrefixLM(nn.Module):
             "semantic_latent_dim": float(aux.get("semantic_latent_dim", ce_loss.new_tensor(0.0)).item()),
             "semantic_target_token_count": float(aux.get("semantic_target_token_count", ce_loss.new_tensor(0.0)).item()),
             "semantic_teacher_enabled": 1.0 if teacher_model is not None else 0.0,
+            "loss_semantic_format": 0.0,
+            "semantic_format_weight": 0.0,
+            "semantic_format_cosine_sim": 0.0,
             "loss_grounding": 0.0,
             "loss_distill": 0.0,
             "grounding_mean_kl": 0.0,
             "compression_mean_attn_entropy": float(aux.get("compression_mean_attn_entropy", ce_loss.new_tensor(0.0)).item()),
+            "compression_grid_attn_fraction": float(aux.get("compression_grid_attn_fraction", ce_loss.new_tensor(0.0)).item()),
+            "vitstr_attn_fraction": float(aux.get("vitstr_attn_fraction", ce_loss.new_tensor(0.0)).item()),
         }
+
+        answer_kd_store = self.__dict__.get("answer_kd_store", None)
+        answer_kd_weight = float(self.__dict__.get("answer_kd_weight", 0.0) or 0.0)
+        answer_kd_temp = float(self.__dict__.get("answer_kd_temp", 4.0) or 4.0)
+        if isinstance(answer_kd_store, dict) and answer_kd_weight > 0.0:
+            batch_qids = [int(qid) for qid in batch.get("question_ids", [])]
+            if batch_qids:
+                qid_to_row = dict(answer_kd_store.get("qid_to_row") or {})
+                answer_mask_any = batch["answer_loss_mask"].any(dim=1)
+                row_pairs: List[Tuple[int, int]] = []
+                for bi, qid in enumerate(batch_qids):
+                    row_idx = qid_to_row.get(int(qid))
+                    if row_idx is None or not bool(answer_mask_any[bi].item()):
+                        continue
+                    row_pairs.append((int(bi), int(row_idx)))
+                if row_pairs:
+                    batch_idx = torch.tensor([p[0] for p in row_pairs], device=next_logits.device, dtype=torch.long)
+                    row_idx = torch.tensor([p[1] for p in row_pairs], dtype=torch.long)
+                    answer_pos = batch["answer_loss_mask"][batch_idx].float().argmax(dim=1)
+                    student_vocab_cols = answer_kd_store.get("student_first_token_ids")
+                    teacher_logits_all = answer_kd_store.get("teacher_logits")
+                    if isinstance(student_vocab_cols, torch.Tensor) and isinstance(teacher_logits_all, torch.Tensor):
+                        student_answer_logits = next_logits[batch_idx, answer_pos].index_select(
+                            dim=-1,
+                            index=student_vocab_cols.to(device=next_logits.device),
+                        )
+                        teacher_answer_logits = teacher_logits_all.index_select(dim=0, index=row_idx).to(
+                            device=next_logits.device,
+                            dtype=student_answer_logits.dtype,
+                        )
+                        temp = max(1e-4, float(answer_kd_temp))
+                        kd_loss = F.kl_div(
+                            F.log_softmax(student_answer_logits / temp, dim=-1),
+                            F.softmax(teacher_answer_logits / temp, dim=-1),
+                            reduction="batchmean",
+                        ) * (temp * temp)
+                        loss = loss + answer_kd_weight * kd_loss
+                        info["loss_answer_kd"] = float(kd_loss.item())
+                        info["answer_kd_coverage"] = float(len(row_pairs)) / float(max(1, len(batch_qids)))
 
         if self.prefix_norm_reg_weight > 0.0 and self.prefix_norm_target_ratio > 0.0:
             ratio = aux["prefix_norm_mean"] / aux["text_norm_mean"].clamp_min(1e-8)
@@ -1555,6 +1701,38 @@ class MultimodalPrefixLM(nn.Module):
         if semantic_consistency is not None and semantic_consistency_weight > 0.0:
             loss = loss + semantic_consistency_weight * semantic_consistency
             info["loss_semantic_consistency"] = float(semantic_consistency.item())
+        semantic_export_tokens = aux.get("semantic_export_tokens")
+        semantic_format_weight = float(getattr(self, "semantic_format_loss_weight", 0.0))
+        semantic_format_final_weight = float(getattr(self, "semantic_format_loss_final_weight", 0.0))
+        semantic_format_anneal_start = int(getattr(self, "semantic_format_anneal_start_step", 0))
+        semantic_format_anneal_end = int(getattr(self, "semantic_format_anneal_end_step", 0))
+        if (
+            isinstance(semantic_export_tokens, torch.Tensor)
+            and isinstance(self.prefix_remap, PrefixRemap)
+            and semantic_format_weight > 0.0
+        ):
+            current_step = int(train_step or 0)
+            weight_now = semantic_format_weight
+            if semantic_format_anneal_end > semantic_format_anneal_start > 0 and current_step >= semantic_format_anneal_start:
+                if current_step >= semantic_format_anneal_end:
+                    weight_now = semantic_format_final_weight
+                else:
+                    frac = float(current_step - semantic_format_anneal_start) / float(
+                        max(1, semantic_format_anneal_end - semantic_format_anneal_start)
+                    )
+                    weight_now = semantic_format_weight + frac * (semantic_format_final_weight - semantic_format_weight)
+            if weight_now > 0.0:
+                teacher_tokens = self.prefix_remap(semantic_export_tokens).detach()
+                format_loss = F.mse_loss(semantic_export_tokens, teacher_tokens)
+                loss = loss + float(weight_now) * format_loss
+                cosine_sim = F.cosine_similarity(
+                    semantic_export_tokens.float(),
+                    teacher_tokens.float(),
+                    dim=-1,
+                ).mean()
+                info["loss_semantic_format"] = float(format_loss.item())
+                info["semantic_format_weight"] = float(weight_now)
+                info["semantic_format_cosine_sim"] = float(cosine_sim.item())
         if bool(getattr(self, "use_grounding_loss", False)):
             perceiver_final_attn = aux.get("perceiver_final_attn")
             has_grounding_target = batch.get("has_grounding_target")
@@ -1570,6 +1748,11 @@ class MultimodalPrefixLM(nn.Module):
                     attn_dist = attn.mean(dim=1).mean(dim=1)
                     attn_dist = attn_dist / attn_dist.sum(dim=-1, keepdim=True).clamp_min(1e-8)
                     target = grounding_soft_target[ground_mask].float()
+                    if int(target.shape[-1]) != int(attn_dist.shape[-1]):
+                        if int(target.shape[-1]) < int(attn_dist.shape[-1]):
+                            target = F.pad(target, (0, int(attn_dist.shape[-1]) - int(target.shape[-1])), value=0.0)
+                        else:
+                            target = target[:, : int(attn_dist.shape[-1])]
                     target = target / target.sum(dim=-1, keepdim=True).clamp_min(1e-8)
                     mean_kl = F.kl_div(attn_dist.clamp_min(1e-8).log(), target, reduction="batchmean")
                     ground_weight = float(getattr(self, "grounding_loss_weight", 0.0))
@@ -1639,7 +1822,7 @@ class MultimodalPrefixLM(nn.Module):
         can_use_kv_cache = (
             bool(self.eval_use_kv_cache)
             and cached_visual_prefix is not None
-            and not self.uses_visual_adapters
+            and not self._active_visual_adapters_enabled()
             and hasattr(self.lm, "_prefill_decode_only")
             and hasattr(self.lm, "_decode_only_incremental")
             and int(max_new_tokens) > 0
@@ -1816,8 +1999,19 @@ def build_loader(
 ) -> DataLoader:
     transform = build_image_transform(train_mode=train_mode)
     dataset_mix_raw = str(getattr(args, "dataset_mix", "") or "").strip()
+    gqa_train_mix_ratio = float(getattr(args, "gqa_train_mix_ratio", 0.0))
+    gqa_train_fraction = float(getattr(args, "gqa_train_fraction", 1.0))
     base_train_dataset: Any = None
-    if bool(train_mode) and split == "train" and dataset_mix_raw:
+    if bool(train_mode) and split == "train" and bool(getattr(args, "use_grounding_loss", False)) and gqa_train_mix_ratio > 0.0:
+        base_train_dataset = VQAv2Dataset(
+            images_root=args.images_root,
+            annotations_root=args.annotations_root,
+            split="train",
+            transform=transform,
+            limit=limit,
+            skip_missing_images=True,
+        )
+    elif bool(train_mode) and split == "train" and dataset_mix_raw:
         mix = parse_json_object_arg("--dataset_mix", dataset_mix_raw)
         base_train_dataset = MixedVQAv2Dataset(
             images_root=args.images_root,
@@ -1837,6 +2031,8 @@ def build_loader(
             limit=limit,
             skip_missing_images=True,
             question_group="",
+            train_fraction=gqa_train_fraction,
+            seed=int(args.seed),
         )
     elif split in ("gqa_train", "gqa_val"):
         gqa_split = "train" if split == "gqa_train" else "val"
@@ -1859,7 +2055,27 @@ def build_loader(
         )
     ds = base_train_dataset
     batch_sampler = None
-    if bool(train_mode) and split == "train" and bool(getattr(args, "use_grounding_loss", False)):
+    if bool(train_mode) and split == "train" and (not bool(getattr(args, "use_grounding_loss", False))) and gqa_train_mix_ratio > 0.0:
+        gqa_train_dataset = GQADataset(
+            gqa_root=args.gqa_root,
+            split="train",
+            transform=transform,
+            limit=limit,
+            skip_missing_images=True,
+            question_group="",
+            train_fraction=gqa_train_fraction,
+            seed=int(args.seed),
+        )
+        ds = ConcatDataset([base_train_dataset, gqa_train_dataset])
+        batch_sampler = VQAGQAMixBatchSampler(
+            vqa_dataset=base_train_dataset,
+            gqa_dataset=gqa_train_dataset,
+            batch_size=int(args.batch_size),
+            gqa_mix_ratio=float(gqa_train_mix_ratio),
+            seed=int(args.seed),
+            drop_last=True,
+        )
+    elif bool(train_mode) and split == "train" and bool(getattr(args, "use_grounding_loss", False)):
         index_path = str(getattr(args, "pointing_index_path", "") or "").strip()
         if not index_path:
             raise SystemExit("--use_grounding_loss requires --pointing_index_path")
@@ -1871,15 +2087,38 @@ def build_loader(
             skip_missing_images=True,
             target_len=196,
         )
-        ds = ConcatDataset([pointing_ds, base_train_dataset])
-        batch_sampler = GroundingMixBatchSampler(
-            base_dataset=base_train_dataset,
-            pointing_dataset=pointing_ds,
-            batch_size=int(args.batch_size),
-            pointing_mix_ratio=float(getattr(args, "pointing_mix_ratio", 0.25)),
-            seed=int(args.seed),
-            drop_last=True,
-        )
+        if gqa_train_mix_ratio > 0.0:
+            gqa_train_dataset = GQADataset(
+                gqa_root=args.gqa_root,
+                split="train",
+                transform=transform,
+                limit=limit,
+                skip_missing_images=True,
+                question_group="",
+                train_fraction=gqa_train_fraction,
+                seed=int(args.seed),
+            )
+            ds = ConcatDataset([base_train_dataset, gqa_train_dataset, pointing_ds])
+            batch_sampler = GroundingGQAMixBatchSampler(
+                vqa_dataset=base_train_dataset,
+                gqa_dataset=gqa_train_dataset,
+                pointing_dataset=pointing_ds,
+                batch_size=int(args.batch_size),
+                gqa_mix_ratio=float(gqa_train_mix_ratio),
+                pointing_mix_ratio=float(getattr(args, "pointing_mix_ratio", 0.25)),
+                seed=int(args.seed),
+                drop_last=True,
+            )
+        else:
+            ds = ConcatDataset([pointing_ds, base_train_dataset])
+            batch_sampler = GroundingMixBatchSampler(
+                base_dataset=base_train_dataset,
+                pointing_dataset=pointing_ds,
+                batch_size=int(args.batch_size),
+                pointing_mix_ratio=float(getattr(args, "pointing_mix_ratio", 0.25)),
+                seed=int(args.seed),
+                drop_last=True,
+            )
     if (not train_mode) and int(limit) <= 0:
         eval_fraction = float(getattr(args, "eval_fraction", 1.0))
         if 0.0 < eval_fraction < 1.0:
@@ -1950,7 +2189,32 @@ def _module_param_summary(module: nn.Module) -> Tuple[int, int]:
 
 
 def _vision_tail_modules(vision_model: nn.Module) -> List[nn.Module]:
+    core_blocks = getattr(vision_model, "_core_blocks", None)
+    if isinstance(core_blocks, (nn.Sequential, nn.ModuleList)):
+        return list(core_blocks)
+    module_core_blocks = getattr(getattr(vision_model, "_modules", {}), "get", lambda *_: None)("_core_blocks")
+    if isinstance(module_core_blocks, (nn.Sequential, nn.ModuleList)):
+        return list(module_core_blocks)
+    enc_module = getattr(getattr(vision_model, "_modules", {}), "get", lambda *_: None)("_encoder")
+    if isinstance(enc_module, nn.Module):
+        core_blocks = getattr(enc_module, "_core_blocks", None)
+        if isinstance(core_blocks, (nn.Sequential, nn.ModuleList)):
+            return list(core_blocks)
+        core_blocks = getattr(enc_module, "blocks", None)
+        if isinstance(core_blocks, (nn.Sequential, nn.ModuleList)):
+            return list(core_blocks)
     enc = getattr(vision_model, "_encoder", None)
+    if isinstance(enc, nn.Module):
+        core_blocks = getattr(enc, "_core_blocks", None)
+        if isinstance(core_blocks, (nn.Sequential, nn.ModuleList)):
+            return list(core_blocks)
+        enc_seq = getattr(enc, "_encoder", None)
+        if isinstance(enc_seq, (nn.Sequential, nn.ModuleList)):
+            return list(enc_seq)
+        children = list(enc.children())
+        return children if children else [enc]
+    if callable(enc):
+        return []
     if enc is None:
         return []
     core_blocks = getattr(enc, "_core_blocks", None)
@@ -1974,6 +2238,14 @@ def configure_freezing(model: MultimodalPrefixLM, args: argparse.Namespace) -> N
             for p in semantic_mod.parameters():
                 p.requires_grad_(True)
         for p in model.visual_adapters.parameters():
+            p.requires_grad_(True)
+    elif mode == "semantic_bottleneck_only":
+        semantic_mod = getattr(model.bridge, "semantic_bottleneck", None)
+        if semantic_mod is not None:
+            for p in semantic_mod.parameters():
+                p.requires_grad_(True)
+    elif mode == "prefix_remap_only":
+        for p in model.prefix_remap.parameters():
             p.requires_grad_(True)
     else:
         for p in model.bridge.parameters():
@@ -2005,6 +2277,10 @@ def configure_freezing(model: MultimodalPrefixLM, args: argparse.Namespace) -> N
         return
     if mode == "semantic_adapter_only":
         return
+    if mode == "semantic_bottleneck_only":
+        return
+    if mode == "prefix_remap_only":
+        return
     if mode == "full_finetune":
         for p in model.parameters():
             p.requires_grad_(True)
@@ -2014,12 +2290,12 @@ def configure_freezing(model: MultimodalPrefixLM, args: argparse.Namespace) -> N
 
 def _set_module_modes(model: MultimodalPrefixLM, freeze_mode: str) -> None:
     model.train()
-    if freeze_mode in ("bridge_only", "bridge_plus_top_lm", "semantic_adapter_only"):
+    if freeze_mode in ("bridge_only", "bridge_plus_top_lm", "semantic_adapter_only", "semantic_bottleneck_only", "prefix_remap_only"):
         model.vision_adapter.vision_model.eval()
         if int(getattr(model, "train_vision_last_n_blocks", 0)) > 0:
             for mod in _vision_tail_modules(model.vision_adapter.vision_model)[-int(model.train_vision_last_n_blocks):]:
                 mod.train()
-    if freeze_mode in ("bridge_only", "semantic_adapter_only"):
+    if freeze_mode in ("bridge_only", "semantic_adapter_only", "semantic_bottleneck_only", "prefix_remap_only"):
         model.lm.eval()
 
 
@@ -2098,12 +2374,20 @@ def load_model_weights_from_mm_checkpoint(
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if logger is not None:
         logger.log(f"[mm] initialized model weights from {checkpoint_path}")
-        if unexpected:
-            logger.log(f"[mm] WARNING: unexpected init keys: {unexpected}")
-        if missing:
+        unexpected_log = [k for k in unexpected if not str(k).startswith("vision_adapter.vision_model.")]
+        missing_log = [k for k in missing if not str(k).startswith("vision_adapter.vision_model.")]
+        ignored_unexpected = len(unexpected) - len(unexpected_log)
+        ignored_missing = len(missing) - len(missing_log)
+        if ignored_unexpected > 0 or ignored_missing > 0:
             logger.log(
-                f"[mm] note: {len(missing)} init keys missing (newly initialized): "
-                f"{missing[:5]}{'...' if len(missing) > 5 else ''}"
+                f"[mm] note: ignored vision-side init mismatches missing={ignored_missing} unexpected={ignored_unexpected}"
+            )
+        if unexpected_log:
+            logger.log(f"[mm] WARNING: unexpected init keys: {unexpected_log}")
+        if missing_log:
+            logger.log(
+                f"[mm] note: {len(missing_log)} init keys missing (newly initialized): "
+                f"{missing_log[:5]}{'...' if len(missing_log) > 5 else ''}"
             )
     return payload
 
@@ -2126,6 +2410,149 @@ def attach_semantic_teacher(
     model.__dict__["semantic_teacher_model"] = teacher_model
     if logger is not None:
         logger.log(f"[mm] semantic teacher attached from {checkpoint_path}")
+
+
+def load_prefix_remap_checkpoint(
+    model: MultimodalPrefixLM,
+    *,
+    checkpoint_path: str,
+    logger: Optional[Logger] = None,
+) -> None:
+    if not checkpoint_path:
+        return
+    if not isinstance(model.prefix_remap, PrefixRemap):
+        raise RuntimeError(
+            "prefix_remap_checkpoint was provided, but the model does not have a PrefixRemap module. "
+            "Enable --prefix_remap_present or --use_prefix_remap."
+        )
+    payload = _load_checkpoint(checkpoint_path, map_location="cpu")
+    state_dict = payload.get("model_state_dict", {})
+    remap_state = {
+        key[len("prefix_remap.") :]: value
+        for key, value in state_dict.items()
+        if key.startswith("prefix_remap.")
+    }
+    if not remap_state:
+        raise RuntimeError(f"No prefix_remap weights found in checkpoint: {checkpoint_path}")
+    missing, unexpected = model.prefix_remap.load_state_dict(remap_state, strict=True)
+    if missing or unexpected:
+        raise RuntimeError(
+            f"Unexpected PrefixRemap load state from {checkpoint_path}: missing={missing} unexpected={unexpected}"
+        )
+    for p in model.prefix_remap.parameters():
+        p.requires_grad_(False)
+    model.__dict__["semantic_format_teacher_loaded_from"] = str(checkpoint_path)
+    if logger is not None:
+        logger.log(f"[mm] prefix remap weights loaded from {checkpoint_path}")
+
+
+def _load_answer_kd_payload(labels_path: str) -> Dict[str, Any]:
+    path = os.path.abspath(str(labels_path))
+    if os.path.isdir(path):
+        meta_path = os.path.join(path, "meta.json")
+        if not os.path.isfile(meta_path):
+            raise FileNotFoundError(f"Missing answer KD meta.json under {path}")
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        shard_names = list(meta.get("shards") or [])
+        if not shard_names:
+            shard_names = sorted(fn for fn in os.listdir(path) if fn.startswith("shard_") and fn.endswith(".pt"))
+        qid_parts: List[torch.Tensor] = []
+        logit_parts: List[torch.Tensor] = []
+        for shard_name in shard_names:
+            shard_path = os.path.join(path, shard_name)
+            if not os.path.isfile(shard_path):
+                continue
+            payload = _load_checkpoint(shard_path, map_location="cpu")
+            qids = payload.get("question_ids")
+            logits = payload.get("teacher_logits")
+            if not isinstance(qids, torch.Tensor) or not isinstance(logits, torch.Tensor):
+                continue
+            qid_parts.append(qids.to(dtype=torch.long, device="cpu"))
+            logit_parts.append(logits.to(dtype=torch.float16, device="cpu"))
+        if not qid_parts or not logit_parts:
+            raise RuntimeError(f"No usable answer KD shards found under {path}")
+        return {
+            "meta": meta,
+            "question_ids": torch.cat(qid_parts, dim=0),
+            "teacher_logits": torch.cat(logit_parts, dim=0),
+        }
+    payload = _load_checkpoint(path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Unsupported answer KD payload at {path}")
+    return payload
+
+
+def attach_answer_kd_labels(
+    model: MultimodalPrefixLM,
+    *,
+    labels_path: str,
+    tokenizer: ByteBPETokenizer,
+    kd_weight: float,
+    kd_temp: float,
+    logger: Optional[Logger] = None,
+) -> None:
+    if not labels_path:
+        return
+    payload = _load_answer_kd_payload(labels_path)
+    meta = dict(payload.get("meta") or {})
+    answer_vocab = [str(x) for x in (meta.get("answer_vocab") or payload.get("answer_vocab") or []) if str(x).strip()]
+    if not answer_vocab:
+        raise RuntimeError(f"Answer KD payload at {labels_path} is missing answer_vocab metadata")
+    student_first_token_ids = meta.get("student_first_token_ids") or payload.get("student_first_token_ids")
+    if not isinstance(student_first_token_ids, (list, tuple)) or len(student_first_token_ids) != len(answer_vocab):
+        rebuilt: List[int] = []
+        kept_vocab: List[str] = []
+        teacher_first_token_ids = meta.get("teacher_first_token_ids") or payload.get("teacher_first_token_ids")
+        teacher_logits = payload.get("teacher_logits")
+        if not isinstance(teacher_logits, torch.Tensor):
+            raise RuntimeError(f"Answer KD payload at {labels_path} is missing teacher_logits")
+        keep_cols: List[int] = []
+        for idx, ans in enumerate(answer_vocab):
+            ids = tokenizer.encode(ans, add_bos=False, add_eos=False).tolist()
+            if not ids:
+                continue
+            rebuilt.append(int(ids[0]))
+            kept_vocab.append(ans)
+            keep_cols.append(int(idx))
+        if not rebuilt:
+            raise RuntimeError(f"Could not derive any student answer-token ids from KD payload at {labels_path}")
+        payload["teacher_logits"] = teacher_logits.index_select(
+            dim=1,
+            index=torch.tensor(keep_cols, dtype=torch.long),
+        )
+        if isinstance(teacher_first_token_ids, (list, tuple)):
+            meta["teacher_first_token_ids"] = [int(teacher_first_token_ids[idx]) for idx in keep_cols]
+        answer_vocab = kept_vocab
+        student_first_token_ids = rebuilt
+    question_ids = payload.get("question_ids")
+    teacher_logits = payload.get("teacher_logits")
+    if not isinstance(question_ids, torch.Tensor) or not isinstance(teacher_logits, torch.Tensor):
+        raise RuntimeError(f"Answer KD payload at {labels_path} is missing question_ids/teacher_logits tensors")
+    question_ids = question_ids.to(dtype=torch.long, device="cpu").contiguous()
+    teacher_logits = teacher_logits.to(dtype=torch.float16, device="cpu").contiguous()
+    if int(question_ids.numel()) != int(teacher_logits.shape[0]):
+        raise RuntimeError(
+            f"Answer KD payload row mismatch at {labels_path}: qids={int(question_ids.numel())} logits={int(teacher_logits.shape[0])}"
+        )
+    qid_to_row = {int(qid): idx for idx, qid in enumerate(question_ids.tolist())}
+    store = {
+        "path": os.path.abspath(str(labels_path)),
+        "answer_vocab": answer_vocab,
+        "question_ids": question_ids,
+        "teacher_logits": teacher_logits,
+        "qid_to_row": qid_to_row,
+        "student_first_token_ids": torch.tensor(student_first_token_ids, dtype=torch.long),
+    }
+    model.__dict__["answer_kd_store"] = store
+    model.__dict__["answer_kd_weight"] = float(max(0.0, kd_weight))
+    model.__dict__["answer_kd_temp"] = float(max(1e-4, kd_temp))
+    if logger is not None:
+        logger.log(
+            f"[mm] answer KD labels attached from {store['path']} "
+            f"samples={int(question_ids.numel())} answer_vocab={int(len(answer_vocab))} "
+            f"weight={float(max(0.0, kd_weight)):.6g} temp={float(max(1e-4, kd_temp)):.6g}"
+        )
 
 
 def save_mm_checkpoint(
@@ -2156,6 +2583,7 @@ def save_mm_checkpoint(
             "vision_cbld": args.vision_cbld,
             "feature_mode": args.vision_feature_mode,
             "feature_source": args.vision_feature_source,
+            "vision_aux_checkpoint": str(getattr(args, "vision_aux_checkpoint", "") or ""),
         },
     }
     torch.save(payload, path)
@@ -2231,12 +2659,23 @@ def build_runtime_from_args(
         "bridge_token_select_k_min": int(args.bridge_token_select_k_min),
         "bridge_num_roles": int(args.bridge_num_roles),
         "bridge_evidence_topk": int(args.bridge_evidence_topk),
+        "dual_visual_inputs": bool(str(args.vision_model) == "siglip_vitstr_tiny_dual"),
         "semantic_bottleneck": bool(getattr(args, "use_compression", False) or args.semantic_bottleneck),
-        "semantic_tokens": int(getattr(args, "compression_k", args.semantic_tokens)),
+        "semantic_tokens": int(
+            getattr(args, "compression_k", args.semantic_tokens)
+            if bool(getattr(args, "use_compression", False))
+            else args.semantic_tokens
+        ),
         "semantic_latent_dim": int(args.semantic_latent_dim),
-        "semantic_recon_loss_weight": float(getattr(args, "compression_distill_weight", args.semantic_recon_loss_weight)),
+        "semantic_recon_loss_weight": float(
+            getattr(args, "compression_distill_weight", args.semantic_recon_loss_weight)
+            if bool(getattr(args, "use_compression", False))
+            else args.semantic_recon_loss_weight
+        ),
         "semantic_consistency_loss_weight": float(args.semantic_consistency_loss_weight),
         "semantic_token_schedule": str(args.semantic_token_schedule),
+        "semantic_grid_access": bool(getattr(args, "semantic_grid_access", False)),
+        "semantic_query_derivation": bool(getattr(args, "semantic_query_derivation", False)),
     }
     if checkpoint_payload is not None and isinstance(checkpoint_payload.get("bridge_config"), dict):
         bcfg_data.update(dict(checkpoint_payload["bridge_config"]))
@@ -2249,10 +2688,17 @@ def build_runtime_from_args(
         bcfg_data["semantic_bottleneck"] = bool(
             getattr(args, "use_compression", False) or bcfg_data.get("semantic_bottleneck", False)
         )
-        bcfg_data["semantic_tokens"] = int(getattr(args, "compression_k", bcfg_data.get("semantic_tokens", 16)))
-        bcfg_data["semantic_recon_loss_weight"] = float(
-            getattr(args, "compression_distill_weight", bcfg_data.get("semantic_recon_loss_weight", 0.0))
-        )
+        if bool(getattr(args, "use_compression", False)):
+            bcfg_data["semantic_tokens"] = int(
+                getattr(args, "compression_k", bcfg_data.get("semantic_tokens", 16))
+            )
+            bcfg_data["semantic_recon_loss_weight"] = float(
+                getattr(
+                    args,
+                    "compression_distill_weight",
+                    bcfg_data.get("semantic_recon_loss_weight", 0.0),
+                )
+            )
     bridge_cfg = BridgeConfig(**bcfg_data)
     bridge = build_bridge(bridge_cfg).to(device)
     model = MultimodalPrefixLM(
@@ -2283,10 +2729,24 @@ def build_runtime_from_args(
         lm_visual_adapter_num_heads=int(getattr(args, "lm_visual_adapter_num_heads", 8)),
         lm_visual_adapter_dropout=float(getattr(args, "lm_visual_adapter_dropout", 0.0)),
         lm_visual_adapter_gate_init=float(getattr(args, "lm_visual_adapter_gate_init", 0.5)),
+        use_prefix_remap=bool(getattr(args, "use_prefix_remap", False)),
+        prefix_remap_present=bool(
+            getattr(args, "prefix_remap_present", False)
+            or getattr(args, "use_prefix_remap", False)
+            or bool(str(getattr(args, "prefix_remap_checkpoint", "") or "").strip())
+        ),
+        apply_prefix_remap_in_forward=bool(
+            getattr(args, "apply_prefix_remap_in_forward", getattr(args, "use_prefix_remap", False))
+        ),
+        disable_lm_visual_adapters=bool(getattr(args, "disable_lm_visual_adapters", False)),
     ).to(device)
     model.train_vision_last_n_blocks = max(0, int(getattr(args, "train_vision_last_n_blocks", 0)))
     model.use_grounding_loss = bool(getattr(args, "use_grounding_loss", False))
     model.grounding_loss_weight = float(getattr(args, "grounding_loss_weight", 0.0))
+    model.semantic_format_loss_weight = float(getattr(args, "semantic_format_loss_weight", 0.0))
+    model.semantic_format_loss_final_weight = float(getattr(args, "semantic_format_loss_final_weight", 0.0))
+    model.semantic_format_anneal_start_step = int(getattr(args, "semantic_format_anneal_start_step", 0))
+    model.semantic_format_anneal_end_step = int(getattr(args, "semantic_format_anneal_end_step", 0))
     if hasattr(model.bridge, "eval_bypass_compression"):
         model.bridge.eval_bypass_compression = bool(getattr(args, "eval_bypass_compression", False))
     if str(vision_device) != str(device):
@@ -2305,6 +2765,12 @@ def load_runtime_from_checkpoint(
         for k, v in args_override.items():
             if v is not None:
                 train_args[k] = v
+    state_dict = payload.get("model_state_dict", {}) or {}
+    if any(str(k).startswith("prefix_remap.") for k in state_dict.keys()):
+        # Format-alignment checkpoints may carry a frozen remap teacher even when
+        # the remap is not applied in the forward pass. Build the runtime with the
+        # module present so strict state-dict loading remains backward-compatible.
+        train_args["prefix_remap_present"] = True
     args = SimpleNamespace(**train_args)
     args = _apply_runtime_defaults(args)
     model, tokenizer, bridge_cfg = build_runtime_from_args(args, device=device, checkpoint_payload=payload)
@@ -2743,6 +3209,8 @@ def run_grounding_eval(
         if not isinstance(perceiver_attn, torch.Tensor):
             raise RuntimeError("Grounding eval requires perceiver_final_attn in bridge aux.")
         attn_dist = perceiver_attn.float().mean(dim=1).mean(dim=1)
+        if int(attn_dist.shape[-1]) > 196:
+            attn_dist = attn_dist[:, :196]
         attn_dist = attn_dist / attn_dist.sum(dim=-1, keepdim=True).clamp_min(1e-8)
         for i in range(int(attn_dist.shape[0])):
             bbox = raw_batch["bbox_xyxy"][i]
@@ -2938,6 +3406,7 @@ def log_startup_config(
     )
     logger.log(
         f"[mm] vision model={args.vision_model} ckpt={args.vision_checkpoint} "
+        f"aux_ckpt={str(getattr(args, 'vision_aux_checkpoint', '') or '')} "
         f"feature_source={args.vision_feature_source} feature_mode={args.vision_feature_mode} "
         f"vision_device={args.vision_device}"
     )
@@ -2968,7 +3437,9 @@ def log_startup_config(
         f"semantic_latent_dim={int(getattr(bridge_cfg, 'semantic_latent_dim', 256))} "
         f"semantic_recon_w={float(getattr(bridge_cfg, 'semantic_recon_loss_weight', 0.0)):.6g} "
         f"semantic_consistency_w={float(getattr(bridge_cfg, 'semantic_consistency_loss_weight', 0.0)):.6g} "
-        f"semantic_token_schedule={str(getattr(bridge_cfg, 'semantic_token_schedule', ''))}"
+        f"semantic_token_schedule={str(getattr(bridge_cfg, 'semantic_token_schedule', ''))} "
+        f"semantic_grid_access={int(bool(getattr(bridge_cfg, 'semantic_grid_access', False)))} "
+        f"semantic_query_derivation={int(bool(getattr(bridge_cfg, 'semantic_query_derivation', False)))}"
     )
     logger.log(
         f"[mm] visual_feature_adapter_type={str(getattr(args, 'visual_feature_adapter_type', 'none'))} "
@@ -3001,6 +3472,24 @@ def log_startup_config(
         f"prefix_dropout={float(args.prefix_dropout):.6g}"
     )
     logger.log(
+        f"[mm] use_prefix_remap={int(bool(getattr(args, 'use_prefix_remap', False)))} "
+        f"prefix_remap_present={int(bool(getattr(args, 'prefix_remap_present', False)))} "
+        f"apply_prefix_remap_in_forward={int(bool(getattr(args, 'apply_prefix_remap_in_forward', False)))} "
+        f"disable_lm_visual_adapters={int(bool(getattr(args, 'disable_lm_visual_adapters', False)))}"
+    )
+    logger.log(
+        f"[mm] prefix_remap_checkpoint={str(getattr(args, 'prefix_remap_checkpoint', '') or '')} "
+        f"semantic_format_loss_weight={float(getattr(args, 'semantic_format_loss_weight', 0.0)):.6g} "
+        f"semantic_format_loss_final_weight={float(getattr(args, 'semantic_format_loss_final_weight', 0.0)):.6g} "
+        f"semantic_format_anneal_start_step={int(getattr(args, 'semantic_format_anneal_start_step', 0))} "
+        f"semantic_format_anneal_end_step={int(getattr(args, 'semantic_format_anneal_end_step', 0))}"
+    )
+    logger.log(
+        f"[mm] answer_kd_labels_path={str(getattr(args, 'answer_kd_labels_path', '') or '')} "
+        f"answer_kd_weight={float(getattr(args, 'answer_kd_weight', 0.0)):.6g} "
+        f"answer_kd_temp={float(getattr(args, 'answer_kd_temp', 4.0)):.6g}"
+    )
+    logger.log(
         f"[mm] freeze_mode={args.freeze_mode} train_top_lm_layers={args.train_top_lm_layers} "
         f"loss_on_answer_only={int(bool(args.loss_on_answer_only))}"
     )
@@ -3026,6 +3515,8 @@ def log_startup_config(
         f"dataset_mix={str(getattr(args, 'dataset_mix', '') or '')} "
         f"pointing_index_path={str(getattr(args, 'pointing_index_path', '') or '')} "
         f"pointing_mix_ratio={float(getattr(args, 'pointing_mix_ratio', 0.0)):.6g} "
+        f"gqa_train_mix_ratio={float(getattr(args, 'gqa_train_mix_ratio', 0.0)):.6g} "
+        f"gqa_train_fraction={float(getattr(args, 'gqa_train_fraction', 1.0)):.6g} "
         f"use_grounding_loss={int(bool(getattr(args, 'use_grounding_loss', False)))} "
         f"grounding_loss_weight={float(getattr(args, 'grounding_loss_weight', 0.0)):.6g} "
         f"limit_train={args.limit_train} limit_val={args.limit_val} limit_eval={args.limit_eval} "
@@ -3064,9 +3555,10 @@ def parse_args() -> argparse.Namespace:
         "--vision_model",
         type=str,
         default="vitvae2",
-        choices=["vae", "vaer", "vitvae", "vitvae2", "mobilevit_hf", "dinov2_small", "dinov2_base", "mobileclip_s0", "siglip_base", "dinovit_ssl"],
+        choices=["vae", "vaer", "vitvae", "vitvae2", "mobilevit_hf", "dinov2_small", "dinov2_base", "mobileclip_s0", "siglip2_b16", "pe_core_b16", "siglip_base", "siglip_vitstr_tiny_dual", "dinovit_ssl"],
     )
     ap.add_argument("--vision_checkpoint", type=str, default=None)
+    ap.add_argument("--vision_aux_checkpoint", type=str, default=None)
     ap.add_argument("--vision_config", type=str, default=None)
     ap.add_argument("--vision_latent_dim", type=int, default=768)
     ap.add_argument("--vision_cbld", type=int, default=1536)
@@ -3316,6 +3808,18 @@ def parse_args() -> argparse.Namespace:
         help="Reserved schedule string for future semantic token-count curricula; currently logged only.",
     )
     ap.add_argument(
+        "--semantic_grid_access",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Let the semantic bottleneck cross-attend over projected visual grid tokens in addition to perceiver latents.",
+    )
+    ap.add_argument(
+        "--semantic_query_derivation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Derive bottleneck queries from perceiver latents, then attend over projected visual grid tokens only.",
+    )
+    ap.add_argument(
         "--semantic_teacher_checkpoint",
         type=str,
         default="",
@@ -3355,6 +3859,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--grounding_sigma", type=float, default=1.5)
     ap.add_argument("--pointing_index_path", type=str, default="")
     ap.add_argument("--pointing_mix_ratio", type=float, default=0.25)
+    ap.add_argument("--gqa_train_mix_ratio", type=float, default=0.0)
+    ap.add_argument("--gqa_train_fraction", type=float, default=1.0)
     ap.add_argument(
         "--prefix_calibration",
         action=argparse.BooleanOptionalAction,
@@ -3420,7 +3926,14 @@ def parse_args() -> argparse.Namespace:
         "--freeze_mode",
         type=str,
         default="bridge_only",
-        choices=["bridge_only", "bridge_plus_top_lm", "semantic_adapter_only", "full_finetune"],
+        choices=[
+            "bridge_only",
+            "bridge_plus_top_lm",
+            "semantic_adapter_only",
+            "semantic_bottleneck_only",
+            "prefix_remap_only",
+            "full_finetune",
+        ],
     )
     ap.add_argument("--train_top_lm_layers", type=int, default=1)
     ap.add_argument(
@@ -3439,6 +3952,58 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--lm_visual_adapter_num_heads", type=int, default=8)
     ap.add_argument("--lm_visual_adapter_dropout", type=float, default=0.0)
     ap.add_argument("--lm_visual_adapter_gate_init", type=float, default=0.5)
+    ap.add_argument(
+        "--use_prefix_remap",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Insert a single linear remap on the LM-facing visual prefix before decode.",
+    )
+    ap.add_argument(
+        "--prefix_remap_present",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Instantiate a PrefixRemap module even if it is not applied in the forward path.",
+    )
+    ap.add_argument(
+        "--apply_prefix_remap_in_forward",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Apply PrefixRemap in the LM prefix path. Useful for eval-only ceiling checks.",
+    )
+    ap.add_argument(
+        "--prefix_remap_checkpoint",
+        type=str,
+        default="",
+        help="Optional checkpoint to load PrefixRemap weights from.",
+    )
+    ap.add_argument(
+        "--disable_lm_visual_adapters",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Disable LM visual adapters entirely at forward time.",
+    )
+    ap.add_argument("--semantic_format_loss_weight", type=float, default=0.0)
+    ap.add_argument("--semantic_format_loss_final_weight", type=float, default=0.0)
+    ap.add_argument("--semantic_format_anneal_start_step", type=int, default=0)
+    ap.add_argument("--semantic_format_anneal_end_step", type=int, default=0)
+    ap.add_argument(
+        "--answer_kd_labels_path",
+        type=str,
+        default="",
+        help="Optional path to precomputed answer-vocab teacher logits keyed by question_id.",
+    )
+    ap.add_argument(
+        "--answer_kd_weight",
+        type=float,
+        default=0.0,
+        help="Weight for KL distillation against answer-vocab teacher logits.",
+    )
+    ap.add_argument(
+        "--answer_kd_temp",
+        type=float,
+        default=4.0,
+        help="Temperature for answer-vocab KD loss.",
+    )
     ap.add_argument(
         "--visual_feature_adapter_type",
         type=str,
@@ -3720,6 +4285,22 @@ def main() -> None:
         tokenizer=tokenizer,
         bridge_cfg=bridge_cfg,
     )
+    vision_model_obj = model.vision_adapter.vision_model
+    if hasattr(vision_model_obj, "vitstr"):
+        vitstr = getattr(vision_model_obj, "vitstr")
+        arch = getattr(vitstr, "arch_summary", {})
+        splits = getattr(vision_model_obj, "last_feature_splits", ())
+        siglip_desc = splits[0] if isinstance(splits, tuple) and len(splits) > 0 else ("siglip", 196, 768)
+        vitstr_desc = splits[1] if isinstance(splits, tuple) and len(splits) > 1 else ("vitstr", arch.get("patch_tokens", 196), arch.get("embed_dim", 192))
+        logger.log(
+            f"[mm] dual_vm siglip_tokens={siglip_desc[1]} siglip_dim={siglip_desc[2]} "
+            f"vitstr_source=roatienza/deep-text-recognition-benchmark "
+            f"vitstr_ckpt={getattr(vitstr, 'checkpoint_path', '')} "
+            f"vitstr_input_hw={tuple(arch.get('input_resolution', (224, 224)))} "
+            f"vitstr_patch={int(arch.get('patch_size', 16))} "
+            f"vitstr_depth={int(arch.get('depth', 12))} vitstr_heads={int(arch.get('num_heads', 3))} "
+            f"vitstr_tokens={vitstr_desc[1]} vitstr_dim={vitstr_desc[2]}"
+        )
 
     val_limit = int(args.limit_val) if int(args.limit_val) > 0 else 0
     train_loader = None
@@ -3793,6 +4374,23 @@ def main() -> None:
             device=device,
             logger=logger,
         )
+    prefix_remap_checkpoint = str(getattr(args, "prefix_remap_checkpoint", "") or "").strip()
+    if prefix_remap_checkpoint:
+        load_prefix_remap_checkpoint(
+            model,
+            checkpoint_path=prefix_remap_checkpoint,
+            logger=logger,
+        )
+    answer_kd_labels_path = str(getattr(args, "answer_kd_labels_path", "") or "").strip()
+    if answer_kd_labels_path and float(getattr(args, "answer_kd_weight", 0.0)) > 0.0:
+        attach_answer_kd_labels(
+            model,
+            labels_path=answer_kd_labels_path,
+            tokenizer=tokenizer,
+            kd_weight=float(getattr(args, "answer_kd_weight", 0.0)),
+            kd_temp=float(getattr(args, "answer_kd_temp", 4.0)),
+            logger=logger,
+        )
 
     configure_freezing(model, args)
     _set_module_modes(model, args.freeze_mode)
@@ -3803,6 +4401,7 @@ def main() -> None:
         ("bridge", model.bridge),
         ("semantic_bottleneck", getattr(model.bridge, "semantic_bottleneck", None)),
         ("prefix_calibrator", model.prefix_calibrator),
+        ("prefix_remap", model.prefix_remap),
         ("lm", model.lm),
         ("lm_visual_adapters", model.visual_adapters),
     ]
@@ -3814,6 +4413,19 @@ def main() -> None:
             f"[mm] module={name} total_params={total_n:,} trainable_params={train_n:,} "
             f"frozen_params={max(0, total_n - train_n):,}"
         )
+    if hasattr(model.vision_adapter.vision_model, "siglip"):
+        for name, module in [
+            ("siglip_vm", getattr(model.vision_adapter.vision_model, "siglip", None)),
+            ("vitstr_vm", getattr(model.vision_adapter.vision_model, "vitstr", None)),
+            ("bridge_visual_proj_aux", getattr(model.bridge, "visual_proj_aux", None)),
+        ]:
+            if module is None:
+                continue
+            total_n, train_n = _module_param_summary(module)
+            logger.log(
+                f"[mm] module={name} total_params={total_n:,} trainable_params={train_n:,} "
+                f"frozen_params={max(0, total_n - train_n):,}"
+            )
     if hasattr(model.bridge, "core"):
         core_total, core_train = _module_param_summary(model.bridge.core)
         logger.log(
@@ -4022,9 +4634,18 @@ def main() -> None:
             reg_var = info_dict.get("loss_prefix_batchvar_reg", None)
             sem_recon = info_dict.get("loss_semantic_recon", None)
             sem_consistency = info_dict.get("loss_semantic_consistency", None)
+            sem_format = info_dict.get("loss_semantic_format", None)
+            sem_format_weight = info_dict.get("semantic_format_weight", None)
+            sem_format_cos = info_dict.get("semantic_format_cosine_sim", None)
+            answer_kd_loss = info_dict.get("loss_answer_kd", None)
+            answer_kd_cov = info_dict.get("answer_kd_coverage", None)
             loss_ground = info_dict.get("loss_grounding", None)
             mean_kl = info_dict.get("grounding_mean_kl", None)
             attn_entropy = info_dict.get("compression_mean_attn_entropy", None)
+            grid_attn_fraction = info_dict.get("compression_grid_attn_fraction", None)
+            vitstr_attn_fraction = info_dict.get("vitstr_attn_fraction", None)
+            gqa_fraction = info_dict.get("data_gqa_fraction", None)
+            pointing_fraction = info_dict.get("data_pointing_fraction", None)
             ratio_txt = "" if ratio is None else f" pfx_txt_norm_ratio={float(ratio):.4f}"
             reg_txt = ""
             if reg_norm is not None:
@@ -4035,12 +4656,30 @@ def main() -> None:
                 reg_txt += f" distill={float(sem_recon):.6f}"
             if sem_consistency is not None:
                 reg_txt += f" sem_consistency={float(sem_consistency):.6f}"
+            if sem_format is not None and float(sem_format) > 0.0:
+                reg_txt += f" sem_format={float(sem_format):.6f}"
+            if sem_format_weight is not None and float(sem_format_weight) > 0.0:
+                reg_txt += f" sem_format_w={float(sem_format_weight):.4f}"
+            if sem_format_cos is not None and float(sem_format_cos) > 0.0:
+                reg_txt += f" format_cos={float(sem_format_cos):.4f}"
+            if answer_kd_loss is not None and float(answer_kd_loss) > 0.0:
+                reg_txt += f" answer_kd={float(answer_kd_loss):.6f}"
+            if answer_kd_cov is not None and float(answer_kd_cov) > 0.0:
+                reg_txt += f" kd_cov={float(answer_kd_cov):.3f}"
             if loss_ground is not None and float(loss_ground) > 0.0:
                 reg_txt += f" grounding={float(loss_ground):.6f}"
             if mean_kl is not None and float(mean_kl) > 0.0:
                 reg_txt += f" ground_kl={float(mean_kl):.6f}"
             if attn_entropy is not None and float(attn_entropy) > 0.0:
                 reg_txt += f" comp_attn_ent={float(attn_entropy):.4f}"
+            if grid_attn_fraction is not None and float(grid_attn_fraction) > 0.0:
+                reg_txt += f" grid_attn={float(grid_attn_fraction):.4f}"
+            if vitstr_attn_fraction is not None and float(vitstr_attn_fraction) > 0.0:
+                reg_txt += f" vitstr_attn={float(vitstr_attn_fraction):.4f}"
+            if gqa_fraction is not None and float(gqa_fraction) > 0.0:
+                reg_txt += f" gqa_frac={float(gqa_fraction):.4f}"
+            if pointing_fraction is not None and float(pointing_fraction) > 0.0:
+                reg_txt += f" pointing_frac={float(pointing_fraction):.4f}"
             steps_per_s = float(train_log_steps) / max(1e-6, float(train_log_time_sec))
             logger.log(
                 f"[mm] step={global_step} epoch={epoch} loss={float(loss_value):.4f} "
@@ -4152,7 +4791,7 @@ def main() -> None:
             if isinstance(sampler, EpochShuffleSampler):
                 sampler.set_epoch(epoch)
             batch_sampler = getattr(train_loader, "batch_sampler", None)
-            if isinstance(batch_sampler, GroundingMixBatchSampler):
+            if isinstance(batch_sampler, (VQAGQAMixBatchSampler, GroundingMixBatchSampler, GroundingGQAMixBatchSampler)):
                 batch_sampler.set_epoch(epoch)
             iter_obj = train_loader
 
@@ -4171,7 +4810,21 @@ def main() -> None:
                     batch,
                     answer_only=bool(args.loss_on_answer_only),
                     debug_shapes=debug_shape_once,
+                    train_step=(global_step + 1),
                 )
+            metadata_list = batch.get("metadata", [])
+            if isinstance(metadata_list, list) and metadata_list:
+                gqa_count = 0
+                for meta in metadata_list:
+                    meta_dict = meta if isinstance(meta, dict) else {}
+                    source = str(meta_dict.get("source_dataset", "")).strip().lower()
+                    split_name = str(meta_dict.get("split", "")).strip().lower()
+                    if source == "gqa" or split_name.startswith("gqa"):
+                        gqa_count += 1
+                info["data_gqa_fraction"] = float(gqa_count) / float(len(metadata_list))
+            has_ground = batch.get("has_grounding_target")
+            if isinstance(has_ground, torch.Tensor) and int(has_ground.numel()) > 0:
+                info["data_pointing_fraction"] = float(has_ground.float().mean().item())
             debug_shape_once = False
 
             loss_back = loss / float(accum_steps)

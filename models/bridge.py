@@ -58,6 +58,9 @@ class BridgeConfig:
     semantic_recon_loss_weight: float = 0.1
     semantic_consistency_loss_weight: float = 0.1
     semantic_token_schedule: str = ""
+    semantic_grid_access: bool = False
+    semantic_query_derivation: bool = False
+    dual_visual_inputs: bool = False
 
 
 def _resolve_num_heads(dim: int, requested: int) -> int:
@@ -258,7 +261,9 @@ class _QueryBridgeBase(nn.Module):
         self.requires_visual_features = True
         self._pos_cache: dict[tuple[int, int, str, str], torch.Tensor] = {}
         self.visual_proj = nn.LazyLinear(int(cfg.lm_hidden_size))
+        self.visual_proj_aux = nn.LazyLinear(int(cfg.lm_hidden_size)) if bool(getattr(cfg, "dual_visual_inputs", False)) else None
         self.spatial_mixer = _SpatialMixer(cfg)
+        self._last_source_token_counts: tuple[int, ...] = ()
         selector_type = str(getattr(cfg, "bridge_token_selector_type", "none"))
         selector_k = int(getattr(cfg, "bridge_token_select_k", 0))
         self._selector_type = selector_type
@@ -308,24 +313,42 @@ class _QueryBridgeBase(nn.Module):
         self._pos_cache[key] = emb
         return emb
 
+    def _project_stream(self, x: torch.Tensor, proj: nn.Module) -> torch.Tensor:
+        y = proj(_as_token_sequence(x))
+        if bool(self.cfg.add_2d_pos_emb):
+            y = y + self._token_pos_emb(
+                int(y.shape[1]),
+                int(y.shape[2]),
+                device=y.device,
+                dtype=y.dtype,
+            ).unsqueeze(0)
+        return y
+
     def _prepare_visual_tokens(
         self,
-        visual_features: torch.Tensor,
+        visual_features: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor],
         *,
         question_context: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        x = _as_token_sequence(visual_features)
-        x = self.visual_proj(x)
-        if bool(self.cfg.add_2d_pos_emb):
-            x = x + self._token_pos_emb(
-                int(x.shape[1]),
-                int(x.shape[2]),
-                device=x.device,
-                dtype=x.dtype,
-            ).unsqueeze(0)
+        return_grid_tokens: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(visual_features, (tuple, list)):
+            if len(visual_features) != 2:
+                raise ValueError("Dual-visual bridge path expects exactly 2 feature streams.")
+            if self.visual_proj_aux is None:
+                raise RuntimeError("Received dual visual features, but bridge.dual_visual_inputs is disabled.")
+            primary = self._project_stream(visual_features[0], self.visual_proj)
+            secondary = self._project_stream(visual_features[1], self.visual_proj_aux)
+            self._last_source_token_counts = (int(primary.shape[1]), int(secondary.shape[1]))
+            x = torch.cat([primary, secondary], dim=1)
+        else:
+            x = self._project_stream(visual_features, self.visual_proj)
+            self._last_source_token_counts = (int(x.shape[1]),)
         x = self.spatial_mixer(x)
+        grid_tokens = x
         x = self._maybe_select_tokens(x, question_context=question_context)
-        return x
+        if not bool(return_grid_tokens):
+            return x
+        return x, grid_tokens
 
     def _maybe_select_tokens(
         self,
@@ -707,6 +730,7 @@ class SemanticBottleneck(nn.Module):
 
     Shapes:
     - evidence_latents: [B, K, D]
+    - grid_tokens: [B, N, D]
     - semantic_latents: [B, M, Z]
     - exported_tokens: [B, M, D]
     """
@@ -717,12 +741,28 @@ class SemanticBottleneck(nn.Module):
         self.target_token_count = max(1, int(cfg.num_visual_tokens))
         self.semantic_tokens = max(1, min(int(getattr(cfg, "semantic_tokens", 16)), self.target_token_count))
         self.semantic_latent_dim = max(1, min(int(getattr(cfg, "semantic_latent_dim", 256)), d_model))
+        self.semantic_grid_access = bool(getattr(cfg, "semantic_grid_access", False))
+        self.semantic_query_derivation = bool(getattr(cfg, "semantic_query_derivation", False))
         std = float(cfg.learned_init_std)
         self.semantic_queries = nn.Parameter(torch.randn(1, self.semantic_tokens, d_model) * std)
         self.compress = _CrossAttnFFNBlock(
             d_model,
             num_heads=int(cfg.bridge_num_heads),
             attn_dropout=float(cfg.bridge_attn_dropout),
+        )
+        self.query_pool = (
+            _CrossAttnFFNBlock(
+                d_model,
+                num_heads=int(cfg.bridge_num_heads),
+                attn_dropout=float(cfg.bridge_attn_dropout),
+            )
+            if self.semantic_query_derivation
+            else None
+        )
+        self.query_pool_queries = (
+            nn.Parameter(torch.randn(1, self.semantic_tokens, d_model) * std)
+            if self.semantic_query_derivation
+            else None
         )
         self.to_semantic = nn.Sequential(
             nn.LayerNorm(d_model),
@@ -750,13 +790,27 @@ class SemanticBottleneck(nn.Module):
         self,
         evidence_latents: torch.Tensor,
         *,
+        grid_tokens: torch.Tensor | None = None,
         target_evidence_latents: torch.Tensor | None = None,
         return_attn: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]] | tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
         # evidence_latents: [B, K, D] -> semantic_slots: [B, M, D]
+        if self.semantic_query_derivation:
+            if grid_tokens is None:
+                raise ValueError("semantic_query_derivation requires grid_tokens, but got None.")
+            assert self.query_pool is not None and self.query_pool_queries is not None
+            query_init = self.query_pool_queries.expand(int(evidence_latents.shape[0]), -1, -1)
+            semantic_queries = self.query_pool(query_init, evidence_latents)
+            attn_targets = grid_tokens
+        else:
+            semantic_queries = self.semantic_queries.expand(int(evidence_latents.shape[0]), -1, -1)
+            if self.semantic_grid_access and grid_tokens is not None:
+                attn_targets = torch.cat([evidence_latents, grid_tokens], dim=1)
+            else:
+                attn_targets = evidence_latents
         compress_out = self.compress(
-            self.semantic_queries.expand(int(evidence_latents.shape[0]), -1, -1),
-            evidence_latents,
+            semantic_queries,
+            attn_targets,
             return_attn=return_attn,
         )
         if bool(return_attn):
@@ -779,15 +833,26 @@ class SemanticBottleneck(nn.Module):
         aux = {
             "semantic_recon_loss": recon_loss,
             "semantic_consistency_loss": consistency_loss,
+            # Exported LM-facing semantic tokens before prefix calibration/remap.
+            "semantic_export_tokens": exported_tokens,
             "semantic_token_count": evidence_latents.new_tensor(float(self.semantic_tokens)),
             "semantic_latent_dim": evidence_latents.new_tensor(float(self.semantic_latent_dim)),
             "semantic_target_token_count": evidence_latents.new_tensor(float(self.target_token_count)),
             "semantic_bottleneck_enabled": evidence_latents.new_tensor(1.0),
+            "semantic_grid_access_enabled": evidence_latents.new_tensor(1.0 if self.semantic_grid_access else 0.0),
+            "semantic_query_derivation_enabled": evidence_latents.new_tensor(1.0 if self.semantic_query_derivation else 0.0),
         }
         if semantic_attn is not None:
             attn = semantic_attn.float().clamp_min(1e-8)
             entropy = (-(attn * attn.log()).sum(dim=-1)).mean()
             aux["compression_mean_attn_entropy"] = entropy
+            if self.semantic_query_derivation:
+                aux["compression_grid_attn_fraction"] = attn.new_tensor(1.0)
+            elif self.semantic_grid_access and grid_tokens is not None:
+                evidence_n = int(evidence_latents.shape[1])
+                grid_mass = attn[..., evidence_n:].sum(dim=-1)
+                total_mass = attn.sum(dim=-1).clamp_min(1e-8)
+                aux["compression_grid_attn_fraction"] = (grid_mass / total_mass).mean()
         if not bool(return_attn):
             return exported_tokens, aux
         if semantic_attn is None:
@@ -1032,8 +1097,13 @@ class PerceiverResamplerBridge(_QueryBridgeBase):
         semantic_target_latents: torch.Tensor | None = None,
         return_attn: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
-        core_out = self.forward_evidence(
+        visual_tokens, grid_tokens = self._prepare_visual_tokens(
             visual_features,
+            question_context=question_context,
+            return_grid_tokens=True,
+        )
+        core_out = self.core(
+            visual_tokens,
             question_context=question_context,
             question_tokens=question_tokens,
             question_token_mask=question_token_mask,
@@ -1053,11 +1123,25 @@ class PerceiverResamplerBridge(_QueryBridgeBase):
                 "perceiver_final_attn": perceiver_final_attn if perceiver_final_attn is not None else evidence_latents.new_zeros((int(evidence_latents.shape[0]), 1, int(evidence_latents.shape[1]), 1)),
                 "compression_bypassed": evidence_latents.new_tensor(1.0 if bool(getattr(self, "eval_bypass_compression", False)) else 0.0),
             }
+            source_counts = getattr(self, "_last_source_token_counts", ())
+            if (
+                perceiver_final_attn is not None
+                and isinstance(source_counts, tuple)
+                and len(source_counts) == 2
+                and int(sum(source_counts)) == int(perceiver_final_attn.shape[-1])
+            ):
+                primary_n = int(source_counts[0])
+                vitstr_mass = perceiver_final_attn[..., primary_n:].float().sum(dim=-1)
+                total_mass = perceiver_final_attn.float().sum(dim=-1).clamp_min(1e-8)
+                per_example = (vitstr_mass / total_mass).mean(dim=(1, 2))
+                self.last_aux_info["vitstr_attn_fraction"] = per_example.mean()
+                self.last_aux_info["vitstr_attn_fraction_per_example"] = per_example
             if not bool(return_attn):
                 return evidence_latents
             return evidence_latents, attn_maps if attn_maps is not None else []
         semantic_out = self.semantic_bottleneck(
             evidence_latents,
+            grid_tokens=grid_tokens,
             target_evidence_latents=semantic_target_latents,
             return_attn=return_attn,
         )
@@ -1070,6 +1154,19 @@ class PerceiverResamplerBridge(_QueryBridgeBase):
             semantic_tokens, aux = semantic_out
         if perceiver_final_attn is not None:
             aux["perceiver_final_attn"] = perceiver_final_attn
+        source_counts = getattr(self, "_last_source_token_counts", ())
+        if (
+            perceiver_final_attn is not None
+            and isinstance(source_counts, tuple)
+            and len(source_counts) == 2
+            and int(sum(source_counts)) == int(perceiver_final_attn.shape[-1])
+        ):
+            primary_n = int(source_counts[0])
+            vitstr_mass = perceiver_final_attn[..., primary_n:].float().sum(dim=-1)
+            total_mass = perceiver_final_attn.float().sum(dim=-1).clamp_min(1e-8)
+            per_example = (vitstr_mass / total_mass).mean(dim=(1, 2))
+            aux["vitstr_attn_fraction"] = per_example.mean()
+            aux["vitstr_attn_fraction_per_example"] = per_example
         if bool(return_attn):
             aux["semantic_attn"] = semantic_attn
         aux["compression_bypassed"] = evidence_latents.new_tensor(0.0)
@@ -1140,7 +1237,8 @@ class MultiScalePerceiverBridge(nn.Module):
         low, high = _as_multiscale_token_pair(visual_features)
         low_t = self._prepare_tokens(low, self.low_proj, self.low_log_scale)
         high_t = self._prepare_tokens(high, self.high_proj, self.high_log_scale)
-        visual_tokens = self.spatial_mixer(torch.cat([low_t, high_t], dim=1))
+        grid_tokens = self.spatial_mixer(torch.cat([low_t, high_t], dim=1))
+        visual_tokens = grid_tokens
         core_out = self.core(
             visual_tokens,
             question_context=question_context,
@@ -1167,6 +1265,7 @@ class MultiScalePerceiverBridge(nn.Module):
             return evidence_latents, attn_maps if attn_maps is not None else []
         semantic_out = self.semantic_bottleneck(
             evidence_latents,
+            grid_tokens=grid_tokens,
             target_evidence_latents=semantic_target_latents,
             return_attn=return_attn,
         )

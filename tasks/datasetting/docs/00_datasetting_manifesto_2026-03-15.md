@@ -332,7 +332,7 @@ All synthetic generation uses Ollama on-device with >= 1B models. No cloud compu
 
 ### 7a. DATASETTING_STATE.md
 
-Analogous to mm_bridge's AUTORESEARCH_STATE.md. Contains:
+Analogous to mm_bridge's RESEARCH_STATE.md. Contains:
 - **Current frontier mix:** The best-performing data configuration found so far, with scores.
 - **Settled findings:** What's been tested and conclusively shown to help/hurt.
 - **Dead ends:** Axes that didn't pan out (and why — so we don't revisit them).
