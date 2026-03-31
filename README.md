@@ -12,6 +12,19 @@ This repo is my attempt at cracking into the [VQAv2 benchmark leaderboards](http
 - The final set of LMs + all bridges were trained on a gaming PC (12 core, 32gb, RTX 5080 (16gb VRAM))
 - "from-scratch" = everything but the COCO datasets: fielding imagery data was too big of a ticket price for me
 
+### Recent MM Bridge Work
+- Clean-regime SigLIP2 bridge finetuning on matched-compute `9k` schedules
+- LM-side semantic-token compression with ordered variable-prefix budgets such as `{2,4,8,16}`
+- Oracle and learned-budget studies for dynamic semantic allocation, without changing perceiver-side routing
+- OCR / chart-aware compression experiments using VQAv2, ChartQA, TextOCR, and compact GQA panels
+- Probe-heavy diagnostics for semantic-token quality, bottleneck behavior, and cross-benchmark transfer
+
+### Repo Process
+- Small launchers and task-owned scripts for training, eval, probes, and recoverable reruns
+- Separate eval-only runs for meaningful posthoc measurement, rather than burying results in train stdout
+- Research tracker app plus DuckDB experiment indexing for lightweight experiment bookkeeping
+- Task docs under `tasks/*/docs` used as concise planning files, reports, and rolling champion notes
+
 
 ## Visual Modeling (VAE -> ViTVAE -> DinoViT -> DinoLipVit)
 
