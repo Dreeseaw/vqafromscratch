@@ -3,9 +3,9 @@ VQA From Scratch
 
 This repo is my attempt at cracking into the [VQAv2 benchmark leaderboards](https://eval.ai/web/challenges/challenge-page/830/overview) with merely a Macbook Pro and a gaming PC halfway through the project. It comprises of a VAE, decoder-only LM (+ BPE tokenizer), and bridge module to project the VAE's spatial latent into visual tokens for the LM's usage. It also contains scripts for probing/evaluations, wikipedia scraping/cleaning/tokenization/distillation into QA-format, imagery pipelines (image, image-text, image-point), and web application for monitoring all these types of training runs + a few for visual learning of representations (see: gaus). 
 
-### Currently (as of 3/23/2026),
+### Currently,
 - My best "from-scratch" score is 46.99%
-- My best "frozen HF VM" score is 61.63% utilizing [google_siglip_base_patch16_224's](https://huggingface.co/google/siglip-base-patch16-224) richer training
+- My best "frozen HF VM" score is 66.67% utilizing [google's_siglip2_base's](https://huggingface.co/timm/ViT-B-16-SigLIP2) richer training
 
 ### Constraints
 - All VMs (and some LMs) were trained on a Macbook Pro (M4 Pro, 24gb)
