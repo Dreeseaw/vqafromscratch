@@ -24,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--prefetch_factor", type=int, default=2)
     ap.add_argument("--pin_memory", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--gqa_root", type=str, default=None)
+    ap.add_argument("--semantic_eval_budget", type=int, default=0)
     ap.add_argument("--limit_eval", type=int, default=0)
     ap.add_argument("--eval_batches", type=int, default=0)
     ap.add_argument("--seed", type=int, default=35)
@@ -86,6 +87,7 @@ def main() -> None:
         "prefetch_factor": int(args.prefetch_factor),
         "pin_memory": bool(args.pin_memory),
         "gqa_root": args.gqa_root,
+        "semantic_eval_budget": int(args.semantic_eval_budget),
     }
     model, tokenizer, _bridge_cfg, _payload, run_args = load_runtime_from_checkpoint(
         checkpoint_path=args.checkpoint,
@@ -136,6 +138,9 @@ def main() -> None:
     os.makedirs(os.path.dirname(os.path.abspath(args.output_json)), exist_ok=True)
     with open(args.output_json, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2, ensure_ascii=True)
+    print(f"[eval:gqa_val] overall_accuracy={out['overall_accuracy']:.4f}", flush=True)
+    for key, value in sorted(out["group_accuracy"].items()):
+        print(f"[gqa-eval] group={key} overall_accuracy={float(value):.4f}", flush=True)
     print(f"[gqa-eval] wrote: {os.path.abspath(args.output_json)}")
 
 

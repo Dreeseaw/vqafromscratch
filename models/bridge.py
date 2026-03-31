@@ -776,6 +776,48 @@ class SemanticBottleneck(nn.Module):
         self.recon_ln = nn.LayerNorm(d_model)
         # Linear decoder over token axis: [B, M, D] -> [B, K_target, D]
         self.recon_token_proj = nn.Linear(self.semantic_tokens, self.target_token_count, bias=True)
+        self.training_budget_options: tuple[int, ...] = ()
+        self.training_budget_sample_mode: str = "batch"
+        self.eval_budget: int | None = None
+        self.last_active_budget: int = int(self.semantic_tokens)
+
+    def set_training_budget_options(
+        self,
+        budgets: list[int] | tuple[int, ...],
+        *,
+        sample_mode: str = "batch",
+    ) -> None:
+        cleaned: list[int] = []
+        seen: set[int] = set()
+        for raw in budgets:
+            budget = max(1, min(int(raw), int(self.semantic_tokens)))
+            if budget in seen:
+                continue
+            seen.add(budget)
+            cleaned.append(budget)
+        self.training_budget_options = tuple(sorted(cleaned))
+        self.training_budget_sample_mode = str(sample_mode)
+
+    def set_eval_budget(self, budget: int | None) -> None:
+        if budget is None or int(budget) <= 0:
+            self.eval_budget = None
+            return
+        self.eval_budget = max(1, min(int(budget), int(self.semantic_tokens)))
+
+    def _resolve_active_budget(self, evidence_latents: torch.Tensor) -> int:
+        active_budget = int(self.semantic_tokens)
+        if self.training and self.training_budget_options:
+            if self.training_budget_sample_mode != "batch":
+                raise ValueError(
+                    f"Unsupported semantic budget sample mode={self.training_budget_sample_mode}. Supported: batch"
+                )
+            choice_idx = int(torch.randint(len(self.training_budget_options), (1,), device=evidence_latents.device).item())
+            active_budget = int(self.training_budget_options[choice_idx])
+        elif self.eval_budget is not None:
+            active_budget = int(self.eval_budget)
+        active_budget = max(1, min(active_budget, int(self.semantic_tokens)))
+        self.last_active_budget = int(active_budget)
+        return int(active_budget)
 
     def _target_tokens(self, evidence_latents: torch.Tensor, target_evidence_latents: torch.Tensor | None) -> torch.Tensor:
         target = target_evidence_latents if target_evidence_latents is not None else evidence_latents
@@ -821,6 +863,8 @@ class SemanticBottleneck(nn.Module):
         # semantic_latents: [B, M, Z] -> exported_tokens: [B, M, D]
         semantic_latents = self.to_semantic(semantic_slots)
         exported_tokens = self.to_export(semantic_latents)
+        active_budget = self._resolve_active_budget(evidence_latents)
+        active_export_tokens = exported_tokens[:, :active_budget, :]
         # reconstruction tokens: [B, M, D] -> [B, K_target, D]
         recon_tokens = self.recon_token_proj(self.recon_ln(exported_tokens).transpose(1, 2)).transpose(1, 2)
         target_tokens = self._target_tokens(evidence_latents, target_evidence_latents)
@@ -835,12 +879,15 @@ class SemanticBottleneck(nn.Module):
             "semantic_consistency_loss": consistency_loss,
             # Exported LM-facing semantic tokens before prefix calibration/remap.
             "semantic_export_tokens": exported_tokens,
-            "semantic_token_count": evidence_latents.new_tensor(float(self.semantic_tokens)),
+            "semantic_token_count": evidence_latents.new_tensor(float(active_budget)),
+            "semantic_token_capacity": evidence_latents.new_tensor(float(self.semantic_tokens)),
+            "semantic_active_token_count": evidence_latents.new_tensor(float(active_budget)),
             "semantic_latent_dim": evidence_latents.new_tensor(float(self.semantic_latent_dim)),
             "semantic_target_token_count": evidence_latents.new_tensor(float(self.target_token_count)),
             "semantic_bottleneck_enabled": evidence_latents.new_tensor(1.0),
             "semantic_grid_access_enabled": evidence_latents.new_tensor(1.0 if self.semantic_grid_access else 0.0),
             "semantic_query_derivation_enabled": evidence_latents.new_tensor(1.0 if self.semantic_query_derivation else 0.0),
+            "semantic_eval_budget": evidence_latents.new_tensor(float(self.eval_budget or 0)),
         }
         if semantic_attn is not None:
             attn = semantic_attn.float().clamp_min(1e-8)
@@ -854,10 +901,10 @@ class SemanticBottleneck(nn.Module):
                 total_mass = attn.sum(dim=-1).clamp_min(1e-8)
                 aux["compression_grid_attn_fraction"] = (grid_mass / total_mass).mean()
         if not bool(return_attn):
-            return exported_tokens, aux
+            return active_export_tokens, aux
         if semantic_attn is None:
             raise RuntimeError("Requested semantic attention weights but none were returned.")
-        return exported_tokens, aux, semantic_attn
+        return active_export_tokens, aux, semantic_attn
 
 
 class MLPVisualBridge(nn.Module):

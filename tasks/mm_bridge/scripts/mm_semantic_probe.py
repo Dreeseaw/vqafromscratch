@@ -24,6 +24,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--pin_memory", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--images_root", type=str, default=None)
     ap.add_argument("--annotations_root", type=str, default=None)
+    ap.add_argument("--gqa_root", type=str, default=None)
+    ap.add_argument("--chartqa_db_path", type=str, default=None)
+    ap.add_argument("--textocr_annotations_root", type=str, default=None)
+    ap.add_argument("--textocr_images_root", type=str, default=None)
+    ap.add_argument("--train_split", type=str, default="train")
+    ap.add_argument("--val_split", type=str, default="val")
     ap.add_argument("--limit_train", type=int, default=10000)
     ap.add_argument("--limit_val", type=int, default=5000)
     ap.add_argument("--answer_top_k", type=int, default=3000)
@@ -31,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--weight_decay", type=float, default=1e-4)
     ap.add_argument("--feature_pool", type=str, default="flatten", choices=["flatten", "mean"])
+    ap.add_argument("--semantic_eval_budget", type=int, default=0)
     ap.add_argument("--seed", type=int, default=35)
     ap.add_argument("--output_json", type=str, required=True)
     return ap.parse_args()
@@ -136,6 +143,11 @@ def main() -> None:
         "pin_memory": bool(args.pin_memory),
         "images_root": args.images_root,
         "annotations_root": args.annotations_root,
+        "gqa_root": args.gqa_root,
+        "chartqa_db_path": args.chartqa_db_path,
+        "textocr_annotations_root": args.textocr_annotations_root,
+        "textocr_images_root": args.textocr_images_root,
+        "semantic_eval_budget": int(args.semantic_eval_budget),
     }
     model, tokenizer, _bridge_cfg, _payload, run_args = load_runtime_from_checkpoint(
         checkpoint_path=args.checkpoint,
@@ -146,23 +158,26 @@ def main() -> None:
         run_args.images_root = args.images_root
     if args.annotations_root:
         run_args.annotations_root = args.annotations_root
+    if args.gqa_root:
+        run_args.gqa_root = args.gqa_root
     run_args.batch_size = int(args.batch_size)
     run_args.eval_batch_size = int(args.batch_size)
     run_args.num_workers = int(args.num_workers)
     run_args.prefetch_factor = int(args.prefetch_factor)
     run_args.pin_memory = bool(args.pin_memory)
+    run_args.semantic_eval_budget = int(args.semantic_eval_budget)
 
     train_loader = build_loader(
         run_args,
         tokenizer=tokenizer,
-        split="train",
+        split=str(args.train_split),
         train_mode=False,
         limit=max(0, int(args.limit_train)),
     )
     val_loader = build_loader(
         run_args,
         tokenizer=tokenizer,
-        split="val",
+        split=str(args.val_split),
         train_mode=False,
         limit=max(0, int(args.limit_val)),
     )
@@ -225,6 +240,9 @@ def main() -> None:
     out = {
         "checkpoint": os.path.abspath(args.checkpoint),
         "feature_pool": str(args.feature_pool),
+        "semantic_eval_budget": int(args.semantic_eval_budget),
+        "train_split": str(args.train_split),
+        "val_split": str(args.val_split),
         "answer_vocab_size": int(len(answer_to_idx)),
         "train_samples": int(train_x.shape[0]),
         "val_samples": int(val_x.shape[0]),
@@ -234,6 +252,12 @@ def main() -> None:
     os.makedirs(os.path.dirname(os.path.abspath(args.output_json)), exist_ok=True)
     with open(args.output_json, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2, ensure_ascii=True)
+    if best_summary is not None:
+        print(
+            f"[probe] best_accuracy={float(best_summary.get('accuracy', 0.0) or 0.0):.4f} "
+            f"semantic_eval_budget={int(args.semantic_eval_budget)}",
+            flush=True,
+        )
     print(f"[probe] wrote: {os.path.abspath(args.output_json)}")
 
 

@@ -42,7 +42,21 @@ from models.hf_vision import (
 from models.vit_ssl import DINOCheckpointBackbone
 from models.lm import LMConfig, TransformerDecoderOnlyV1
 from models.vae import VAEConfig, VariationalAutoEncoder, VariationalAutoEncoderRes, ViTVAE, ViTVAE2
-from train.vqa_data import GQADataset, GroundingGQAMixBatchSampler, GroundingMixBatchSampler, MixedVQAv2Dataset, PointingIndexDataset, VQAGQAMixBatchSampler, VQAv2Dataset, VQAv2Paths, build_image_transform, prepare_vqav2
+from train.vqa_data import (
+    ChartQADataset,
+    GQADataset,
+    GroundingGQAMixBatchSampler,
+    GroundingMixBatchSampler,
+    MixedVQAv2Dataset,
+    MultiDatasetBatchSampler,
+    PointingIndexDataset,
+    TextOCRReadoutDataset,
+    VQAGQAMixBatchSampler,
+    VQAv2Dataset,
+    VQAv2Paths,
+    build_image_transform,
+    prepare_vqav2,
+)
 
 
 LOGDIR = "logs"
@@ -287,6 +301,9 @@ def _apply_runtime_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "semantic_recon_loss_weight": 0.1,
         "semantic_consistency_loss_weight": 0.1,
         "semantic_token_schedule": "",
+        "semantic_budget_options": "",
+        "semantic_budget_sample_mode": "batch",
+        "semantic_eval_budget": 0,
         "semantic_teacher_checkpoint": "",
         "init_from_mm_checkpoint": "",
         "use_compression": False,
@@ -346,7 +363,12 @@ def _apply_runtime_defaults(args: argparse.Namespace) -> argparse.Namespace:
         "images_root": "images",
         "annotations_root": "annotations",
         "gqa_root": "data/gqa",
+        "chartqa_db_path": "data/vm_ssl/db/vm_ssl.duckdb",
+        "textocr_annotations_root": "data/vm_ssl/raw/textocr_full",
+        "textocr_images_root": "data/vm_ssl/raw/textocr_trainval",
         "dataset_mix": "",
+        "chartqa_train_mix_ratio": 0.0,
+        "textocr_train_mix_ratio": 0.0,
         "max_question_length": 64,
         "max_answer_length": 16,
         "max_text_tokens": 256,
@@ -377,6 +399,24 @@ def _normalize_semantic_aliases(args: argparse.Namespace) -> argparse.Namespace:
         if hasattr(args, "compression_distill_weight"):
             args.semantic_recon_loss_weight = float(getattr(args, "compression_distill_weight"))
     return args
+
+
+def _parse_semantic_budget_options(raw: Any, *, max_tokens: int) -> Tuple[int, ...]:
+    text = str(raw or "").strip()
+    if not text:
+        return ()
+    values: List[int] = []
+    seen: set[int] = set()
+    for part in text.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        budget = max(1, min(int(item), int(max_tokens)))
+        if budget in seen:
+            continue
+        seen.add(budget)
+        values.append(budget)
+    return tuple(sorted(values))
 
 
 def build_vision_model_from_args(args: argparse.Namespace, device: str, ckpt_payload: Optional[Dict[str, Any]] = None) -> nn.Module:
@@ -437,7 +477,11 @@ def build_vision_model_from_args(args: argparse.Namespace, device: str, ckpt_pay
         ckpt_path = os.path.join(model_dir, "open_clip_model.pt")
         if not os.path.isfile(ckpt_path):
             raise SystemExit(f"Expected checkpoint at {ckpt_path}. Run the download script first.")
-        model = OpenCLIPBackbone("MobileCLIP2-S0", checkpoint_path=ckpt_path, device=device)
+        model = OpenCLIPBackbone(
+            "MobileCLIP2-S0",
+            checkpoint_path=ckpt_path,
+            device=device,
+        )
         return model.to(device)
     elif vision_model_name == "siglip2_b16":
         model_dir = str(args.vision_checkpoint or meta.get("vision_checkpoint", ""))
@@ -1627,6 +1671,7 @@ class MultimodalPrefixLM(nn.Module):
             "prefix_batch_variance_mean": float(aux["prefix_batch_variance_mean"].item()),
             "semantic_bottleneck_enabled": float(aux.get("semantic_bottleneck_enabled", ce_loss.new_tensor(0.0)).item()),
             "semantic_token_count": float(aux.get("semantic_token_count", ce_loss.new_tensor(0.0)).item()),
+            "semantic_token_capacity": float(aux.get("semantic_token_capacity", ce_loss.new_tensor(0.0)).item()),
             "semantic_latent_dim": float(aux.get("semantic_latent_dim", ce_loss.new_tensor(0.0)).item()),
             "semantic_target_token_count": float(aux.get("semantic_target_token_count", ce_loss.new_tensor(0.0)).item()),
             "semantic_teacher_enabled": 1.0 if teacher_model is not None else 0.0,
@@ -1647,12 +1692,15 @@ class MultimodalPrefixLM(nn.Module):
         if isinstance(answer_kd_store, dict) and answer_kd_weight > 0.0:
             batch_qids = [int(qid) for qid in batch.get("question_ids", [])]
             if batch_qids:
-                qid_to_row = dict(answer_kd_store.get("qid_to_row") or {})
-                answer_mask_any = batch["answer_loss_mask"].any(dim=1)
+                # Keep the KD lookup map as a long-lived dict instead of copying it every
+                # step. Also materialize the answer-mask presence on CPU once, so we do
+                # not pay per-sample GPU sync via .item() inside the Python loop.
+                qid_to_row = answer_kd_store.get("qid_to_row") or {}
+                answer_mask_any = batch["answer_loss_mask"].any(dim=1).detach().to(device="cpu")
                 row_pairs: List[Tuple[int, int]] = []
                 for bi, qid in enumerate(batch_qids):
                     row_idx = qid_to_row.get(int(qid))
-                    if row_idx is None or not bool(answer_mask_any[bi].item()):
+                    if row_idx is None or not bool(answer_mask_any[bi]):
                         continue
                     row_pairs.append((int(bi), int(row_idx)))
                 if row_pairs:
@@ -1662,14 +1710,32 @@ class MultimodalPrefixLM(nn.Module):
                     student_vocab_cols = answer_kd_store.get("student_first_token_ids")
                     teacher_logits_all = answer_kd_store.get("teacher_logits")
                     if isinstance(student_vocab_cols, torch.Tensor) and isinstance(teacher_logits_all, torch.Tensor):
+                        # Cache the student answer-token projection indices on the active
+                        # device. Re-sending the same small tensor every step was
+                        # measurable overhead in the SigLIP2+KD bridge path.
+                        if student_vocab_cols.device != next_logits.device:
+                            student_vocab_cols_dev = answer_kd_store.get("_student_first_token_ids_dev")
+                            if (
+                                not isinstance(student_vocab_cols_dev, torch.Tensor)
+                                or student_vocab_cols_dev.device != next_logits.device
+                            ):
+                                student_vocab_cols_dev = student_vocab_cols.to(device=next_logits.device, non_blocking=True)
+                                answer_kd_store["_student_first_token_ids_dev"] = student_vocab_cols_dev
+                        else:
+                            student_vocab_cols_dev = student_vocab_cols
                         student_answer_logits = next_logits[batch_idx, answer_pos].index_select(
                             dim=-1,
-                            index=student_vocab_cols.to(device=next_logits.device),
+                            index=student_vocab_cols_dev,
                         )
-                        teacher_answer_logits = teacher_logits_all.index_select(dim=0, index=row_idx).to(
-                            device=next_logits.device,
-                            dtype=student_answer_logits.dtype,
-                        )
+                        if teacher_logits_all.device.type != "cpu" and teacher_logits_all.device != row_idx.device:
+                            row_idx = row_idx.to(device=teacher_logits_all.device, non_blocking=True)
+                        teacher_answer_logits = teacher_logits_all.index_select(dim=0, index=row_idx)
+                        if teacher_answer_logits.device != next_logits.device or teacher_answer_logits.dtype != student_answer_logits.dtype:
+                            teacher_answer_logits = teacher_answer_logits.to(
+                                device=next_logits.device,
+                                dtype=student_answer_logits.dtype,
+                                non_blocking=True,
+                            )
                         temp = max(1e-4, float(answer_kd_temp))
                         kd_loss = F.kl_div(
                             F.log_softmax(student_answer_logits / temp, dim=-1),
@@ -2001,8 +2067,26 @@ def build_loader(
     dataset_mix_raw = str(getattr(args, "dataset_mix", "") or "").strip()
     gqa_train_mix_ratio = float(getattr(args, "gqa_train_mix_ratio", 0.0))
     gqa_train_fraction = float(getattr(args, "gqa_train_fraction", 1.0))
+    chartqa_train_mix_ratio = float(getattr(args, "chartqa_train_mix_ratio", 0.0))
+    textocr_train_mix_ratio = float(getattr(args, "textocr_train_mix_ratio", 0.0))
     base_train_dataset: Any = None
-    if bool(train_mode) and split == "train" and bool(getattr(args, "use_grounding_loss", False)) and gqa_train_mix_ratio > 0.0:
+    has_chart_or_text_mix = chartqa_train_mix_ratio > 0.0 or textocr_train_mix_ratio > 0.0
+    if bool(train_mode) and split == "train" and has_chart_or_text_mix:
+        if dataset_mix_raw:
+            raise ValueError("chartqa/textocr mix ratios are not supported together with --dataset_mix")
+        if gqa_train_mix_ratio > 0.0:
+            raise ValueError("chartqa/textocr mix ratios are not supported together with --gqa_train_mix_ratio")
+        if bool(getattr(args, "use_grounding_loss", False)):
+            raise ValueError("chartqa/textocr mix ratios are not supported together with --use_grounding_loss")
+        base_train_dataset = VQAv2Dataset(
+            images_root=args.images_root,
+            annotations_root=args.annotations_root,
+            split="train",
+            transform=transform,
+            limit=limit,
+            skip_missing_images=True,
+        )
+    elif bool(train_mode) and split == "train" and bool(getattr(args, "use_grounding_loss", False)) and gqa_train_mix_ratio > 0.0:
         base_train_dataset = VQAv2Dataset(
             images_root=args.images_root,
             annotations_root=args.annotations_root,
@@ -2044,6 +2128,25 @@ def build_loader(
             skip_missing_images=True,
             question_group=str(getattr(args, "gqa_eval_group", "") or "").strip().lower(),
         )
+    elif split in ("chartqa_train", "chartqa_val"):
+        chart_split = "train" if split == "chartqa_train" else "val"
+        base_train_dataset = ChartQADataset(
+            db_path=str(getattr(args, "chartqa_db_path", "") or "data/vm_ssl/db/vm_ssl.duckdb"),
+            split=chart_split,
+            transform=transform,
+            limit=limit,
+            skip_missing_images=True,
+        )
+    elif split in ("textocr_train", "textocr_val"):
+        text_split = "train" if split == "textocr_train" else "val"
+        base_train_dataset = TextOCRReadoutDataset(
+            annotations_root=str(getattr(args, "textocr_annotations_root", "") or "data/vm_ssl/raw/textocr_full"),
+            images_root=str(getattr(args, "textocr_images_root", "") or "data/vm_ssl/raw/textocr_trainval"),
+            split=text_split,
+            transform=transform,
+            limit=limit,
+            skip_missing_images=True,
+        )
     else:
         base_train_dataset = VQAv2Dataset(
             images_root=args.images_root,
@@ -2055,7 +2158,43 @@ def build_loader(
         )
     ds = base_train_dataset
     batch_sampler = None
-    if bool(train_mode) and split == "train" and (not bool(getattr(args, "use_grounding_loss", False))) and gqa_train_mix_ratio > 0.0:
+    if bool(train_mode) and split == "train" and has_chart_or_text_mix:
+        datasets: List[Any] = [base_train_dataset]
+        source_names: List[str] = ["vqav2"]
+        source_mix_ratios: Dict[str, float] = {}
+        if chartqa_train_mix_ratio > 0.0:
+            chartqa_train_dataset = ChartQADataset(
+                db_path=str(getattr(args, "chartqa_db_path", "") or "data/vm_ssl/db/vm_ssl.duckdb"),
+                split="train",
+                transform=transform,
+                limit=0,
+                skip_missing_images=True,
+            )
+            datasets.append(chartqa_train_dataset)
+            source_names.append("chartqa")
+            source_mix_ratios["chartqa"] = float(chartqa_train_mix_ratio)
+        if textocr_train_mix_ratio > 0.0:
+            textocr_train_dataset = TextOCRReadoutDataset(
+                annotations_root=str(getattr(args, "textocr_annotations_root", "") or "data/vm_ssl/raw/textocr_full"),
+                images_root=str(getattr(args, "textocr_images_root", "") or "data/vm_ssl/raw/textocr_trainval"),
+                split="train",
+                transform=transform,
+                limit=0,
+                skip_missing_images=True,
+            )
+            datasets.append(textocr_train_dataset)
+            source_names.append("textocr")
+            source_mix_ratios["textocr"] = float(textocr_train_mix_ratio)
+        ds = ConcatDataset(datasets)
+        batch_sampler = MultiDatasetBatchSampler(
+            datasets=datasets,
+            source_names=source_names,
+            batch_size=int(args.batch_size),
+            source_mix_ratios=source_mix_ratios,
+            seed=int(args.seed),
+            drop_last=True,
+        )
+    elif bool(train_mode) and split == "train" and (not bool(getattr(args, "use_grounding_loss", False))) and gqa_train_mix_ratio > 0.0:
         gqa_train_dataset = GQADataset(
             gqa_root=args.gqa_root,
             split="train",
@@ -2313,7 +2452,7 @@ def _to_device(batch: Dict[str, Any], device: str) -> Dict[str, Any]:
         "has_grounding_target",
     ):
         if k in batch:
-            out[k] = batch[k].to(device)
+            out[k] = batch[k].to(device, non_blocking=True)
     return out
 
 
@@ -2536,6 +2675,9 @@ def attach_answer_kd_labels(
             f"Answer KD payload row mismatch at {labels_path}: qids={int(question_ids.numel())} logits={int(teacher_logits.shape[0])}"
         )
     qid_to_row = {int(qid): idx for idx, qid in enumerate(question_ids.tolist())}
+    # Keep KD logits CPU-resident by default. A GPU-resident variant was benchmarked
+    # for the current SigLIP2 frontier bridge and did not beat the CPU-resident path
+    # once the batch-time Python overheads were fixed, while also consuming extra VRAM.
     store = {
         "path": os.path.abspath(str(labels_path)),
         "answer_vocab": answer_vocab,
@@ -2749,6 +2891,20 @@ def build_runtime_from_args(
     model.semantic_format_anneal_end_step = int(getattr(args, "semantic_format_anneal_end_step", 0))
     if hasattr(model.bridge, "eval_bypass_compression"):
         model.bridge.eval_bypass_compression = bool(getattr(args, "eval_bypass_compression", False))
+    semantic_mod = getattr(model.bridge, "semantic_bottleneck", None)
+    if semantic_mod is not None:
+        budget_options = _parse_semantic_budget_options(
+            getattr(args, "semantic_budget_options", ""),
+            max_tokens=int(getattr(bridge_cfg, "semantic_tokens", 16)),
+        )
+        if hasattr(semantic_mod, "set_training_budget_options"):
+            semantic_mod.set_training_budget_options(
+                list(budget_options),
+                sample_mode=str(getattr(args, "semantic_budget_sample_mode", "batch")),
+            )
+        if hasattr(semantic_mod, "set_eval_budget"):
+            eval_budget = int(getattr(args, "semantic_eval_budget", 0))
+            semantic_mod.set_eval_budget(eval_budget if eval_budget > 0 else None)
     if str(vision_device) != str(device):
         model.vision_adapter.vision_model.to(vision_device)
     return model, tokenizer, bridge_cfg
@@ -2793,6 +2949,7 @@ def run_generation_predictions(
     split_name: str = "eval",
     log_every: int = 10,
     cuda_empty_cache_every: int = 0,
+    collect_generation_stats: bool = False,
 ) -> List[Dict[str, Any]]:
     model.eval()
     records: List[Dict[str, Any]] = []
@@ -2806,6 +2963,15 @@ def run_generation_predictions(
             eos_id=tokenizer.eos_id,
             max_new_tokens=max_answer_length,
         )
+        gen_stats: List[Dict[str, float]] | None = None
+        if bool(collect_generation_stats):
+            gen_stats = compute_generation_uncertainty_stats(
+                model=model,
+                images=batch["images"],
+                prompt_ids=batch["prompt_ids"],
+                generated_ids=gens,
+                pad_id=tokenizer.pad_id,
+            )
         if debug_shapes and bidx == 0:
             _ = model.forward_logits(
                 input_ids=batch["input_ids"],
@@ -2827,6 +2993,8 @@ def run_generation_predictions(
                     "metadata": batch["metadata"][i],
                 }
             )
+            if isinstance(gen_stats, list) and i < len(gen_stats):
+                records[-1]["generation_stats"] = dict(gen_stats[i])
         if int(log_every) > 0 and ((bidx + 1) % int(log_every) == 0 or (bidx == 0)):
             elapsed = max(1e-6, float(time.time() - t0))
             msg = (
@@ -2837,7 +3005,7 @@ def run_generation_predictions(
             if logger is not None:
                 logger.log(msg)
             else:
-                print(msg)
+                print(msg, flush=True)
         if int(cuda_empty_cache_every) > 0 and ((bidx + 1) % int(cuda_empty_cache_every) == 0):
             if torch.cuda.is_available():
                 gc.collect()
@@ -2847,6 +3015,141 @@ def run_generation_predictions(
         if max_batches > 0 and (bidx + 1) >= int(max_batches):
             break
     return records
+
+
+@torch.no_grad()
+def compute_generation_uncertainty_stats(
+    model: MultimodalPrefixLM,
+    images: torch.Tensor,
+    prompt_ids: Sequence[Sequence[int]],
+    generated_ids: Sequence[Sequence[int]],
+    *,
+    pad_id: int,
+) -> List[Dict[str, float]]:
+    if len(prompt_ids) != len(generated_ids):
+        raise ValueError(f"Expected prompt_ids len={len(prompt_ids)}, got generated_ids len={len(generated_ids)}")
+    if not prompt_ids:
+        return []
+
+    device = images.device
+    prompt_lengths = [int(len(x)) for x in prompt_ids]
+    seqs = [list(prompt_ids[i]) + list(generated_ids[i]) for i in range(len(prompt_ids))]
+    legacy_prompt_conditioned = bool(
+        getattr(model.bridge, "supports_question_context", False)
+        and model.question_context_mode == "prompt_only"
+    )
+
+    needs_visual = bool(getattr(model.bridge, "requires_visual_features", True))
+    supports_qcond = bool(getattr(model.bridge, "supports_question_context", False))
+    supports_qtokens = bool(getattr(model.bridge, "supports_question_tokens", False))
+    prompt_conditioned = (supports_qcond or supports_qtokens) and model.question_context_mode in (
+        "prompt_only",
+        "question_only",
+    )
+
+    cached_visual_features: Optional[torch.Tensor] = None
+    if needs_visual:
+        cached_visual_features = model.vision_adapter(images)
+        if model.visual_feature_adapter_type != "none":
+            cached_visual_features = model.visual_feature_adapter(cached_visual_features)
+
+    cached_visual_prefix: Optional[torch.Tensor] = None
+    if (not supports_qcond) or prompt_conditioned:
+        prompt_input_ids, prompt_text_pad_mask, prompt_mask, question_mask = model._pack_generation_text_batch(
+            prompt_ids,
+            prompt_lengths=prompt_lengths,
+            pad_id=pad_id,
+            device=device,
+            legacy_prompt_mask=False,
+        )
+        prompt_text_emb = model.lm._embed_dropout(model.lm._embed(prompt_input_ids))
+        cached_visual_prefix, cached_visual_features = model._compute_visual_prefix(
+            images=images,
+            text_emb=prompt_text_emb,
+            text_pad_mask=prompt_text_pad_mask,
+            prompt_mask=prompt_mask,
+            question_mask=question_mask,
+            visual_features=cached_visual_features,
+        )
+
+    input_ids, text_pad_mask, prompt_mask, question_mask = model._pack_generation_text_batch(
+        seqs,
+        prompt_lengths=prompt_lengths,
+        pad_id=pad_id,
+        device=device,
+        legacy_prompt_mask=legacy_prompt_conditioned,
+    )
+    text_emb = model.lm._embed_dropout(model.lm._embed(input_ids))
+    visual_prefix = cached_visual_prefix
+    if visual_prefix is None:
+        visual_prefix, cached_visual_features = model._compute_visual_prefix(
+            images=images,
+            text_emb=text_emb,
+            text_pad_mask=text_pad_mask,
+            prompt_mask=prompt_mask,
+            question_mask=question_mask,
+            visual_features=cached_visual_features,
+        )
+    logits, prefix_k = model._decode_with_visual_prefix(
+        input_ids=input_ids,
+        text_emb=text_emb,
+        text_pad_mask=text_pad_mask,
+        visual_prefix=visual_prefix,
+    )
+    text_logits = logits[:, prefix_k:, :].float()
+
+    out: List[Dict[str, float]] = []
+    for i, gen in enumerate(generated_ids):
+        token_ids = [int(tok) for tok in gen]
+        if not token_ids:
+            out.append(
+                {
+                    "generated_token_count": 0.0,
+                    "mean_selected_prob": 0.0,
+                    "min_selected_prob": 0.0,
+                    "mean_selected_logprob": 0.0,
+                    "mean_margin": 0.0,
+                    "min_margin": 0.0,
+                    "mean_entropy": 0.0,
+                    "max_entropy": 0.0,
+                    "first_selected_prob": 0.0,
+                    "first_margin": 0.0,
+                    "first_entropy": 0.0,
+                }
+            )
+            continue
+
+        start_pos = max(0, int(prompt_lengths[i]) - 1)
+        pos_idx = torch.arange(start_pos, start_pos + len(token_ids), dtype=torch.long, device=device)
+        step_logits = text_logits[i].index_select(0, pos_idx)
+        step_log_probs = F.log_softmax(step_logits, dim=-1)
+        step_probs = step_log_probs.exp()
+        token_idx = torch.tensor(token_ids, dtype=torch.long, device=device).unsqueeze(-1)
+        selected_log_probs = step_log_probs.gather(dim=-1, index=token_idx).squeeze(-1)
+        selected_probs = selected_log_probs.exp()
+        top_k = min(2, int(step_probs.shape[-1]))
+        top_probs = torch.topk(step_probs, k=top_k, dim=-1).values
+        top1_probs = top_probs[:, 0]
+        top2_probs = top_probs[:, 1] if top_k > 1 else torch.zeros_like(top1_probs)
+        margins = top1_probs - top2_probs
+        entropy = -(step_probs * step_log_probs).sum(dim=-1)
+
+        out.append(
+            {
+                "generated_token_count": float(len(token_ids)),
+                "mean_selected_prob": float(selected_probs.mean().item()),
+                "min_selected_prob": float(selected_probs.min().item()),
+                "mean_selected_logprob": float(selected_log_probs.mean().item()),
+                "mean_margin": float(margins.mean().item()),
+                "min_margin": float(margins.min().item()),
+                "mean_entropy": float(entropy.mean().item()),
+                "max_entropy": float(entropy.max().item()),
+                "first_selected_prob": float(selected_probs[0].item()),
+                "first_margin": float(margins[0].item()),
+                "first_entropy": float(entropy[0].item()),
+            }
+        )
+    return out
 
 
 @torch.no_grad()
@@ -3485,6 +3788,11 @@ def log_startup_config(
         f"semantic_format_anneal_end_step={int(getattr(args, 'semantic_format_anneal_end_step', 0))}"
     )
     logger.log(
+        f"[mm] semantic_budget_options={str(getattr(args, 'semantic_budget_options', '') or '')} "
+        f"semantic_budget_sample_mode={str(getattr(args, 'semantic_budget_sample_mode', 'batch'))} "
+        f"semantic_eval_budget={int(getattr(args, 'semantic_eval_budget', 0))}"
+    )
+    logger.log(
         f"[mm] answer_kd_labels_path={str(getattr(args, 'answer_kd_labels_path', '') or '')} "
         f"answer_kd_weight={float(getattr(args, 'answer_kd_weight', 0.0)):.6g} "
         f"answer_kd_temp={float(getattr(args, 'answer_kd_temp', 4.0)):.6g}"
@@ -3512,7 +3820,12 @@ def log_startup_config(
     )
     logger.log(
         f"[mm] data images_root={args.images_root} annotations_root={args.annotations_root} gqa_root={getattr(args, 'gqa_root', '')} "
+        f"chartqa_db_path={str(getattr(args, 'chartqa_db_path', '') or '')} "
+        f"textocr_annotations_root={str(getattr(args, 'textocr_annotations_root', '') or '')} "
+        f"textocr_images_root={str(getattr(args, 'textocr_images_root', '') or '')} "
         f"dataset_mix={str(getattr(args, 'dataset_mix', '') or '')} "
+        f"chartqa_train_mix_ratio={float(getattr(args, 'chartqa_train_mix_ratio', 0.0)):.6g} "
+        f"textocr_train_mix_ratio={float(getattr(args, 'textocr_train_mix_ratio', 0.0)):.6g} "
         f"pointing_index_path={str(getattr(args, 'pointing_index_path', '') or '')} "
         f"pointing_mix_ratio={float(getattr(args, 'pointing_mix_ratio', 0.0)):.6g} "
         f"gqa_train_mix_ratio={float(getattr(args, 'gqa_train_mix_ratio', 0.0)):.6g} "
@@ -3820,6 +4133,25 @@ def parse_args() -> argparse.Namespace:
         help="Derive bottleneck queries from perceiver latents, then attend over projected visual grid tokens only.",
     )
     ap.add_argument(
+        "--semantic_budget_options",
+        type=str,
+        default="",
+        help="Comma-separated semantic token budgets to sample per batch during training, e.g. 4,8,12,16.",
+    )
+    ap.add_argument(
+        "--semantic_budget_sample_mode",
+        type=str,
+        default="batch",
+        choices=["batch"],
+        help="How to sample from --semantic_budget_options during training.",
+    )
+    ap.add_argument(
+        "--semantic_eval_budget",
+        type=int,
+        default=0,
+        help="Fixed semantic token budget exposed at eval/inference time; <=0 uses the full bottleneck width.",
+    )
+    ap.add_argument(
         "--semantic_teacher_checkpoint",
         type=str,
         default="",
@@ -4005,6 +4337,13 @@ def parse_args() -> argparse.Namespace:
         help="Temperature for answer-vocab KD loss.",
     )
     ap.add_argument(
+        "--answer_kd_resident_device",
+        type=str,
+        default="cpu",
+        choices=["cpu", "cuda", "auto"],
+        help="Where to keep answer-KD teacher logits during training.",
+    )
+    ap.add_argument(
         "--visual_feature_adapter_type",
         type=str,
         default="none",
@@ -4019,6 +4358,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--images_root", type=str, default="images")
     ap.add_argument("--annotations_root", type=str, default="annotations")
     ap.add_argument("--gqa_root", type=str, default="data/gqa")
+    ap.add_argument("--chartqa_db_path", type=str, default="data/vm_ssl/db/vm_ssl.duckdb")
+    ap.add_argument("--textocr_annotations_root", type=str, default="data/vm_ssl/raw/textocr_full")
+    ap.add_argument("--textocr_images_root", type=str, default="data/vm_ssl/raw/textocr_trainval")
     ap.add_argument("--gqa_eval_group", type=str, default="", choices=["", "spatial", "attribute", "count", "exist"])
     ap.add_argument(
         "--dataset_mix",
@@ -4026,6 +4368,8 @@ def parse_args() -> argparse.Namespace:
         default="",
         help='JSON dict mapping supervised source keys to percentages, e.g. \'{"vqav2_train": 100, "vqav2_val": 10}\' or \'{"gqa_train": 100}\'.',
     )
+    ap.add_argument("--chartqa_train_mix_ratio", type=float, default=0.0)
+    ap.add_argument("--textocr_train_mix_ratio", type=float, default=0.0)
     ap.add_argument("--auto_download", action="store_true")
     ap.add_argument("--download_images", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--download_test", action=argparse.BooleanOptionalAction, default=False)
@@ -4637,6 +4981,8 @@ def main() -> None:
             sem_format = info_dict.get("loss_semantic_format", None)
             sem_format_weight = info_dict.get("semantic_format_weight", None)
             sem_format_cos = info_dict.get("semantic_format_cosine_sim", None)
+            sem_budget = info_dict.get("semantic_token_count", None)
+            sem_capacity = info_dict.get("semantic_token_capacity", None)
             answer_kd_loss = info_dict.get("loss_answer_kd", None)
             answer_kd_cov = info_dict.get("answer_kd_coverage", None)
             loss_ground = info_dict.get("loss_grounding", None)
@@ -4662,6 +5008,11 @@ def main() -> None:
                 reg_txt += f" sem_format_w={float(sem_format_weight):.4f}"
             if sem_format_cos is not None and float(sem_format_cos) > 0.0:
                 reg_txt += f" format_cos={float(sem_format_cos):.4f}"
+            if sem_budget is not None and float(sem_budget) > 0.0:
+                if sem_capacity is not None and float(sem_capacity) > 0.0:
+                    reg_txt += f" sem_k={int(round(float(sem_budget)))}/{int(round(float(sem_capacity)))}"
+                else:
+                    reg_txt += f" sem_k={int(round(float(sem_budget)))}"
             if answer_kd_loss is not None and float(answer_kd_loss) > 0.0:
                 reg_txt += f" answer_kd={float(answer_kd_loss):.6f}"
             if answer_kd_cov is not None and float(answer_kd_cov) > 0.0:

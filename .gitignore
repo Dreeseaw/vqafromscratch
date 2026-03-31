@@ -11,3 +11,4 @@ data/*
 cmds.txt
 *.pdf
 .venv/
+tasks/*

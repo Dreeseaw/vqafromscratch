@@ -35,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--disable_lm_visual_adapters", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--prefix_remap_checkpoint", type=str, default="")
     ap.add_argument("--seed", type=int, default=35)
+    ap.add_argument("--semantic_eval_budget", type=int, default=0)
     ap.add_argument("--output_json", type=str, required=True)
     return ap.parse_args()
 
@@ -57,6 +58,7 @@ def main() -> None:
         "prefix_remap_present": bool(args.apply_prefix_remap_in_forward)
         or bool(str(args.prefix_remap_checkpoint or "").strip()),
         "prefix_remap_checkpoint": str(args.prefix_remap_checkpoint or ""),
+        "semantic_eval_budget": int(args.semantic_eval_budget),
     }
     model, tokenizer, _bridge_cfg, _payload, run_args = load_runtime_from_checkpoint(
         checkpoint_path=args.checkpoint,
@@ -99,6 +101,7 @@ def main() -> None:
         "checkpoint": os.path.abspath(args.checkpoint),
         "apply_prefix_remap_in_forward": bool(args.apply_prefix_remap_in_forward),
         "disable_lm_visual_adapters": bool(args.disable_lm_visual_adapters),
+        "semantic_eval_budget": int(args.semantic_eval_budget),
         "scorer": str(summary.get("scorer", args.scorer)),
         "overall_accuracy": float(summary.get("overall_accuracy", 0.0)),
         "answer_type_accuracy": dict(summary.get("answer_type_accuracy", {})),

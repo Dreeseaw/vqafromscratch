@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import zipfile
+from io import BytesIO
 from pathlib import Path
 from typing import Iterable
 
 import duckdb
+from PIL import Image
 try:
     import ijson
 except ImportError:
@@ -112,6 +115,47 @@ def clean_text(value: str | None) -> str | None:
     if text.lower() == "none":
         return None
     return text
+
+
+def sha256_bytes(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def save_chart_image(image: Image.Image, out_path: Path) -> tuple[str, int, int, int]:
+    normalized = image.convert("RGB")
+    buffer = BytesIO()
+    normalized.save(buffer, format="PNG", optimize=True)
+    raw = buffer.getvalue()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if not out_path.exists():
+        out_path.write_bytes(raw)
+    width, height = normalized.size
+    return sha256_bytes(raw), width, height, len(raw)
+
+
+def insert_image_rows(conn: duckdb.DuckDBPyConnection, rows: list[list[object]]) -> None:
+    if not rows:
+        return
+    conn.executemany(
+        """
+        insert or replace into images (
+          image_id,
+          source_name,
+          source_native_id,
+          source_split,
+          source_path_or_url,
+          local_path,
+          sha256,
+          width,
+          height,
+          aspect_ratio,
+          file_size_bytes,
+          decode_ok,
+          drop_reason
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
 
 
 def insert_pair_rows(conn: duckdb.DuckDBPyConnection, rows: list[list[object]]) -> None:
@@ -234,6 +278,121 @@ def import_gqa(conn: duckdb.DuckDBPyConnection, root_dir: Path, allowed_splits: 
     return counts_by_split
 
 
+def import_chartqa(
+    conn: duckdb.DuckDBPyConnection,
+    root_dir: Path,
+    allowed_splits: set[str] | None = None,
+) -> tuple[dict[str, int], int]:
+    from datasets import load_dataset
+
+    requested_splits = sorted(allowed_splits or {"train", "val"})
+    images_root = root_dir / "images"
+    register_dataset(
+        conn,
+        "chartqa",
+        license_name="dataset-specific / benchmark",
+        tier="research",
+        local_path=str(root_dir.resolve()),
+        notes=(
+            "HuggingFaceM4/ChartQA train+val import. Chart images are materialized once by content hash "
+            "and shared across multiple question-answer rows via image_qa_pairs."
+        ),
+    )
+
+    existing_ids = {
+        row[0]
+        for row in conn.execute(
+            "select image_id from images where source_name = 'chartqa'"
+        ).fetchall()
+    }
+
+    image_rows: list[list[object]] = []
+    pair_rows: list[list[object]] = []
+    counts_by_split: dict[str, int] = {}
+    new_images = 0
+
+    for split in requested_splits:
+        ds = load_dataset("HuggingFaceM4/ChartQA", split=split)
+        human_or_machine_feature = ds.features["human_or_machine"]
+        for row_idx, row in enumerate(ds):
+            image = row["image"]
+            question = clean_text(row.get("query"))
+            labels = row.get("label") or []
+            answer = clean_text(labels[0] if labels else None)
+            if image is None or question is None:
+                continue
+
+            buffer = BytesIO()
+            image.convert("RGB").save(buffer, format="PNG", optimize=True)
+            encoded = buffer.getvalue()
+            image_sha = sha256_bytes(encoded)
+            image_id = f"chartqa:shared:{image_sha}"
+            rel_path = Path("data/vm_ssl/raw/chartqa/images") / image_sha[:2] / f"{image_sha}.png"
+            abs_path = Path.cwd() / rel_path
+
+            if image_id not in existing_ids:
+                abs_path.parent.mkdir(parents=True, exist_ok=True)
+                if not abs_path.exists():
+                    abs_path.write_bytes(encoded)
+                width, height = image.size
+                image_rows.append(
+                    [
+                        image_id,
+                        "chartqa",
+                        image_sha,
+                        "shared",
+                        f"hf://HuggingFaceM4/ChartQA/{split}/{row_idx}",
+                        str(rel_path),
+                        image_sha,
+                        width,
+                        height,
+                        float(width) / float(height) if height else None,
+                        len(encoded),
+                        True,
+                        None,
+                    ]
+                )
+                existing_ids.add(image_id)
+                new_images += 1
+
+            record_json = {
+                "row_idx": row_idx,
+                "human_or_machine": human_or_machine_feature.int2str(int(row["human_or_machine"])),
+                "answers": labels,
+            }
+            pair_rows.append(
+                [
+                    f"chartqa:{split}:{row_idx}",
+                    "chartqa",
+                    image_id,
+                    split,
+                    question,
+                    answer,
+                    answer is not None,
+                    len(question),
+                    len(answer) if answer is not None else None,
+                    json.dumps(record_json, sort_keys=True),
+                ]
+            )
+            counts_by_split[split] = counts_by_split.get(split, 0) + 1
+
+            if len(image_rows) >= 512:
+                insert_image_rows(conn, image_rows)
+                image_rows.clear()
+            if len(pair_rows) >= 2048:
+                insert_pair_rows(conn, pair_rows)
+                pair_rows.clear()
+
+        if image_rows:
+            insert_image_rows(conn, image_rows)
+            image_rows.clear()
+        if pair_rows:
+            insert_pair_rows(conn, pair_rows)
+            pair_rows.clear()
+
+    return counts_by_split, new_images
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Register image-question-answer datasets into DuckDB.")
     parser.add_argument(
@@ -244,7 +403,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--datasets",
         nargs="+",
-        choices=["gqa"],
+        choices=["gqa", "chartqa"],
         default=["gqa"],
         help="QA datasets to register.",
     )
@@ -266,6 +425,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional subset of GQA split files to import.",
     )
+    parser.add_argument(
+        "--chartqa-splits",
+        nargs="+",
+        choices=["train", "val", "test"],
+        default=["train", "val"],
+        help="ChartQA splits to import. Defaults to train+val.",
+    )
     return parser.parse_args()
 
 
@@ -279,6 +445,16 @@ def main() -> int:
             counts = import_gqa(conn, Path("data/gqa"), allowed_splits=set(args.gqa_splits) if args.gqa_splits else None)
             total = sum(counts.values())
             print(f"gqa_questions_1_2: {total} qa rows registered", flush=True)
+            for split, count in sorted(counts.items()):
+                print(f"  {split}: {count}", flush=True)
+        elif dataset_name == "chartqa":
+            counts, new_images = import_chartqa(
+                conn,
+                Path("data/vm_ssl/raw/chartqa"),
+                allowed_splits=set(args.chartqa_splits) if args.chartqa_splits else None,
+            )
+            total = sum(counts.values())
+            print(f"chartqa: {total} qa rows registered; {new_images} new images materialized", flush=True)
             for split, count in sorted(counts.items()):
                 print(f"  {split}: {count}", flush=True)
         else:

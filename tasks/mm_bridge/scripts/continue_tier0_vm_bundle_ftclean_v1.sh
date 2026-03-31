@@ -19,7 +19,7 @@ main_continue() {
 
   clear_vram
   run_bridge_baseline "${KEY}" "${RUN_ID}" "siglip2_b16" "${SIGLIP2_DIR}" \
-    "${FINETUNE_BS}" "${FINETUNE_GA}" "${FINETUNE_EVAL_BS}" "${FINETUNE_NUM_WORKERS}" "${FINETUNE_PREFETCH}" \
+    "${FINETUNE_BS}" "${FINETUNE_GA}" "${FINETUNE_EVAL_BS}" "${FINETUNE_NUM_WORKERS}" "${FINETUNE_PREFETCH}" "${FINETUNE_PIN_MEMORY}" \
     --answer_kd_labels_path "${TEACHER_DATA_DIR}" \
     --answer_kd_weight 0.3 \
     --answer_kd_temp 4.0 \

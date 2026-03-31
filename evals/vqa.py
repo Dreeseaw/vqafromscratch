@@ -18,6 +18,7 @@ from typing import Any, Dict, Iterable, List, Sequence
 from train.vqa_data import (
     heuristic_answer_type,
     heuristic_question_category,
+    normalize_text_answer,
     normalize_vqa_answer,
     vqa_soft_accuracy,
 )
@@ -228,6 +229,8 @@ def _majority_answer(answers: Sequence[str], scorer: str) -> str:
         return ""
     if scorer == "official":
         norm = [normalize_vqa_official(a) for a in answers if str(a).strip()]
+    elif scorer == "text_exact":
+        norm = [normalize_text_answer(a) for a in answers if str(a).strip()]
     else:
         norm = [normalize_vqa_answer(a) for a in answers if str(a).strip()]
     norm = [x for x in norm if x]
@@ -268,6 +271,10 @@ def _record_accuracy(record: Dict[str, Any], scorer: str) -> float:
     pred = str(record.get("prediction", ""))
     if scorer == "official":
         return vqa_official_accuracy(pred, answers)
+    if scorer == "text_exact":
+        pred_norm = normalize_text_answer(pred)
+        gt_norm = [normalize_text_answer(a) for a in answers if str(a).strip()]
+        return 1.0 if pred_norm and pred_norm in gt_norm else 0.0
     if scorer == "exact":
         pred_norm = normalize_vqa_answer(pred)
         gt_norm = [normalize_vqa_answer(a) for a in answers if str(a).strip()]
@@ -397,6 +404,8 @@ def build_confusion_summary(
         gt = _majority_answer(answers, scorer)
         if scorer == "official":
             pr = normalize_vqa_official(str(r.get("prediction", "")))
+        elif scorer == "text_exact":
+            pr = normalize_text_answer(str(r.get("prediction", "")))
         else:
             pr = normalize_vqa_answer(str(r.get("prediction", "")))
         if not gt or not pr:
@@ -464,7 +473,7 @@ def parse_args() -> argparse.Namespace:
 
     ap.add_argument("--qualitative_samples", type=int, default=8)
     ap.add_argument("--confusion_top_k", type=int, default=20)
-    ap.add_argument("--scorer", type=str, default="official", choices=["official", "proxy", "exact"])
+    ap.add_argument("--scorer", type=str, default="official", choices=["official", "proxy", "exact", "text_exact"])
     ap.add_argument("--seed", type=int, default=35)
 
     ap.add_argument("--save_predictions_jsonl", type=str, default=None)

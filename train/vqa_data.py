@@ -51,6 +51,7 @@ _NUM_WORDS = {
 _ARTICLES = {"a", "an", "the"}
 _PUNCT_RE = re.compile(r"[^\w\s']")
 _SP_RE = re.compile(r"\s+")
+_TEXT_WS_RE = re.compile(r"\s+")
 
 
 def normalize_vqa_answer(text: str) -> str:
@@ -60,6 +61,17 @@ def normalize_vqa_answer(text: str) -> str:
     words = [_NUM_WORDS.get(w, w) for w in _SP_RE.split(t) if w]
     words = [w for w in words if w not in _ARTICLES]
     return " ".join(words).strip()
+
+
+def normalize_text_answer(text: str) -> str:
+    t = str(text or "").replace("\n", " ").replace("\t", " ").strip().lower()
+    t = (
+        t.replace("\u2019", "'")
+        .replace("\u2018", "'")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+    )
+    return _TEXT_WS_RE.sub(" ", t).strip()
 
 
 def is_number_text(text: str) -> bool:
@@ -288,6 +300,13 @@ def prepare_vqav2(
 
 
 def build_image_transform(train_mode: bool) -> transforms.Compose:
+    # Performance note:
+    # For the current SigLIP2 bridge frontier, alternate "faster" image paths were
+    # benchmarked and rejected on this machine:
+    #   - unit-range tensors with VM-side renorm: slower
+    #   - torchvision tensor decode + ConvertImageDtype: slower
+    # So we keep the simple PIL -> ToTensor -> Normalize path unless a future pass
+    # re-benchmarks on different hardware or a different VM.
     if train_mode:
         return transforms.Compose(
             [
@@ -439,6 +458,8 @@ class VQAv2Dataset(Dataset):
         source_item = item
         if self._corruption_indices is not None:
             source_item = self.items[self._corruption_indices[idx]]
+        # PIL decode remains the kept default for the current bridge champion family.
+        # A torchvision decode path was tested later and did not improve throughput.
         img = Image.open(source_item["image_path"]).convert("RGB")
         img_t = self.transform(img)
         if self.image_corruption_mode == "zero":
@@ -594,6 +615,289 @@ class GQADataset(Dataset):
         if self._corruption_indices is not None:
             source_item = self.items[self._corruption_indices[idx]]
         img = Image.open(source_item["image_path"]).convert("RGB")
+        img_t = self.transform(img)
+        if self.image_corruption_mode == "zero":
+            img_t = torch.zeros_like(img_t)
+        return {
+            "image": img_t,
+            "question": item["question"],
+            "answer": item["answer"],
+            "all_answers_raw": item.get("all_answers_raw", []),
+            "all_answers": item["all_answers"],
+            "question_id": item["question_id"],
+            "image_id": item["image_id"],
+            "metadata": item["metadata"],
+        }
+
+
+class ChartQADataset(Dataset):
+    def __init__(
+        self,
+        db_path: str,
+        split: str,
+        *,
+        transform: Optional[transforms.Compose] = None,
+        limit: int = 0,
+        skip_missing_images: bool = True,
+    ) -> None:
+        super().__init__()
+        if split not in ("train", "val"):
+            raise ValueError("ChartQADataset currently only supports split='train' or split='val'")
+        if not os.path.isfile(db_path):
+            raise FileNotFoundError(f"Missing ChartQA DuckDB registry: {db_path}")
+        self.db_path = db_path
+        self.split = split
+        self.transform = transform or build_image_transform(train_mode=(split == "train"))
+        self.image_corruption_mode = "none"
+        self._corruption_indices: Optional[List[int]] = None
+
+        import duckdb
+
+        conn = duckdb.connect(db_path, read_only=True)
+        rows = conn.execute(
+            """
+            select
+                pair_id,
+                image_id,
+                question,
+                answer,
+                source_record_json,
+                local_path
+            from valid_labeled_image_qa_pairs
+            where dataset_name = 'chartqa' and pair_split = ?
+            order by pair_id
+            """,
+            [split],
+        ).fetchall()
+        conn.close()
+
+        items: List[dict] = []
+        for row_idx, (pair_id, raw_image_id, question, answer, source_record_json, local_path) in enumerate(rows):
+            question = str(question or "").strip()
+            answer_text = str(answer or "").strip()
+            image_path = str(local_path or "").strip()
+            if not question or not answer_text or not image_path:
+                continue
+            if skip_missing_images and not os.path.isfile(image_path):
+                continue
+            source_record: Dict[str, Any] = {}
+            if isinstance(source_record_json, str) and source_record_json.strip():
+                try:
+                    source_record = json.loads(source_record_json)
+                except Exception:
+                    source_record = {}
+            item = {
+                "question_id": int(row_idx),
+                "image_id": int(row_idx),
+                "image_path": image_path,
+                "question": question,
+                "answer": answer_text,
+                "all_answers_raw": [answer_text],
+                "all_answers": [answer_text],
+                "metadata": {
+                    "split": f"chartqa_{split}",
+                    "question_type": heuristic_question_category(question),
+                    "answer_type": heuristic_answer_type(answer_text),
+                    "source_dataset": "chartqa",
+                    "chartqa_pair_id": str(pair_id),
+                    "chartqa_image_id": str(raw_image_id),
+                    "chartqa_human_or_machine": str(source_record.get("human_or_machine", "")),
+                    "heuristic_question_type": heuristic_question_category(question),
+                    "heuristic_answer_type": heuristic_answer_type(answer_text),
+                },
+            }
+            items.append(item)
+            if limit > 0 and len(items) >= int(limit):
+                break
+
+        if not items:
+            raise FileNotFoundError("No usable ChartQA items found.")
+        self.items = items
+
+    def set_image_corruption(self, mode: str = "none", *, seed: int = 0) -> None:
+        mode = str(mode or "none")
+        if mode not in ("none", "zero", "shuffle", "random_swap"):
+            raise ValueError(
+                f"Unsupported image_corruption_mode={mode}. Supported: none, zero, shuffle, random_swap"
+            )
+        self.image_corruption_mode = mode
+        self._corruption_indices = None
+        n = len(self.items)
+        if n <= 0 or mode in ("none", "zero"):
+            return
+        if mode == "shuffle":
+            self._corruption_indices = [((i + 1) % n) if n > 1 else 0 for i in range(n)]
+            return
+        idxs = list(range(n))
+        if n == 1:
+            self._corruption_indices = idxs
+            return
+        rng = random.Random(int(seed))
+        rng.shuffle(idxs)
+        for i in range(n):
+            if idxs[i] == i:
+                j = (i + 1) % n
+                idxs[i], idxs[j] = idxs[j], idxs[i]
+        self._corruption_indices = idxs
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> dict:
+        item = self.items[idx]
+        source_item = item if self._corruption_indices is None else self.items[self._corruption_indices[idx]]
+        img = Image.open(source_item["image_path"]).convert("RGB")
+        img_t = self.transform(img)
+        if self.image_corruption_mode == "zero":
+            img_t = torch.zeros_like(img_t)
+        return {
+            "image": img_t,
+            "question": item["question"],
+            "answer": item["answer"],
+            "all_answers_raw": item.get("all_answers_raw", []),
+            "all_answers": item["all_answers"],
+            "question_id": item["question_id"],
+            "image_id": item["image_id"],
+            "metadata": item["metadata"],
+        }
+
+
+class TextOCRReadoutDataset(Dataset):
+    QUESTION_TEMPLATE = "what text is shown?"
+
+    def __init__(
+        self,
+        annotations_root: str,
+        images_root: str,
+        split: str,
+        *,
+        transform: Optional[transforms.Compose] = None,
+        limit: int = 0,
+        skip_missing_images: bool = True,
+        crop_pad_ratio: float = 0.08,
+        max_answer_chars: int = 24,
+        max_answer_words: int = 4,
+    ) -> None:
+        super().__init__()
+        if split not in ("train", "val"):
+            raise ValueError("TextOCRReadoutDataset currently only supports split='train' or split='val'")
+        ann_path = os.path.join(annotations_root, f"TextOCR_0.1_{split}.json")
+        if not os.path.isfile(ann_path):
+            raise FileNotFoundError(f"Missing TextOCR annotations: {ann_path}")
+        if not os.path.isdir(images_root):
+            raise FileNotFoundError(f"Missing TextOCR images dir: {images_root}")
+        self.annotations_root = annotations_root
+        self.images_root = images_root
+        self.split = split
+        self.transform = transform or build_image_transform(train_mode=(split == "train"))
+        self.image_corruption_mode = "none"
+        self._corruption_indices: Optional[List[int]] = None
+        self.crop_pad_ratio = max(0.0, float(crop_pad_ratio))
+
+        with open(ann_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        imgs = dict(payload.get("imgs") or {})
+        anns = dict(payload.get("anns") or {})
+
+        items: List[dict] = []
+        for ann_idx, ann in enumerate(anns.values()):
+            answer_raw = str(ann.get("utf8_string") or "").strip()
+            answer_text = normalize_text_answer(answer_raw)
+            if not answer_text:
+                continue
+            if not any(ch.isalnum() for ch in answer_text):
+                continue
+            if len(answer_text) > int(max_answer_chars):
+                continue
+            if len(answer_text.split()) > int(max_answer_words):
+                continue
+            image_info = imgs.get(str(ann.get("image_id") or ""))
+            if not isinstance(image_info, dict):
+                continue
+            image_rel = os.path.basename(str(image_info.get("file_name") or "").strip())
+            image_path = os.path.join(images_root, image_rel)
+            if skip_missing_images and not os.path.isfile(image_path):
+                continue
+            bbox = ann.get("bbox") or []
+            if not isinstance(bbox, list) or len(bbox) != 4:
+                continue
+            x, y, w, h = [float(v) for v in bbox]
+            if w <= 1.0 or h <= 1.0:
+                continue
+            items.append(
+                {
+                    "question_id": int(len(items)),
+                    "image_id": int(len(items)),
+                    "image_path": image_path,
+                    "question": self.QUESTION_TEMPLATE,
+                    "answer": answer_text,
+                    "all_answers_raw": [answer_raw],
+                    "all_answers": [answer_text],
+                    "crop_bbox_xywh": [x, y, w, h],
+                    "metadata": {
+                        "split": f"textocr_{split}",
+                        "question_type": "text_readout",
+                        "answer_type": heuristic_answer_type(answer_text),
+                        "source_dataset": "textocr_readout",
+                        "textocr_ann_id": str(ann.get("id", ann_idx)),
+                        "textocr_image_id": str(ann.get("image_id", "")),
+                        "heuristic_question_type": "text_readout",
+                        "heuristic_answer_type": heuristic_answer_type(answer_text),
+                    },
+                }
+            )
+            if limit > 0 and len(items) >= int(limit):
+                break
+
+        if not items:
+            raise FileNotFoundError("No usable TextOCR readout items found.")
+        self.items = items
+
+    def set_image_corruption(self, mode: str = "none", *, seed: int = 0) -> None:
+        mode = str(mode or "none")
+        if mode not in ("none", "zero", "shuffle", "random_swap"):
+            raise ValueError(
+                f"Unsupported image_corruption_mode={mode}. Supported: none, zero, shuffle, random_swap"
+            )
+        self.image_corruption_mode = mode
+        self._corruption_indices = None
+        n = len(self.items)
+        if n <= 0 or mode in ("none", "zero"):
+            return
+        if mode == "shuffle":
+            self._corruption_indices = [((i + 1) % n) if n > 1 else 0 for i in range(n)]
+            return
+        idxs = list(range(n))
+        if n == 1:
+            self._corruption_indices = idxs
+            return
+        rng = random.Random(int(seed))
+        rng.shuffle(idxs)
+        for i in range(n):
+            if idxs[i] == i:
+                j = (i + 1) % n
+                idxs[i], idxs[j] = idxs[j], idxs[i]
+        self._corruption_indices = idxs
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def _crop_image(self, image: Image.Image, bbox_xywh: Sequence[float]) -> Image.Image:
+        x, y, w, h = [float(v) for v in bbox_xywh]
+        pad = self.crop_pad_ratio * max(w, h)
+        left = max(0, int(math.floor(x - pad)))
+        top = max(0, int(math.floor(y - pad)))
+        right = min(int(image.width), int(math.ceil(x + w + pad)))
+        bottom = min(int(image.height), int(math.ceil(y + h + pad)))
+        if right <= left or bottom <= top:
+            return image
+        return image.crop((left, top, right, bottom))
+
+    def __getitem__(self, idx: int) -> dict:
+        item = self.items[idx]
+        source_item = item if self._corruption_indices is None else self.items[self._corruption_indices[idx]]
+        img = Image.open(source_item["image_path"]).convert("RGB")
+        img = self._crop_image(img, source_item["crop_bbox_xywh"])
         img_t = self.transform(img)
         if self.image_corruption_mode == "zero":
             img_t = torch.zeros_like(img_t)
@@ -1250,5 +1554,92 @@ class GroundingGQAMixBatchSampler(BatchSampler):
                 batch.append(gqa_offset + next_from_cycle(gqa_cycle, len(self.gqa_dataset), "gqa"))
             for _ in range(self.pointing_batch):
                 batch.append(pointing_offset + next_point_index())
+            rng.shuffle(batch)
+            yield batch
+
+
+class MultiDatasetBatchSampler(BatchSampler):
+    def __init__(
+        self,
+        *,
+        datasets: Sequence[Dataset],
+        source_names: Sequence[str],
+        batch_size: int,
+        source_mix_ratios: Dict[str, float],
+        seed: int,
+        drop_last: bool = True,
+    ) -> None:
+        if len(datasets) != len(source_names):
+            raise ValueError("datasets and source_names must have the same length")
+        if len(datasets) < 2:
+            raise ValueError("MultiDatasetBatchSampler expects at least a base dataset and one auxiliary dataset")
+        self.datasets = list(datasets)
+        self.source_names = [str(name) for name in source_names]
+        self.batch_size = max(1, int(batch_size))
+        self.seed = int(seed)
+        self.drop_last = bool(drop_last)
+        self.epoch = 1
+
+        self.dataset_lengths = [len(ds) for ds in self.datasets]
+        self.offsets: List[int] = []
+        offset = 0
+        for length in self.dataset_lengths:
+            self.offsets.append(offset)
+            offset += int(length)
+
+        self.counts_per_source: Dict[str, int] = {}
+        used = 0
+        for name in self.source_names[1:]:
+            ratio = max(0.0, float(source_mix_ratios.get(name, 0.0)))
+            if ratio <= 0.0:
+                self.counts_per_source[name] = 0
+                continue
+            count = max(1, int(round(float(self.batch_size) * ratio)))
+            self.counts_per_source[name] = count
+            used += count
+        base_name = self.source_names[0]
+        self.counts_per_source[base_name] = int(self.batch_size - used)
+        if self.counts_per_source[base_name] <= 0:
+            raise ValueError("Auxiliary dataset mix ratios leave no room for base samples in the batch.")
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = max(1, int(epoch))
+
+    def __len__(self) -> int:
+        base_name = self.source_names[0]
+        base_batch = max(1, int(self.counts_per_source[base_name]))
+        n_base = self.dataset_lengths[0]
+        if self.drop_last:
+            return max(1, n_base // base_batch)
+        return max(1, int(math.ceil(float(n_base) / float(base_batch))))
+
+    def _make_cycle(self, length: int, *, seed_key: str) -> deque[int]:
+        idxs = list(range(int(length)))
+        rng = random.Random(f"{self.seed}_{self.epoch}_{seed_key}")
+        rng.shuffle(idxs)
+        return deque(idxs)
+
+    def __iter__(self) -> Iterable[List[int]]:
+        cycles = {
+            name: self._make_cycle(self.dataset_lengths[idx], seed_key=name)
+            for idx, name in enumerate(self.source_names)
+        }
+        rng = random.Random(f"{self.seed}_{self.epoch}_multi_dataset_batch")
+
+        def next_idx(name: str, source_idx: int) -> int:
+            cycle = cycles[name]
+            if not cycle:
+                cycle.extend(self._make_cycle(self.dataset_lengths[source_idx], seed_key=name))
+            return int(cycle.popleft())
+
+        for _ in range(len(self)):
+            batch: List[int] = []
+            for source_idx, name in enumerate(self.source_names):
+                count = int(self.counts_per_source.get(name, 0))
+                if count <= 0:
+                    continue
+                offset = int(self.offsets[source_idx])
+                for _ in range(count):
+                    batch.append(offset + next_idx(name, source_idx))
             rng.shuffle(batch)
             yield batch

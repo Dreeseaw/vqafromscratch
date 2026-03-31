@@ -241,6 +241,32 @@ What it is for:
 - structured visual reasoning supervision
 - pseudo-pointing conversion via scene-graph object centroids
 
+### ChartQA
+
+- Root: [data/vm_ssl/raw/chartqa](/home/wdree/percy/vqafromscratch/data/vm_ssl/raw/chartqa)
+- Stored image tree: [data/vm_ssl/raw/chartqa/images](/home/wdree/percy/vqafromscratch/data/vm_ssl/raw/chartqa/images)
+- Disk usage: about `766M`
+
+DuckDB-backed QA status from [data/vm_ssl/db/vm_ssl.duckdb](/home/wdree/percy/vqafromscratch/data/vm_ssl/db/vm_ssl.duckdb):
+
+- dataset name: `chartqa`
+- stored chart images: `19,321`
+- labeled QA pairs: `30,219`
+- split breakdown:
+  - `train`: `28,299`
+  - `val`: `1,920`
+
+Important storage note:
+
+- `ChartQA` is materially one-to-many on the image side
+- chart images are deduplicated by content hash and stored once under `data/vm_ssl/raw/chartqa/images/`
+- QA rows fan out onto shared `image_id`s in `image_qa_pairs`
+
+What it is for:
+- chart-reading QA supervision
+- table/axis/value extraction and comparison questions
+- later OCR-heavy and diagram-style VQA experiments
+
 ## 4. VM / VLM Image and Image-Text Corpora
 
 Canonical registry:
@@ -253,6 +279,7 @@ This DB is the canonical image / image-text / QA manifest layer for the VM recip
 
 #### Images by source
 
+- `chartqa`: `19,321`
 - `inat2021`: `500,000`
 - `coco_local`: `204,721`
 - `gqa`: `148,854`
@@ -266,7 +293,7 @@ This DB is the canonical image / image-text / QA manifest layer for the VM recip
 - `mapillary_vistas`: `40`
 - `textocr_test`: `30`
 
-Total indexed images: `1,013,991`
+Total indexed images: `1,033,312`
 
 #### Valid image-text pairs by dataset
 
@@ -282,7 +309,10 @@ Total valid image-text pairs: `486,867`
 
 #### Valid labeled image-QA pairs in DuckDB
 
+- `chartqa`: `30,219`
 - `gqa_questions_1_2`: `198,553`
+
+Total valid labeled image-QA pairs: `228,772`
 
 ### Notable Raw Image Roots
 
@@ -295,6 +325,7 @@ Total valid image-text pairs: `486,867`
 - [data/vm_ssl/raw/textcaps_materialized](/home/wdree/percy/vqafromscratch/data/vm_ssl/raw/textcaps_materialized)
 - [data/vm_ssl/raw/cc3m_subset_50k](/home/wdree/percy/vqafromscratch/data/vm_ssl/raw/cc3m_subset_50k)
 - [data/vm_ssl/raw/midjourney_v6_recap_30k](/home/wdree/percy/vqafromscratch/data/vm_ssl/raw/midjourney_v6_recap_30k)
+- [data/vm_ssl/raw/chartqa](/home/wdree/percy/vqafromscratch/data/vm_ssl/raw/chartqa)
 
 ### Registered Artifact Inventory
 
@@ -420,6 +451,7 @@ What it is for:
 
 - `data/vqav2/`
 - GQA QA pairs in DuckDB
+- ChartQA QA pairs in DuckDB and chart images under `data/vm_ssl/raw/chartqa/`
 
 ### Grounding / pointing supervision
 

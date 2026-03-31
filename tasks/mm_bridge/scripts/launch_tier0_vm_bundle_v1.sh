@@ -26,17 +26,31 @@ REMAP_CKPT="${REMAP_CKPT:-logs/mmsemantic_remap_v1_debug/step_500.tar}"
 
 SEED="${SEED:-35}"
 
+# Performance note:
+# The original 9k SigLIP2+KD+top-2-block finetune champion was recorded with a more
+# conservative profile (~64x3, 2 workers, pin_memory off in some paths) and ran at
+# about 1.89 steps/s on this machine. The defaults below were re-benchmarked later
+# for this exact family and are the kept fast profile for reruns:
+#   - 96x2 effective batch 192
+#   - 4 workers, prefetch 2, pin_memory on
+#   - eval batch 160
+#   - SDPA backend math
+# Rejected follow-ups on this box:
+#   - 6 workers: slower
+#   - SDPA auto: flat/slower
 BRIDGE_BS="${BRIDGE_BS:-96}"
 BRIDGE_GA="${BRIDGE_GA:-2}"
-BRIDGE_EVAL_BS="${BRIDGE_EVAL_BS:-128}"
-BRIDGE_NUM_WORKERS="${BRIDGE_NUM_WORKERS:-2}"
-BRIDGE_PREFETCH="${BRIDGE_PREFETCH:-1}"
+BRIDGE_EVAL_BS="${BRIDGE_EVAL_BS:-160}"
+BRIDGE_NUM_WORKERS="${BRIDGE_NUM_WORKERS:-4}"
+BRIDGE_PREFETCH="${BRIDGE_PREFETCH:-2}"
+BRIDGE_PIN_MEMORY="${BRIDGE_PIN_MEMORY:-1}"
 
-FINETUNE_BS="${FINETUNE_BS:-64}"
-FINETUNE_GA="${FINETUNE_GA:-3}"
-FINETUNE_EVAL_BS="${FINETUNE_EVAL_BS:-96}"
-FINETUNE_NUM_WORKERS="${FINETUNE_NUM_WORKERS:-2}"
-FINETUNE_PREFETCH="${FINETUNE_PREFETCH:-1}"
+FINETUNE_BS="${FINETUNE_BS:-96}"
+FINETUNE_GA="${FINETUNE_GA:-2}"
+FINETUNE_EVAL_BS="${FINETUNE_EVAL_BS:-160}"
+FINETUNE_NUM_WORKERS="${FINETUNE_NUM_WORKERS:-4}"
+FINETUNE_PREFETCH="${FINETUNE_PREFETCH:-2}"
+FINETUNE_PIN_MEMORY="${FINETUNE_PIN_MEMORY:-1}"
 FINETUNE_LAST_N_BLOCKS="${FINETUNE_LAST_N_BLOCKS:-2}"
 FINETUNE_VISION_LR_SCALE="${FINETUNE_VISION_LR_SCALE:-0.1}"
 
@@ -45,14 +59,20 @@ COMPRESS_GA="${COMPRESS_GA:-2}"
 COMPRESS_EVAL_BS="${COMPRESS_EVAL_BS:-96}"
 COMPRESS_NUM_WORKERS="${COMPRESS_NUM_WORKERS:-2}"
 COMPRESS_PREFETCH="${COMPRESS_PREFETCH:-1}"
+COMPRESS_PIN_MEMORY="${COMPRESS_PIN_MEMORY:-1}"
 COMPRESS_K="${COMPRESS_K:-8}"
 
 GQA_EVAL_LIMIT="${GQA_EVAL_LIMIT:-5000}"
 GQA_EVAL_BS="${GQA_EVAL_BS:-96}"
 OCR_LIMIT="${OCR_LIMIT:-500}"
+HARD_EVAL_BS="${HARD_EVAL_BS:-160}"
+HARD_EVAL_NUM_WORKERS="${HARD_EVAL_NUM_WORKERS:-2}"
+HARD_EVAL_PREFETCH="${HARD_EVAL_PREFETCH:-2}"
+HARD_EVAL_PIN_MEMORY="${HARD_EVAL_PIN_MEMORY:-1}"
 PROBE_BATCH="${PROBE_BATCH:-256}"
 PROBE_TRAIN_LIMIT="${PROBE_TRAIN_LIMIT:-10000}"
 PROBE_VAL_LIMIT="${PROBE_VAL_LIMIT:-5000}"
+MM_SDP_BACKEND="${MM_SDP_BACKEND:-math}"
 
 DO_COMPRESS_WINNING_FROZEN="${DO_COMPRESS_WINNING_FROZEN:-1}"
 DO_COMPRESS_WINNING_STACKED="${DO_COMPRESS_WINNING_STACKED:-1}"
@@ -126,6 +146,15 @@ gpu_snapshot() {
 
 host_ram_snapshot() {
   free -m | awk '/^Mem:/ {printf "%s/%s MB", $3, $2}'
+}
+
+pin_memory_flag() {
+  local enabled="${1:-0}"
+  if [[ "${enabled}" == "1" ]]; then
+    printf '%s\n' "--pin_memory"
+  else
+    printf '%s\n' "--no-pin_memory"
+  fi
 }
 
 resume_runmm() {
@@ -321,9 +350,9 @@ full_eval_bridge_checkpoint() {
     --eval_only \
     --eval_batches 0 \
     --eval_batch_size "${eval_bs}" \
-    --num_workers 1 \
-    --prefetch_factor 1 \
-    --no-pin_memory \
+    --num_workers "${HARD_EVAL_NUM_WORKERS}" \
+    --prefetch_factor "${HARD_EVAL_PREFETCH}" \
+    "$(pin_memory_flag "${HARD_EVAL_PIN_MEMORY}")" \
     --min_train_steps_per_s 0 2>&1 | tee -a "${stdout_log}"
   materialize_eval_json_from_log "logs/${run_id}/logfile_from_${step}.txt" "${out_json}"
   bundle_mark_end "${run_id}_peak_eval" "step=${step}"
@@ -371,9 +400,9 @@ run_probe() {
     --checkpoint "${ckpt}" \
     --batch_size "${batch_size}" \
     --probe_batch_size "${PROBE_BATCH}" \
-    --num_workers 1 \
-    --prefetch_factor 1 \
-    --no-pin_memory \
+    --num_workers "${HARD_EVAL_NUM_WORKERS}" \
+    --prefetch_factor "${HARD_EVAL_PREFETCH}" \
+    "$(pin_memory_flag "${HARD_EVAL_PIN_MEMORY}")" \
     --limit_train "${PROBE_TRAIN_LIMIT}" \
     --limit_val "${PROBE_VAL_LIMIT}" \
     --answer_top_k 3000 \
@@ -393,9 +422,9 @@ run_ocr_eval() {
   runtime_exec_python -m tasks.mm_bridge.scripts.mm_ocr_subset_eval \
     --checkpoint "${ckpt}" \
     --batch_size "${batch_size}" \
-    --num_workers 1 \
-    --prefetch_factor 1 \
-    --no-pin_memory \
+    --num_workers "${HARD_EVAL_NUM_WORKERS}" \
+    --prefetch_factor "${HARD_EVAL_PREFETCH}" \
+    "$(pin_memory_flag "${HARD_EVAL_PIN_MEMORY}")" \
     --limit_ocr "${OCR_LIMIT}" \
     --output_json "${out_json}"
 }
@@ -504,7 +533,8 @@ run_bridge_baseline() {
   local eval_bs="$7"
   local workers="$8"
   local prefetch="$9"
-  shift 9
+  local pin_memory="${10}"
+  shift 10
   local extra_args=("$@")
 
   local started_h started_ts end_ts duration stdout_log status=0 trace_json final_step peak_json notes
@@ -533,13 +563,14 @@ run_bridge_baseline() {
     --vision_model "${vm_name}" \
     --vision_checkpoint "${vm_ckpt}" \
     --lm_checkpoint "${LM_CKPT}" \
+    --mm_sdp_backend "${MM_SDP_BACKEND}" \
     --seed "${SEED}" \
     --batch_size "${train_bs}" \
     --grad_accum_steps "${train_ga}" \
     --eval_batch_size "${eval_bs}" \
     --num_workers "${workers}" \
     --prefetch_factor "${prefetch}" \
-    --no-pin_memory \
+    "$(pin_memory_flag "${pin_memory}")" \
     --min_train_steps_per_s 0 \
     "${extra_args[@]}" 2>&1 | tee -a "${stdout_log}" || status=$?
 
@@ -585,6 +616,7 @@ run_k8_compression() {
     --vision_model "${vm_name}" \
     --vision_checkpoint "${vm_ckpt}" \
     --lm_checkpoint "${LM_CKPT}" \
+    --mm_sdp_backend "${MM_SDP_BACKEND}" \
     --seed "${SEED}" \
     --max_steps 3000 \
     --manual_max_steps \
@@ -593,7 +625,7 @@ run_k8_compression() {
     --eval_batch_size "${COMPRESS_EVAL_BS}" \
     --num_workers "${COMPRESS_NUM_WORKERS}" \
     --prefetch_factor "${COMPRESS_PREFETCH}" \
-    --no-pin_memory \
+    "$(pin_memory_flag "${COMPRESS_PIN_MEMORY}")" \
     --log_every 20 \
     --eval_every 500 \
     --eval_batches 100 \
@@ -741,11 +773,11 @@ EOF
   clear_vram
 
   run_bridge_baseline "siglip2" "${RUN_SIGLIP2}" "siglip2_b16" "${SIGLIP2_DIR}" \
-    "${BRIDGE_BS}" "${BRIDGE_GA}" "${BRIDGE_EVAL_BS}" "${BRIDGE_NUM_WORKERS}" "${BRIDGE_PREFETCH}" || true
+    "${BRIDGE_BS}" "${BRIDGE_GA}" "${BRIDGE_EVAL_BS}" "${BRIDGE_NUM_WORKERS}" "${BRIDGE_PREFETCH}" "${BRIDGE_PIN_MEMORY}" || true
   clear_vram
 
   run_bridge_baseline "pecore" "${RUN_PECORE}" "pe_core_b16" "${PECORE_DIR}" \
-    "${BRIDGE_BS}" "${BRIDGE_GA}" "${BRIDGE_EVAL_BS}" "${BRIDGE_NUM_WORKERS}" "${BRIDGE_PREFETCH}" || true
+    "${BRIDGE_BS}" "${BRIDGE_GA}" "${BRIDGE_EVAL_BS}" "${BRIDGE_NUM_WORKERS}" "${BRIDGE_PREFETCH}" "${BRIDGE_PIN_MEMORY}" || true
   clear_vram
 
   local frozen_winner_full frozen_winner_key frozen_winner_run frozen_winner_vm frozen_winner_dir frozen_winner_final_step frozen_winner_final_ckpt
@@ -780,14 +812,14 @@ EOF
   fi
 
   run_bridge_baseline "winner_kd" "${RUN_WINNER_KD}" "${frozen_winner_vm}" "${frozen_winner_dir}" \
-    "${BRIDGE_BS}" "${BRIDGE_GA}" "${BRIDGE_EVAL_BS}" "${BRIDGE_NUM_WORKERS}" "${BRIDGE_PREFETCH}" \
+    "${BRIDGE_BS}" "${BRIDGE_GA}" "${BRIDGE_EVAL_BS}" "${BRIDGE_NUM_WORKERS}" "${BRIDGE_PREFETCH}" "${BRIDGE_PIN_MEMORY}" \
     --answer_kd_labels_path "${TEACHER_DATA_DIR}" \
     --answer_kd_weight 0.3 \
     --answer_kd_temp 4.0 || true
   clear_vram
 
   run_bridge_baseline "winner_ft" "${RUN_WINNER_FT}" "${frozen_winner_vm}" "${frozen_winner_dir}" \
-    "${FINETUNE_BS}" "${FINETUNE_GA}" "${FINETUNE_EVAL_BS}" "${FINETUNE_NUM_WORKERS}" "${FINETUNE_PREFETCH}" \
+    "${FINETUNE_BS}" "${FINETUNE_GA}" "${FINETUNE_EVAL_BS}" "${FINETUNE_NUM_WORKERS}" "${FINETUNE_PREFETCH}" "${FINETUNE_PIN_MEMORY}" \
     --train_vision_last_n_blocks "${FINETUNE_LAST_N_BLOCKS}" \
     --vision_lr_scale "${FINETUNE_VISION_LR_SCALE}" || true
   clear_vram
@@ -816,18 +848,18 @@ EOF
   fi
 
   bundle_mark_start "${BUNDLE_ID}_hard_suite" "reference_and_winners"
-  run_hard_suite "reference_bridge" "${REFERENCE_BRIDGE_CKPT}" 96 "reference_bridge"
+  run_hard_suite "reference_bridge" "${REFERENCE_BRIDGE_CKPT}" "${HARD_EVAL_BS}" "reference_bridge"
   if [[ -f "${REFERENCE_COMPRESS_CKPT}" ]]; then
-    run_hard_suite "reference_compressed" "${REFERENCE_COMPRESS_CKPT}" 96 "reference_compressed"
+    run_hard_suite "reference_compressed" "${REFERENCE_COMPRESS_CKPT}" "${HARD_EVAL_BS}" "reference_compressed"
   fi
-  run_hard_suite "winner_frozen_bridge" "${frozen_winner_final_ckpt}" 96 "winner_frozen_bridge"
-  run_hard_suite "winner_kd_bridge" "$(full_eval_ckpt_for_run "${RUN_WINNER_KD}")" 96 "winner_kd_bridge"
-  run_hard_suite "winner_ft_bridge" "$(full_eval_ckpt_for_run "${RUN_WINNER_FT}")" 96 "winner_ft_bridge"
+  run_hard_suite "winner_frozen_bridge" "${frozen_winner_final_ckpt}" "${HARD_EVAL_BS}" "winner_frozen_bridge"
+  run_hard_suite "winner_kd_bridge" "$(full_eval_ckpt_for_run "${RUN_WINNER_KD}")" "${HARD_EVAL_BS}" "winner_kd_bridge"
+  run_hard_suite "winner_ft_bridge" "$(full_eval_ckpt_for_run "${RUN_WINNER_FT}")" "${HARD_EVAL_BS}" "winner_ft_bridge"
   if [[ -f "${BUNDLE_DIR}/winner_frozen_k8_peak_full.json" ]]; then
-    run_hard_suite "winner_frozen_k8" "$(full_eval_ckpt_for_run "${RUN_WINNER_K8}")" 96 "winner_frozen_k8"
+    run_hard_suite "winner_frozen_k8" "$(full_eval_ckpt_for_run "${RUN_WINNER_K8}")" "${HARD_EVAL_BS}" "winner_frozen_k8"
   fi
   if [[ -f "${BUNDLE_DIR}/winner_stacked_k8_peak_full.json" ]]; then
-    run_hard_suite "winner_stacked_k8" "$(full_eval_ckpt_for_run "${RUN_STACKED_K8}")" 96 "winner_stacked_k8"
+    run_hard_suite "winner_stacked_k8" "$(full_eval_ckpt_for_run "${RUN_STACKED_K8}")" "${HARD_EVAL_BS}" "winner_stacked_k8"
   fi
   bundle_mark_end "${BUNDLE_ID}_hard_suite" "done"
 

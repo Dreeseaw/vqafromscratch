@@ -51,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--pin_memory", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--eval_split", type=str, default="val", choices=["train", "val", "test"])
     ap.add_argument("--limit_ocr", type=int, default=500)
+    ap.add_argument("--semantic_eval_budget", type=int, default=0)
     ap.add_argument("--seed", type=int, default=35)
     ap.add_argument("--output_json", type=str, required=True)
     return ap.parse_args()
@@ -112,6 +113,7 @@ def main() -> None:
         "num_workers": int(args.num_workers),
         "prefetch_factor": int(args.prefetch_factor),
         "pin_memory": bool(args.pin_memory),
+        "semantic_eval_budget": int(args.semantic_eval_budget),
     }
     model, tokenizer, _bridge_cfg, _payload, run_args = load_runtime_from_checkpoint(
         checkpoint_path=args.checkpoint,
@@ -152,7 +154,8 @@ def main() -> None:
     os.makedirs(os.path.dirname(os.path.abspath(args.output_json)), exist_ok=True)
     with open(args.output_json, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2, ensure_ascii=True)
-    print(f"[ocr-subset] wrote: {os.path.abspath(args.output_json)}")
+    print(f"[eval:{args.eval_split}_ocr_subset] overall_accuracy={out['overall_accuracy']:.4f}", flush=True)
+    print(f"[ocr-subset] wrote: {os.path.abspath(args.output_json)}", flush=True)
 
 
 if __name__ == "__main__":
